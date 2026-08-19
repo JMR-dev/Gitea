@@ -142,7 +142,47 @@ if ! gcloud iam service-accounts describe "${INFRA_SA_EMAIL}" --project="${PROJE
     gcloud iam service-accounts create "${INFRA_SA}" \
         --project="${PROJECT}" \
         --display-name="Cloud Build: infrastructure (runs Pulumi)"
+
+    # Service account creation is eventually consistent. Binding a role to an
+    # account the IAM API cannot see yet fails with
+    #   INVALID_ARGUMENT: Service account ... does not exist
+    # even though creation just succeeded. Wait for it to appear.
+    log "waiting for ${INFRA_SA_EMAIL} to propagate"
+    for _ in $(seq 1 30); do
+        gcloud iam service-accounts describe "${INFRA_SA_EMAIL}" \
+            --project="${PROJECT}" >/dev/null 2>&1 && break
+        sleep 2
+    done
 fi
+
+# `describe` returning the account is necessary but not sufficient -- the IAM
+# policy backend can still reject it for a while longer. And each
+# add-iam-policy-binding is a read-modify-write of the whole project policy, so
+# a run of them in sequence can also collide with itself. Retry on both.
+add_project_binding() {
+    local member="$1" role="$2" out=""
+    for attempt in $(seq 1 10); do
+        if out=$(gcloud projects add-iam-policy-binding "${PROJECT}" \
+                    --member="${member}" \
+                    --role="${role}" \
+                    --condition=None \
+                    --quiet 2>&1); then
+            return 0
+        fi
+        case "${out}" in
+            *"does not exist"*|*oncurrent*)
+                sleep $(( attempt * 3 ))
+                ;;
+            *)
+                echo "${out}" >&2
+                return 1
+                ;;
+        esac
+    done
+    echo "giving up on ${role}:" >&2
+    echo "${out}" >&2
+    return 1
+}
 
 # Broad by necessity -- Pulumi manages IAM, compute, DNS, and secrets bindings.
 # Deliberately a different identity from cb-image@, which only pushes images.
@@ -162,19 +202,34 @@ INFRA_ROLES=(
     roles/logging.logWriter
 )
 for role in "${INFRA_ROLES[@]}"; do
-    gcloud projects add-iam-policy-binding "${PROJECT}" \
-        --member="serviceAccount:${INFRA_SA_EMAIL}" \
-        --role="${role}" \
-        --condition=None \
-        --quiet >/dev/null
+    log "  granting ${role}"
+    add_project_binding "serviceAccount:${INFRA_SA_EMAIL}" "${role}"
 done
 
 # Pulumi's state lives in the bucket, so the runner needs write access to it --
-# scoped to that bucket rather than project-wide storage admin.
-gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
-    --project="${PROJECT}" \
-    --member="serviceAccount:${INFRA_SA_EMAIL}" \
-    --role=roles/storage.admin >/dev/null
+# scoped to that bucket rather than project-wide storage admin. Same
+# propagation caveat applies.
+bucket_bound=false
+for attempt in $(seq 1 10); do
+    if out=$(gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+                --project="${PROJECT}" \
+                --member="serviceAccount:${INFRA_SA_EMAIL}" \
+                --role=roles/storage.admin 2>&1); then
+        bucket_bound=true
+        break
+    fi
+    case "${out}" in
+        *"does not exist"*|*oncurrent*) sleep $(( attempt * 3 )) ;;
+        *) echo "${out}" >&2; exit 1 ;;
+    esac
+done
+# Without this the loop would fall through after exhausting its retries and the
+# script would print its success summary having granted nothing.
+if [[ "${bucket_bound}" != true ]]; then
+    echo "failed to grant storage.admin on gs://${STATE_BUCKET} after 10 attempts:" >&2
+    echo "${out}" >&2
+    exit 1
+fi
 
 cat <<SUMMARY
 
