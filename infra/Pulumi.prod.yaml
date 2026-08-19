@@ -32,8 +32,8 @@ config:
 
   # Cloud Build source. The GitHub App installation id comes from the URL of the
   # app's settings page after you install it on the repository.
-  gitea:githubOwner: CHANGEME
-  gitea:githubRepo: gitea
+  gitea:githubOwner: JMR-dev
+  gitea:githubRepo: Gitea
   gitea:githubAppInstallationId: "0"
   gitea:githubPatSecret: github-pat
 
