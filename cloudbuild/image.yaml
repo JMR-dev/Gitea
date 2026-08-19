@@ -1,0 +1,128 @@
+# Build the Gitea and Caddy images, push them, and roll them out.
+#
+# The rollout works by kicking podman-auto-update on the VM. That is why the
+# quadlets track a floating :prod tag rather than a digest: AutoUpdate=registry
+# compares the local digest against the registry's digest FOR A TAG, so a
+# digest-pinned image would give it nothing to poll.
+#
+# The :$SHORT_SHA and version tags are the audit trail and the rollback targets.
+
+substitutions:
+  _REGION: us-east1
+  _ZONE: us-east1-b
+  _DOMAIN: gitea.jasonmross.dev
+  _REPO: gitea
+  _VM: gitea-vm
+
+options:
+  # A user-specified service account cannot write to the legacy default log
+  # bucket. Without this the very first build fails on storage.objects.create.
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: 2400s
+
+steps:
+  - id: read-versions
+    name: bash
+    script: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      mkdir -p /workspace/vars
+      tr -d '[:space:]' < image/gitea.version > /workspace/vars/gitea_version
+      tr -d '[:space:]' < image/caddy.version > /workspace/vars/caddy_version
+      tr -d '[:space:]' < image/coraza.version > /workspace/vars/coraza_version
+      echo "gitea=$(cat /workspace/vars/gitea_version) caddy=$(cat /workspace/vars/caddy_version) coraza=$(cat /workspace/vars/coraza_version)"
+
+  - id: build-gitea
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        V=$(cat /workspace/vars/gitea_version)
+        IMG="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/gitea"
+        docker build \
+          --build-arg "GITEA_VERSION=$${V}" \
+          --tag "$${IMG}:prod" \
+          --tag "$${IMG}:$SHORT_SHA" \
+          --tag "$${IMG}:$${V}" \
+          image/gitea
+
+  - id: build-caddy
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    # xcaddy runs inside the Dockerfile's golang builder stage, so the plain
+    # docker builder is all this step needs -- no Go toolchain out here.
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        V=$(cat /workspace/vars/caddy_version)
+        C=$(cat /workspace/vars/coraza_version)
+        IMG="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/caddy"
+        # The Dockerfile asserts both the DNS and WAF modules are present, so a
+        # dropped --with fails the build rather than shipping an unprotected
+        # server. Caddy and coraza-caddy versions are coupled: coraza-caddy
+        # pins a minimum Caddy, and a mismatch fails here at `go get`.
+        docker build \
+          --build-arg "CADDY_VERSION=$${V}" \
+          --build-arg "CORAZA_VERSION=$${C}" \
+          --tag "$${IMG}:prod" \
+          --tag "$${IMG}:$SHORT_SHA" \
+          --tag "$${IMG}:$${V}" \
+          image/caddy
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        BASE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}"
+        docker push --all-tags "$${BASE}/gitea"
+        docker push --all-tags "$${BASE}/caddy"
+        # Record the digests actually published. Pulumi does not pin these, so
+        # the build log is where you look to find a rollback target.
+        docker image inspect "$${BASE}/gitea:prod" --format '{{index .RepoDigests 0}}'
+        docker image inspect "$${BASE}/caddy:prod" --format '{{index .RepoDigests 0}}'
+
+  - id: rollout
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    env:
+      # gcloud needs a writable HOME to generate the ephemeral SSH key it pushes
+      # through OS Login. The default HOME in this image is not writable.
+      - HOME=/workspace
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        gcloud compute ssh "${_VM}" \
+          --zone="${_ZONE}" \
+          --tunnel-through-iap \
+          --quiet \
+          --command 'sudo systemctl start podman-auto-update.service'
+
+  - id: verify
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    # A build that pushes a broken image and reports success is worse than a
+    # failed build. Gate on the app actually answering.
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          if curl -fsS --max-time 10 "https://${_DOMAIN}/api/healthz" >/dev/null; then
+            echo "healthz passed after $${i} attempt(s)"
+            exit 0
+          fi
+          echo "waiting for https://${_DOMAIN}/api/healthz ($${i}/30)"
+          sleep 10
+        done
+        echo "healthz never passed -- check 'journalctl -u podman-auto-update' on the VM;" >&2
+        echo "podman should have rolled back automatically if the new image failed to start." >&2
+        exit 1

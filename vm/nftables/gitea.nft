@@ -1,0 +1,54 @@
+#!/usr/sbin/nft -f
+#
+# Host firewall. Installed by vm/bootstrap.sh as /etc/sysconfig/nftables.conf.
+#
+# CRITICAL: this file must NEVER contain `flush ruleset`. The stock nftables
+# config ships with one, and it would wipe podman/netavark's NAT and forward
+# rules -- silently breaking all container networking on every reload. We touch
+# exactly one table and nothing else.
+#
+# Equally deliberate: there is NO forward chain here. Netavark manages forward
+# and nat rules in its own `netavark` table. A drop-policy forward chain in this
+# table would drop container traffic regardless of what netavark allows, because
+# a packet is dropped if any chain drops it.
+#
+# Traffic to published container ports (443, 2222) is DNAT'd in prerouting and
+# traverses forward, never input -- so the input rules below only actually
+# govern host-terminated traffic. Blocking abusive clients from container ports
+# is fail2ban's job, via the prerouting-hook action in
+# vm/fail2ban/action.d/nft-prerouting.conf.
+
+# Create-then-delete makes this reload idempotent: the bare `table` line is a
+# no-op if it already exists, so the delete can never fail on a fresh boot.
+table inet gitea_filter
+delete table inet gitea_filter
+
+table inet gitea_filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iif "lo" accept comment "loopback"
+		ct state established,related accept
+		ct state invalid drop
+
+		meta l4proto icmp accept comment "IPv4 ICMP"
+		meta l4proto ipv6-icmp accept comment "IPv6 ICMP / NDP"
+
+		# DHCP renewal from the GCE metadata server.
+		udp sport 67 udp dport 68 accept
+
+		# Admin SSH: IAP TCP forwarding range only. There is no other path in --
+		# the VPC firewall enforces the same restriction as the outer layer.
+		ip saddr 35.235.240.0/20 tcp dport 22 accept comment "IAP SSH"
+
+		# Only reached when Caddy runs with Network=host (the metadata-server
+		# fallback path). Harmless otherwise: on the bridge these are DNAT'd
+		# before input and never match here.
+		tcp dport { 80, 443 } accept comment "HTTP/HTTPS"
+		udp dport 443 accept comment "HTTP/3"
+		tcp dport 2222 accept comment "git over SSH"
+
+		# Rate-limited logging so a scan cannot fill the disk via journald.
+		limit rate 5/minute burst 10 packets log prefix "nft-drop-in: " level info
+	}
+}

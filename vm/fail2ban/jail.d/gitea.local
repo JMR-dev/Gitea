@@ -1,0 +1,53 @@
+# Installed by vm/bootstrap.sh as /etc/fail2ban/jail.d/gitea.local
+
+[DEFAULT]
+# Podman's journald log driver tags container output with CONTAINER_NAME, so
+# there are no log files to bind-mount, rotate, or keep in sync.
+backend  = systemd
+
+# Every ban goes through the prerouting action. The stock nftables/iptables
+# actions install INPUT rules, which do not see DNAT'd container traffic at all.
+banaction     = nft-prerouting
+banaction_allports = nft-prerouting
+
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+# Never lock out loopback, the podman bridge, or the IAP range -- IAP is the
+# only way back into this box.
+ignoreip = 127.0.0.1/8 ::1 ${PODMAN_SUBNET} 35.235.240.0/20
+
+[sshd]
+enabled  = true
+port     = 22
+# Belt-and-braces: port 22 already only accepts the IAP range, at both the VPC
+# firewall and nftables.
+maxretry = 5
+
+[gitea]
+enabled  = true
+filter   = gitea
+# One jail across all three ports rather than separate web/ssh jails: Gitea
+# serves them from one process with shared auth logging, and a bad actor should
+# lose every door at once, not just the one they knocked on.
+port     = 80,443,2222
+journalmatch = CONTAINER_NAME=gitea
+maxretry = 5
+bantime  = 1h
+
+[caddy-coraza]
+# Enabled ONLY when gitea:wafMode is "On". In DetectionOnly the WAF reports what
+# it would have blocked but lets it through, and escalating those reports into
+# nftables bans would turn a tuning false positive into a locked-out user --
+# strictly worse than the 403 that DetectionOnly was chosen to avoid.
+# vm/bootstrap.sh derives this from the same config value as SecRuleEngine.
+enabled  = ${CORAZA_JAIL_ENABLED}
+filter   = caddy-coraza
+port     = 80,443
+journalmatch = CONTAINER_NAME=caddy
+# Deliberately looser than the auth jail. A WAF verdict is a weaker signal than
+# a failed password, so it takes sustained hostile traffic to earn a ban.
+maxretry = 10
+findtime = 10m
+bantime  = 2h

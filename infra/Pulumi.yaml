@@ -1,0 +1,9 @@
+name: gitea
+runtime:
+  name: go
+  options:
+    binary: ./gitea-infra
+description: Gitea on a GCE VM running podman quadlets, fronted by Caddy with ACME DNS-01.
+config:
+  pulumi:disable-default-providers:
+    value: []

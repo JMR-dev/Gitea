@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically refresh Artifact Registry credentials
+
+[Timer]
+# Metadata-server access tokens last ~1h. Refreshing every 30m keeps a valid
+# credential on disk at all times, including whenever auto-update fires.
+OnBootSec=1min
+OnUnitActiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

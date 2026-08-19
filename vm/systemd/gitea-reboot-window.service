@@ -1,0 +1,10 @@
+[Unit]
+Description=Reboot into a maintenance window if unattended updates require it
+Documentation=man:needs-restarting(1)
+
+[Service]
+Type=oneshot
+# Reboots ONLY when the package layer says a reboot is actually required.
+# dnf5-automatic is configured with reboot=never precisely so this unit owns
+# the decision and restarts land in a predictable window.
+ExecStart=/usr/local/bin/gitea-reboot-if-needed

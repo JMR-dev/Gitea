@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly maintenance reboot window
+
+[Timer]
+# Sunday 05:00 UTC -- an hour after the weekly image rebuild has pushed :prod,
+# so a reboot picks up both OS and container updates in one outage.
+OnCalendar=Sun *-*-* 05:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

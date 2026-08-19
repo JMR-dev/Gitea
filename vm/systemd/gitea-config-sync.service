@@ -1,0 +1,16 @@
+[Unit]
+Description=Re-sync Gitea VM configuration from GCS and apply it
+Documentation=file:///usr/local/sbin/gitea-bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# --sync-only skips package installation and disk setup; it re-pulls the vm/
+# tree, re-renders the templates, and restarts only what actually changed.
+ExecStart=/usr/local/sbin/gitea-bootstrap --sync-only
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

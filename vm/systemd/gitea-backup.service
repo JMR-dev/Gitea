@@ -1,0 +1,12 @@
+[Unit]
+Description=Gitea dump to Cloud Storage
+After=gitea.service
+Requires=gitea.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gitea-backup
+# A dump of a large instance is not fast, and it should never be killed halfway.
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=idle

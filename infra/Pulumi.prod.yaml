@@ -1,0 +1,42 @@
+# Stack configuration for the `prod` stack.
+#
+# `pulumi config set --secret` is unnecessary here: every value is public
+# infrastructure metadata. The Gitea application secrets live in Secret Manager
+# and are never read by this program.
+config:
+  gcp:project: CHANGEME-gitea-project-id
+  gcp:region: us-east1
+
+  gitea:domain: gitea.jasonmross.dev
+  # The Cloud DNS *resource* name of the existing managed zone, which is not
+  # necessarily the DNS name. `gcloud dns managed-zones list` to find it.
+  gitea:dnsZone: CHANGEME-managed-zone-name
+  gitea:acmeEmail: CHANGEME@example.com
+
+  # us-east1 has zones b, c and d -- there is no us-east1-a.
+  gitea:zone: us-east1-b
+  # e2-small: 2 shared vCPU, 2 GB RAM. See docs/runbook.md ("Memory on a 2 GB
+  # instance") before adding anything else to this host.
+  gitea:machineType: e2-small
+  gitea:bootDiskGb: "20"
+  gitea:dataDiskGb: "30"
+
+  gitea:appName: Gitea
+  gitea:requireSigninView: "false"
+  gitea:podmanSubnet: 10.89.10.0/24
+
+  # Coraza WAF: On | DetectionOnly | Off.
+  # Start in DetectionOnly, review what it flags (docs/waf.md), then switch to
+  # On. The fail2ban jail that bans on WAF verdicts follows this value.
+  gitea:wafMode: DetectionOnly
+
+  # Cloud Build source. The GitHub App installation id comes from the URL of the
+  # app's settings page after you install it on the repository.
+  gitea:githubOwner: CHANGEME
+  gitea:githubRepo: gitea
+  gitea:githubAppInstallationId: "0"
+  gitea:githubPatSecret: github-pat
+
+  # Created by scripts/bootstrap.sh before the first `pulumi up`, because it is
+  # the identity that runs Pulumi and therefore cannot be created by Pulumi.
+  gitea:infraBuildServiceAccount: CHANGEME@CHANGEME.iam.gserviceaccount.com

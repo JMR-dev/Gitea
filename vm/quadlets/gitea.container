@@ -1,0 +1,69 @@
+# Rendered by vm/bootstrap.sh into /etc/containers/systemd/
+[Unit]
+Description=Gitea
+Documentation=https://docs.gitea.com/
+# Requires= (not just After=) on the mount: without it podman happily creates an
+# empty /var/lib/gitea and Gitea initialises a FRESH install on top of the
+# unmounted path, which looks like total data loss.
+Requires=var-lib-gitea.mount
+# Wants= (not just After=): the credential file has to be written before the
+# first pull, and the refresh timer alone would not guarantee that at boot.
+Wants=gitea-ar-auth.service
+After=var-lib-gitea.mount gitea-ar-auth.service network-online.target
+
+[Container]
+ContainerName=gitea
+Image=${IMAGE_GITEA}
+# Floating tag, deliberately. AutoUpdate=registry compares the local digest
+# against the registry's digest FOR A TAG; a digest-pinned image would give it
+# nothing to poll and the feature would be silently dead.
+AutoUpdate=registry
+# Registry auth for Artifact Registry. Two settings, because two different
+# code paths need it: PodmanArgs covers `podman run`'s pull, and the
+# io.containers.autoupdate.authfile label is what `podman auto-update` reads
+# when it checks the registry digest. (There is no AuthFile= key in the
+# [Container] group -- that one only exists for .image and .build units.)
+PodmanArgs=--authfile=/etc/containers/ar-auth.json
+Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
+Network=gitea.network
+LogDriver=journald
+
+# Git over SSH, public. HTTP is loopback-only: Caddy is the only thing that
+# should reach it, and binding it to 127.0.0.1 keeps the reverse-proxy wiring
+# identical whether Caddy runs on the bridge or on the host network.
+PublishPort=2222:2222
+PublishPort=127.0.0.1:3000:3000
+
+# No :z/:Z on the data volume -- bootstrap.sh sets a persistent SELinux fcontext
+# for it instead. A relabel flag here would force a recursive relabel of the
+# entire repository tree on every single container start.
+Volume=/var/lib/gitea:/var/lib/gitea
+Volume=/etc/gitea/app.ini:/etc/gitea/app.ini:ro,Z
+
+User=1000:1000
+Environment=GITEA_WORK_DIR=/var/lib/gitea
+
+# Notify=healthy is what arms auto-update rollback. Rollback only fires when the
+# restarted unit fails to START; without this a container that starts and is
+# broken would never roll back.
+HealthCmd=curl -fsS http://127.0.0.1:3000/api/healthz
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=60s
+HealthRetries=3
+Notify=healthy
+
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=always
+# On first boot the :prod image does not exist yet (it is built by the first
+# Cloud Build run). StartLimitIntervalSec=0 lets the unit retry indefinitely
+# instead of hitting the start limit and parking in `failed` forever.
+RestartSec=30
+StartLimitIntervalSec=0
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

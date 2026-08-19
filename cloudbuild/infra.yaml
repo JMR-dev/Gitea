@@ -1,0 +1,64 @@
+# Run Pulumi, then push the refreshed VM configuration onto the instance.
+#
+# Pulumi uploads the vm/ tree as bucket objects; the last step is what makes the
+# VM actually pick them up, instead of waiting for the next reboot.
+
+substitutions:
+  _REGION: us-east1
+  _ZONE: us-east1-b
+  _VM: gitea-vm
+  _STACK: prod
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/pulumi-config-passphrase/versions/latest
+      env: PULUMI_CONFIG_PASSPHRASE
+
+steps:
+  - id: pulumi
+    name: pulumi/pulumi-go:latest
+    dir: infra
+    entrypoint: bash
+    secretEnv: [PULUMI_CONFIG_PASSPHRASE]
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # Self-managed GCS backend: no external SaaS dependency, and the state
+        # bucket is versioned so history is recoverable.
+        pulumi login "gs://$PROJECT_ID-pulumi-state"
+        pulumi stack select "${_STACK}"
+
+        # Google credentials come from the build's metadata server; the GCS
+        # backend and the gcp provider both pick them up automatically.
+        if [ "$BRANCH_NAME" = "main" ]; then
+          pulumi up --yes --non-interactive
+        else
+          echo "branch $BRANCH_NAME is not main -- preview only"
+          pulumi preview --non-interactive
+        fi
+
+  - id: config-sync
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    env:
+      - HOME=/workspace
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if [ "$BRANCH_NAME" != "main" ]; then
+          echo "preview build -- skipping VM config sync"
+          exit 0
+        fi
+        # Re-render templates and restart only what actually changed.
+        gcloud compute ssh "${_VM}" \
+          --zone="${_ZONE}" \
+          --tunnel-through-iap \
+          --quiet \
+          --command 'sudo systemctl start gitea-config-sync.service && sudo systemctl status --no-pager gitea-config-sync.service'

@@ -1,0 +1,20 @@
+[Unit]
+Description=Refresh Artifact Registry credentials for root podman
+Documentation=file:///usr/local/sbin/gitea-bootstrap
+After=network-online.target
+Wants=network-online.target
+# Ordered before auto-update rather than merely wanted by it: a stale token here
+# is the single most common reason podman-auto-update silently stops working.
+Before=podman-auto-update.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/local/bin/gitea-ar-auth
+# The token is short-lived; a transient metadata-server hiccup should not leave
+# the file missing until the next timer tick.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

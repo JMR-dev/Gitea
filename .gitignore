@@ -1,0 +1,12 @@
+# Compiled Pulumi program (Pulumi.yaml points the go runtime at this binary)
+/infra/gitea-infra
+
+# Pulumi local state / plugin cache
+.pulumi/
+
+# Never commit a rendered app.ini -- it contains SECRET_KEY and INTERNAL_TOKEN
+**/app.ini
+!vm/config/app.ini.tmpl
+
+*.swp
+.DS_Store
