@@ -1,6 +1,7 @@
 #!/usr/sbin/nft -f
 #
-# Host firewall. Installed by vm/bootstrap.sh as /etc/sysconfig/nftables.conf.
+# Host firewall. Rendered by vm/bootstrap.sh into /etc/sysconfig/nftables.conf,
+# substituting ${PODMAN_SUBNET} and ${PODMAN_GATEWAY}.
 #
 # CRITICAL: this file must NEVER contain `flush ruleset`. The stock nftables
 # config ships with one, and it would wipe podman/netavark's NAT and forward
@@ -36,6 +37,14 @@ table inet gitea_filter {
 
 		# DHCP renewal from the GCE metadata server.
 		udp sport 67 udp dport 68 accept
+
+		# Container DNS. aardvark-dns answers on the bridge gateway, so lookups
+		# from containers terminate on the host and arrive here, not in forward.
+		# Netavark accepts them in its own table, but a packet has to survive
+		# every input-hook chain, and this one's drop policy would discard it
+		# anyway. Without this rule containers resolve nothing -- Caddy cannot
+		# reach Let's Encrypt and Gitea cannot reach webhook or mirror hosts.
+		ip saddr ${PODMAN_SUBNET} ip daddr ${PODMAN_GATEWAY} meta l4proto { tcp, udp } th dport 53 accept comment "container DNS"
 
 		# Admin SSH: IAP TCP forwarding range only. There is no other path in --
 		# the VPC firewall enforces the same restriction as the outer layer.
