@@ -8,6 +8,7 @@ package dns
 import (
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/compute"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/dns"
+	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/projects"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"gitea-infra/pkg/config"
@@ -56,6 +57,20 @@ func New(
 		ManagedZone: pulumi.String(zone.Name),
 		Role:        pulumi.String("roles/dns.admin"),
 		Member:      pulumi.Sprintf("serviceAccount:%s", vmServiceAccountEmail),
+	}, pulumi.DependsOn(deps)); err != nil {
+		return nil, err
+	}
+
+	// The zone-scoped grant is not enough on its own: the googleclouddns plugin
+	// maps the domain to a zone by LISTING the project's managed zones, and a
+	// list is a project-level permission that no zone binding can confer. Without
+	// this, presenting the challenge fails with a bare 403. dns.reader adds
+	// read-only access and nothing else, and every write stays scoped to the zone
+	// above.
+	if _, err := projects.NewIAMMember(ctx, "gitea-vm-dns-reader", &projects.IAMMemberArgs{
+		Project: pulumi.String(cfg.Project),
+		Role:    pulumi.String("roles/dns.reader"),
+		Member:  pulumi.Sprintf("serviceAccount:%s", vmServiceAccountEmail),
 	}, pulumi.DependsOn(deps)); err != nil {
 		return nil, err
 	}

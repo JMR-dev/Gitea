@@ -17,7 +17,8 @@ ${DOMAIN} {
 	tls {
 		dns googleclouddns {
 			# Application Default Credentials come from the GCE metadata server.
-			# The VM service account holds roles/dns.admin scoped to this zone only.
+			# The VM service account holds roles/dns.admin scoped to this zone, plus
+			# project-level dns.reader so the plugin can list zones to find it.
 			gcp_project {env.GCP_PROJECT}
 		}
 		# Only used for propagation checks. If issuance stalls waiting for
