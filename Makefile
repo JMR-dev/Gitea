@@ -44,12 +44,15 @@ up: check ## Apply the infrastructure
 #   to cb-image@, not to whatever default Cloud Build account this project
 #   happens to have -- and on newer projects the legacy default does not exist.
 #   Without this the images push fine and the rollout step fails.
+# SHORT_SHA: Cloud Build fills it in only for triggered builds. For `builds
+#   submit` it is empty, and image.yaml's `--tag <image>:$SHORT_SHA` becomes an
+#   invalid reference that fails the build.
 .PHONY: build
 build: ## Build and roll out the container images via Cloud Build
 	gcloud builds submit --config cloudbuild/image.yaml --project $(PROJECT) \
 		--region=$(REGION) \
 		--service-account=projects/$(PROJECT)/serviceAccounts/cb-image@$(PROJECT).iam.gserviceaccount.com \
-		--substitutions=_REGION=$(REGION),_ZONE=$(ZONE)
+		--substitutions=_REGION=$(REGION),_ZONE=$(ZONE),SHORT_SHA=$(shell git rev-parse --short=7 HEAD)
 
 .PHONY: rollout
 rollout: ## Pull the latest :prod images onto the VM right now
