@@ -100,6 +100,11 @@ make backup     # on-demand gitea dump to GCS
 make ssh        # shell via IAP
 ```
 
+The targets read the project and zone from the Pulumi stack, which needs
+Application Default Credentials (`gcloud auth application-default login`).
+Without them `pulumi config get` fails quietly and gcloud runs with an empty
+`--project=`; pass `PROJECT=<project-id>` to skip the lookup.
+
 A push to `main` under `image/**` builds, pushes, rolls out, and gates on
 `/api/healthz`. A push under `infra/**` or `vm/**` runs `pulumi up` and then
 re-syncs the VM configuration. Anything else does nothing.
