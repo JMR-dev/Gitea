@@ -36,6 +36,9 @@ steps:
 
   - id: build-gitea
     name: gcr.io/cloud-builders/docker
+    # Both Dockerfiles are written for BuildKit (`# syntax=`, COPY --chmod). This
+    # builder image defaults to the legacy builder, which rejects --chmod.
+    env: [DOCKER_BUILDKIT=1]
     entrypoint: bash
     args:
       - -c
@@ -52,6 +55,7 @@ steps:
 
   - id: build-caddy
     name: gcr.io/cloud-builders/docker
+    env: [DOCKER_BUILDKIT=1]
     entrypoint: bash
     # xcaddy runs inside the Dockerfile's golang builder stage, so the plain
     # docker builder is all this step needs -- no Go toolchain out here.
