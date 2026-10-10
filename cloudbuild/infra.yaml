@@ -29,6 +29,10 @@ steps:
       - -c
       - |
         set -euo pipefail
+        # Pulumi.yaml points the go runtime at a prebuilt binary, so Pulumi
+        # runs ./gitea-infra rather than compiling the program itself.
+        go build -o gitea-infra .
+
         # Self-managed GCS backend: no external SaaS dependency, and the state
         # bucket is versioned so history is recoverable.
         pulumi login "gs://$PROJECT_ID-pulumi-state"
