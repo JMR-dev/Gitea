@@ -58,6 +58,13 @@ curl -vI https://gitea.jasonmross.dev            # valid Let's Encrypt cert
 DNS-01 means renewal does not need inbound port 80 at all. That is testable:
 temporarily remove the `gitea-allow-web` port 80 rule and force a renewal.
 
+The ACME account and certificates live in the `caddy-data` podman volume, under
+`/var/lib/containers` on the **boot** disk, not the data disk. Replacing the
+instance therefore re-registers and re-issues on first start. That is fine
+occasionally, but Let's Encrypt allows 5 duplicate certificates per week, so
+several replacements in a few days can lock issuance out until the window
+rolls over.
+
 ### fail2ban — drill it, do not trust the status output
 
 ```bash
