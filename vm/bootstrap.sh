@@ -198,8 +198,21 @@ setup_nftables() {
     systemctl disable --now firewalld >/dev/null 2>&1 || true
     systemctl mask firewalld >/dev/null 2>&1 || true
 
-    install -m 0600 "${STATE_DIR}/nftables/gitea.nft" /etc/sysconfig/nftables.conf
-    nft -c -f /etc/sysconfig/nftables.conf || die "nftables ruleset failed validation"
+    [[ -n "${PODMAN_SUBNET}" && -n "${PODMAN_GATEWAY}" ]] \
+        || die "podman-subnet/podman-gateway metadata missing; cannot render the ruleset"
+
+    # Validate BEFORE installing. A ruleset that fails to parse must never land
+    # in /etc/sysconfig: nftables.service would fail to load it on the next boot
+    # and the host would come up with no gitea_filter table at all.
+    local tmp
+    tmp=$(mktemp)
+    envsubst '${PODMAN_SUBNET} ${PODMAN_GATEWAY}' < "${STATE_DIR}/nftables/gitea.nft" > "${tmp}"
+    if ! nft -c -f "${tmp}"; then
+        rm -f "${tmp}"
+        die "nftables ruleset failed validation"
+    fi
+    install -m 0600 "${tmp}" /etc/sysconfig/nftables.conf
+    rm -f "${tmp}"
     systemctl enable --now nftables
     systemctl reload nftables
 
