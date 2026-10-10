@@ -3,7 +3,8 @@
 
 PROJECT ?= $(shell cd infra && pulumi config get gcp:project 2>/dev/null)
 REGION  ?= $(shell cd infra && pulumi config get gcp:region 2>/dev/null || echo us-east1)
-ZONE    ?= $(shell cd infra && pulumi config get gitea:zone 2>/dev/null || echo $(REGION)-a)
+# -b, matching the default in infra/pkg/config: us-east1 has no -a zone.
+ZONE    ?= $(shell cd infra && pulumi config get gitea:zone 2>/dev/null || echo $(REGION)-b)
 VM      ?= gitea-vm
 
 .PHONY: help
@@ -19,9 +20,11 @@ bootstrap: ## One-time project setup (run before the first `make up`)
 fmt: ## Format Go sources
 	cd infra && gofmt -w .
 
+# -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
+#   Pulumi runs it rather than compiling. Without it preview/up fail outright.
 .PHONY: check
 check: ## Build and vet the Pulumi program, and syntax-check the shell scripts
-	cd infra && go build ./... && go vet ./...
+	cd infra && go build -o gitea-infra . && go vet ./...
 	bash -n vm/bootstrap.sh scripts/bootstrap.sh
 	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh || echo "shellcheck not installed -- skipped"
 
