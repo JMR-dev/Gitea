@@ -99,6 +99,16 @@ if ! has_version github-pat; then
     echo "            printf %s '<token>' | gcloud secrets versions add github-pat --project=${PROJECT} --data-file=-"
 fi
 
+# The ACME contact address Caddy registers with Let's Encrypt. A secret only to
+# keep it out of this public repository and out of instance metadata. Created
+# empty: the address is yours to choose, not something to generate.
+ensure_secret gitea-acme-email
+if ! has_version gitea-acme-email; then
+    echo "    NOTE: secret 'gitea-acme-email' has no value yet. Caddy still issues"
+    echo "          certificates without it, but with no contact address. Set it with:"
+    echo "            printf %s 'you@example.com' | gcloud secrets versions add gitea-acme-email --project=${PROJECT} --data-file=-"
+fi
+
 # Gitea's signing secrets. These MUST come from `gitea generate secret`:
 # INTERNAL_TOKEN is a JWT, and a random string there produces an instance that
 # starts and then fails every internal API call in a confusing way.
@@ -247,7 +257,7 @@ Next:
      pulumi stack init prod
      pulumi config set gcp:project ${PROJECT}
      pulumi config set gitea:infraBuildServiceAccount ${INFRA_SA_EMAIL}
-     # ...plus domain, dnsZone, acmeEmail, githubOwner, githubAppInstallationId
+     # ...plus domain, dnsZone, githubOwner, githubAppInstallationId
      pulumi up
   4. make build     # or, spelled out:
      gcloud builds submit --config cloudbuild/image.yaml --project ${PROJECT} \\

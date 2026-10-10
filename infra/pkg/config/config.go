@@ -18,7 +18,6 @@ type Config struct {
 
 	Domain     string
 	DNSZone    string
-	ACMEEmail  string
 	AppName    string
 	PodmanCIDR string
 
@@ -51,7 +50,6 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		Zone:       c.Get("zone"),
 		Domain:     c.Require("domain"),
 		DNSZone:    c.Require("dnsZone"),
-		ACMEEmail:  c.Require("acmeEmail"),
 		AppName:    c.Get("appName"),
 		PodmanCIDR: c.Get("podmanSubnet"),
 

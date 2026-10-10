@@ -26,3 +26,9 @@ var Names = []string{
 	"gitea-oauth2-jwt-secret",
 	"gitea-lfs-jwt-secret",
 }
+
+// ACMEEmail holds the contact address Caddy registers with Let's Encrypt. It
+// is a secret not because it signs anything but to keep it out of this public
+// repository and out of instance metadata. Unlike Names it is supplied by the
+// operator, never generated, so the VM gets read access only.
+const ACMEEmail = "gitea-acme-email"

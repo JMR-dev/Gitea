@@ -63,6 +63,9 @@ func main() {
 		if err := iam.GrantSecrets(ctx, cfg, accounts, secrets.Names); err != nil {
 			return err
 		}
+		if err := iam.GrantSecretRead(ctx, cfg, accounts, secrets.ACMEEmail); err != nil {
+			return err
+		}
 
 		buckets, err := storage.New(ctx, cfg, vmDir, apis)
 		if err != nil {

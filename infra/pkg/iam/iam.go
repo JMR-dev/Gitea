@@ -123,12 +123,7 @@ func GrantRegistry(ctx *pulumi.Context, cfg *config.Config, a *Accounts, repo *a
 // scripts/bootstrap.sh, not by Pulumi; see package secrets for why.
 func GrantSecrets(ctx *pulumi.Context, cfg *config.Config, a *Accounts, names []string) error {
 	for _, name := range names {
-		if _, err := secretmanager.NewSecretIamMember(ctx, "vm-read-"+name, &secretmanager.SecretIamMemberArgs{
-			Project:  pulumi.String(cfg.Project),
-			SecretId: pulumi.String(name),
-			Role:     pulumi.String("roles/secretmanager.secretAccessor"),
-			Member:   pulumi.Sprintf("serviceAccount:%s", a.VM.Email),
-		}); err != nil {
+		if err := GrantSecretRead(ctx, cfg, a, name); err != nil {
 			return err
 		}
 		// vm/bootstrap.sh's safety net adds a version if one is somehow missing.
@@ -142,6 +137,19 @@ func GrantSecrets(ctx *pulumi.Context, cfg *config.Config, a *Accounts, names []
 		}
 	}
 	return nil
+}
+
+// GrantSecretRead gives the VM read-only access to one secret. On its own it is
+// for operator-supplied values the VM must never write; GrantSecrets adds
+// version-adder on top for the ones it may generate.
+func GrantSecretRead(ctx *pulumi.Context, cfg *config.Config, a *Accounts, name string) error {
+	_, err := secretmanager.NewSecretIamMember(ctx, "vm-read-"+name, &secretmanager.SecretIamMemberArgs{
+		Project:  pulumi.String(cfg.Project),
+		SecretId: pulumi.String(name),
+		Role:     pulumi.String("roles/secretmanager.secretAccessor"),
+		Member:   pulumi.Sprintf("serviceAccount:%s", a.VM.Email),
+	})
+	return err
 }
 
 // GrantBuckets: read-only on config, write-only on backups. The VM can create a

@@ -36,7 +36,6 @@ AR_HOST=$(meta ar-host)
 IMAGE_GITEA=$(meta image-gitea)
 IMAGE_CADDY=$(meta image-caddy)
 DOMAIN=$(meta domain)
-ACME_EMAIL=$(meta acme-email)
 APP_NAME=$(meta app-name)
 PODMAN_SUBNET=$(meta podman-subnet)
 PODMAN_GATEWAY=$(meta podman-gateway)
@@ -57,7 +56,7 @@ case "${WAF_MODE}" in
 esac
 : "${DATA_DISK_DEVICE:=/dev/disk/by-id/google-gitea-data}"
 
-export GCP_PROJECT AR_HOST IMAGE_GITEA IMAGE_CADDY DOMAIN ACME_EMAIL APP_NAME
+export GCP_PROJECT AR_HOST IMAGE_GITEA IMAGE_CADDY DOMAIN APP_NAME
 export PODMAN_SUBNET PODMAN_GATEWAY REQUIRE_SIGNIN_VIEW WAF_MODE
 
 # ---------------------------------------------------------------------------
@@ -429,6 +428,20 @@ render_all() {
         rm -f /etc/sysctl.d/90-gitea-caddy.conf
     fi
 
+    # The ACME contact address lives in Secret Manager rather than instance
+    # metadata, to keep it out of the public repository. Without it Caddy still
+    # issues certificates, just under an account with no contact address -- far
+    # better than an empty `email` directive, which fails to parse and leaves
+    # nothing serving TLS.
+    local acme_email caddy_email
+    if acme_email=$(gcloud secrets versions access latest --secret=gitea-acme-email \
+                        --project="${GCP_PROJECT}" 2>/dev/null) && [[ -n "${acme_email}" ]]; then
+        caddy_email="email ${acme_email}"
+    else
+        warn "secret gitea-acme-email unreadable -- Caddy will register without a contact address"
+        caddy_email="# no ACME contact address: secret gitea-acme-email was unreadable at render time"
+    fi
+
     # Trust both the bridge CIDR and loopback so this value stays correct in
     # either Caddy networking mode. Rootful podman SNATs host-loopback traffic
     # to the bridge gateway, so the CIDR covers the host-network case too.
@@ -444,7 +457,8 @@ render_all() {
            GITEA_UPSTREAM="${gitea_upstream}" \
            CADDY_NETWORK="${caddy_network}" \
            CADDY_PUBLISH_PORTS="${caddy_publish}" \
-           CADDY_SYSCTL="${caddy_sysctl}"
+           CADDY_SYSCTL="${caddy_sysctl}" \
+           CADDY_EMAIL="${caddy_email}"
 
     # app.ini is 0400 owned by uid 1000: it holds SECRET_KEY and INTERNAL_TOKEN,
     # and the container runs as that uid and must be able to read it.
@@ -453,7 +467,7 @@ render_all() {
         && changed=1
 
     render "${STATE_DIR}/config/Caddyfile.tmpl" /etc/caddy/Caddyfile root:root 0644 \
-        '${DOMAIN} ${ACME_EMAIL} ${GITEA_UPSTREAM} ${WAF_MODE}' \
+        '${DOMAIN} ${CADDY_EMAIL} ${GITEA_UPSTREAM} ${WAF_MODE}' \
         && changed=1
 
     local unit
