@@ -11,7 +11,6 @@ config:
   # The Cloud DNS *resource* name of the existing managed zone, which is not
   # necessarily the DNS name. `gcloud dns managed-zones list` to find it.
   gitea:dnsZone: CHANGEME-managed-zone-name
-  gitea:acmeEmail: CHANGEME@example.com
 
   # us-east1 has zones b, c and d -- there is no us-east1-a.
   gitea:zone: us-east1-b

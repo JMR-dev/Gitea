@@ -47,14 +47,23 @@ printf %s '<token>' | gcloud secrets versions add github-pat --data-file=- --pro
 # 3. Confirm the Cloud DNS zone is authoritative. DNS-01 cannot work otherwise.
 dig NS gitea.jasonmross.dev
 
-# 4. Configure and apply.
+# 4. The ACME contact address. Kept in Secret Manager, not stack config, so it
+#    stays out of this public repo; the VM reads it when rendering the Caddyfile.
+printf %s 'you@example.com' | gcloud secrets versions add gitea-acme-email --data-file=- --project <project-id>
+
+# 5. Configure and apply. Pulumi's GCS backend and Google provider use
+#    Application Default Credentials, not your gcloud login.
+gcloud auth application-default login
+# Use the passphrase bootstrap.sh generated. Letting `stack init` prompt for a
+# new one encrypts the stack with a key Cloud Build's infra trigger never sees.
+export PULUMI_CONFIG_PASSPHRASE=$(gcloud secrets versions access latest \
+    --secret=pulumi-config-passphrase --project <project-id>)
 cd infra
 pulumi login gs://<project-id>-pulumi-state
 pulumi stack init prod
 pulumi config set gcp:project <project-id>
 pulumi config set gitea:domain gitea.jasonmross.dev
 pulumi config set gitea:dnsZone <cloud-dns-managed-zone-name>   # gcloud dns managed-zones list
-pulumi config set gitea:acmeEmail you@example.com
 pulumi config set gitea:githubOwner <owner>
 pulumi config set gitea:githubAppInstallationId <id>
 pulumi config set gitea:infraBuildServiceAccount cb-infra@<project-id>.iam.gserviceaccount.com
@@ -62,10 +71,10 @@ pulumi config set gitea:infraBuildServiceAccount cb-infra@<project-id>.iam.gserv
 pulumi config set gitea:wafMode DetectionOnly
 pulumi up
 
-# 5. First image build. Until this runs, the :prod images do not exist.
+# 6. First image build. Until this runs, the :prod images do not exist.
 cd .. && make build
 
-# 6. Create the admin user.
+# 7. Create the admin user.
 make ssh
 sudo podman exec -u 1000 gitea gitea admin user create \
     -c /etc/gitea/app.ini --admin --username <you> --email <you@example.com> --random-password
@@ -73,7 +82,7 @@ sudo podman exec -u 1000 gitea gitea admin user create \
 
 ### Expected on the first run, not a bug
 
-Between step 4 and step 5 the `:prod` images do not exist yet, so `gitea.service`
+Between step 5 and step 6 the `:prod` images do not exist yet, so `gitea.service`
 and `caddy.service` crash-loop. That is intentional: the units carry
 `Restart=always` with `StartLimitIntervalSec=0`, so they recover on their own
 within 30 seconds of the first successful push. Likewise, `app.ini` is not

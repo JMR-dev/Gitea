@@ -5,7 +5,7 @@
 #   googleclouddns -- ACME DNS-01, so issuance and renewal never need inbound 80
 #   coraza_waf     -- OWASP Coraza with the Core Rule Set embedded in the binary
 {
-	email ${ACME_EMAIL}
+	${CADDY_EMAIL}
 	admin 127.0.0.1:2019
 	# Required by coraza-caddy: Caddy has no built-in ordering for a third-party
 	# directive, and the WAF must run before anything that could act on the

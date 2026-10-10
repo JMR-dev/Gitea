@@ -169,7 +169,6 @@ func New(
 			"image-caddy": pulumi.String(imageCaddy),
 
 			"domain":              pulumi.String(cfg.Domain),
-			"acme-email":          pulumi.String(cfg.ACMEEmail),
 			"app-name":            pulumi.String(cfg.AppName),
 			"require-signin-view": pulumi.String(strconv.FormatBool(cfg.RequireSigninView)),
 
