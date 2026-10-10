@@ -152,6 +152,17 @@ func GrantSecretRead(ctx *pulumi.Context, cfg *config.Config, a *Accounts, name 
 	return err
 }
 
+// GrantBuildSource lets cb-image@ read the tarballs `make build` stages, and
+// nothing else in storage. See storage.New for why the bucket exists.
+func GrantBuildSource(ctx *pulumi.Context, a *Accounts, sourceBucket *storage.Bucket) error {
+	_, err := storage.NewBucketIAMMember(ctx, "img-build-source-reader", &storage.BucketIAMMemberArgs{
+		Bucket: sourceBucket.Name,
+		Role:   pulumi.String("roles/storage.objectViewer"),
+		Member: pulumi.Sprintf("serviceAccount:%s", a.Image.Email),
+	})
+	return err
+}
+
 // GrantBuckets: read-only on config, write-only on backups. The VM can create a
 // backup but cannot read or delete existing ones, which limits what ransomware
 // on the box could do to the backup history.

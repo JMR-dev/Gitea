@@ -74,6 +74,9 @@ func main() {
 		if err := iam.GrantBuckets(ctx, accounts, buckets.Config, buckets.Backup); err != nil {
 			return err
 		}
+		if err := iam.GrantBuildSource(ctx, accounts, buckets.BuildSource); err != nil {
+			return err
+		}
 
 		// The zone already exists and is delegated; this only adds the A record
 		// and the zone-scoped permission Caddy needs for DNS-01.
@@ -100,6 +103,7 @@ func main() {
 		ctx.Export("registry", pulumi.Sprintf("%s/%s/%s", cfg.ARHost(), cfg.Project, registry.RepoID))
 		ctx.Export("configBucket", buckets.Config.Name)
 		ctx.Export("backupBucket", buckets.Backup.Name)
+		ctx.Export("buildSourceBucket", buckets.BuildSource.Name)
 		ctx.Export("configHash", pulumi.String(buckets.ConfigHash))
 		ctx.Export("vmServiceAccount", accounts.VM.Email)
 		ctx.Export("imageServiceAccount", accounts.Image.Email)

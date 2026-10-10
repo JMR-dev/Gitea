@@ -1,4 +1,4 @@
-// Package storage holds the two buckets and, importantly, uploads the vm/ tree
+// Package storage holds the buckets and, importantly, uploads the vm/ tree
 // as Pulumi-managed objects.
 //
 // Uploading the VM configuration through Pulumi (rather than a `gcloud storage
@@ -24,6 +24,8 @@ import (
 type Buckets struct {
 	Config *storage.Bucket
 	Backup *storage.Bucket
+	// BuildSource stages the source tarball for `make build`. See New.
+	BuildSource *storage.Bucket
 	// ConfigHash changes whenever any file under vm/ changes. It is written into
 	// instance metadata so a config change is visible from `describe`, and so
 	// there is something to compare against when debugging drift.
@@ -72,12 +74,37 @@ func New(ctx *pulumi.Context, cfg *config.Config, vmDir string, deps []pulumi.Re
 		return nil, err
 	}
 
+	// Where `gcloud builds submit` stages its source tarball. Builds run as
+	// cb-image@, which needs storage.objects.get on that tarball. The default
+	// staging bucket is <project>_cloudbuild, created by gcloud on the first
+	// submit -- after `pulumi up`, so there is nothing to bind to in advance --
+	// and project-wide objectViewer would also open the backup and state
+	// buckets. A dedicated bucket keeps the grant exact. Triggered builds fetch
+	// source through the GitHub connection and never touch it.
+	buildSourceBucket, err := storage.NewBucket(ctx, "gitea-build-source", &storage.BucketArgs{
+		Name:                     pulumi.Sprintf("%s-gitea-build-source", cfg.Project),
+		Location:                 pulumi.String(strings.ToUpper(cfg.Region)),
+		UniformBucketLevelAccess: pulumi.Bool(true),
+		PublicAccessPrevention:   pulumi.String("enforced"),
+		// Tarballs are only read once, by the build they were uploaded for.
+		LifecycleRules: storage.BucketLifecycleRuleArray{
+			&storage.BucketLifecycleRuleArgs{
+				Action:    &storage.BucketLifecycleRuleActionArgs{Type: pulumi.String("Delete")},
+				Condition: &storage.BucketLifecycleRuleConditionArgs{Age: pulumi.Int(7)},
+			},
+		},
+		ForceDestroy: pulumi.Bool(true),
+	}, opts)
+	if err != nil {
+		return nil, err
+	}
+
 	hash, err := uploadTree(ctx, configBucket, vmDir)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Buckets{Config: configBucket, Backup: backupBucket, ConfigHash: hash}, nil
+	return &Buckets{Config: configBucket, Backup: backupBucket, BuildSource: buildSourceBucket, ConfigHash: hash}, nil
 }
 
 // uploadTree mirrors vmDir into gs://<bucket>/vm/ and returns a content hash of

@@ -44,6 +44,10 @@ up: check ## Apply the infrastructure
 #   to cb-image@, not to whatever default Cloud Build account this project
 #   happens to have -- and on newer projects the legacy default does not exist.
 #   Without this the images push fine and the rollout step fails.
+# --gcs-source-staging-dir: running as cb-image@, the build must be able to read
+#   the uploaded source. Pulumi grants that on this bucket only; the default
+#   <project>_cloudbuild bucket is unreadable to it and the build fails at
+#   "could not resolve source".
 # SHORT_SHA: Cloud Build fills it in only for triggered builds. For `builds
 #   submit` it is empty, and image.yaml's `--tag <image>:$SHORT_SHA` becomes an
 #   invalid reference that fails the build.
@@ -52,6 +56,7 @@ build: ## Build and roll out the container images via Cloud Build
 	gcloud builds submit --config cloudbuild/image.yaml --project $(PROJECT) \
 		--region=$(REGION) \
 		--service-account=projects/$(PROJECT)/serviceAccounts/cb-image@$(PROJECT).iam.gserviceaccount.com \
+		--gcs-source-staging-dir=gs://$(PROJECT)-gitea-build-source/source \
 		--substitutions=_REGION=$(REGION),_ZONE=$(ZONE),SHORT_SHA=$(shell git rev-parse --short=7 HEAD)
 
 .PHONY: rollout
