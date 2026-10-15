@@ -1,5 +1,7 @@
 // Package gke builds the cluster that runs Gitea Actions jobs: one zonal GKE
-// Standard cluster, used for nothing else, with a single autoscaled node pool.
+// Standard cluster, used for nothing else, with an autoscaled spot pool for
+// the runners and ordinary jobs, and a tainted on-demand pool for heavy jobs
+// that scales from zero.
 //
 // Why GKE at all: the runner must not live on gitea-vm. The 2 GB box has no
 // headroom for it (docs/runbook.md), and a runner on the host it deploys is the
@@ -28,10 +30,21 @@ import (
 // get-credentials` and the runbook never have to look it up.
 const Name = "gitea-runners"
 
+// HeavyPoolKey and HeavyPoolValue are the node label, and the NoSchedule taint,
+// that mark the heavy pool. `runs-on: heavy` job pods select and tolerate it
+// (package runner). Nothing else does, so the pool runs nothing between heavy
+// jobs and the autoscaler takes it back to zero.
+const (
+	HeavyPoolKey   = "gitea-runner-pool"
+	HeavyPoolValue = "heavy"
+)
+
 type Cluster struct {
 	Cluster  *container.Cluster
 	NodePool *container.NodePool
-	NodeSA   *serviceaccount.Account
+	// HeavyPool is nil when gitea:runnerHeavyMaxNodes is 0.
+	HeavyPool *container.NodePool
+	NodeSA    *serviceaccount.Account
 }
 
 // New returns nil (without error) when gitea:runnersEnabled is not set, the same
@@ -194,36 +207,9 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 			MaxUnavailable: pulumi.Int(0),
 		},
 
-		NodeConfig: &container.NodePoolNodeConfigArgs{
-			MachineType: pulumi.String(cfg.RunnerMachineType),
-			// Spot by default: roughly a third of the on-demand price, at the
-			// cost of the occasional preempted job, which can simply be re-run.
-			Spot:      pulumi.Bool(cfg.RunnerSpot),
-			ImageType: pulumi.String("COS_CONTAINERD"),
-
-			ServiceAccount: nodeSA.Email,
-			OauthScopes:    pulumi.ToStringArray([]string{"https://www.googleapis.com/auth/cloud-platform"}),
-
-			// Job images and build layers live on the runner's PVCs, not here.
-			DiskType:   pulumi.String("pd-balanced"),
-			DiskSizeGb: pulumi.Int(30),
-
-			// GKE_METADATA is what puts the GKE metadata server in front of
-			// pods. Without it, pods would see the node's real metadata server
-			// and could take the node SA's token.
-			WorkloadMetadataConfig: &container.NodePoolNodeConfigWorkloadMetadataConfigArgs{
-				Mode: pulumi.String("GKE_METADATA"),
-			},
-			ShieldedInstanceConfig: &container.NodePoolNodeConfigShieldedInstanceConfigArgs{
-				EnableSecureBoot:          pulumi.Bool(true),
-				EnableIntegrityMonitoring: pulumi.Bool(true),
-			},
-			KubeletConfig: &container.NodePoolNodeConfigKubeletConfigArgs{
-				// A string, not a bool, in this provider.
-				InsecureKubeletReadonlyPortEnabled: pulumi.String("FALSE"),
-			},
-			ResourceLabels: pulumi.StringMap{"app": pulumi.String("gitea")},
-		},
+		// Spot by default: roughly a third of the on-demand price, at the cost
+		// of the occasional preempted job, which can simply be re-run.
+		NodeConfig: nodeConfig(nodeSA, cfg.RunnerMachineType, cfg.RunnerSpot),
 	}, opts,
 		// Nodes created before the role binding lands cannot write logs, and
 		// GKE marks the pool unhealthy.
@@ -235,5 +221,103 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 		return nil, err
 	}
 
-	return &Cluster{Cluster: cluster, NodePool: pool, NodeSA: nodeSA}, nil
+	heavy, err := heavyPool(ctx, cfg, cluster, nodeSA, opts, nodeRole)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Cluster{Cluster: cluster, NodePool: pool, HeavyPool: heavy, NodeSA: nodeSA}, nil
+}
+
+// heavyPool is the node pool `runs-on: heavy` jobs run on: bigger machines,
+// from zero nodes. Its taint keeps everything else -- the runners, ordinary job
+// pods, GKE's own Deployments -- off it, so an idle pool really is empty and
+// costs nothing but its configuration.
+//
+// On demand, not spot, on purpose: this is where `pulumi up` runs, and a
+// preempted apply leaves a stack with pending operations to clear by hand.
+// A pool that exists only while a job runs makes the price difference small.
+func heavyPool(
+	ctx *pulumi.Context,
+	cfg *config.Config,
+	cluster *container.Cluster,
+	nodeSA *serviceaccount.Account,
+	opts pulumi.ResourceOption,
+	nodeRole pulumi.Resource,
+) (*container.NodePool, error) {
+	if cfg.RunnerHeavyMaxNodes == 0 {
+		return nil, nil
+	}
+
+	nc := nodeConfig(nodeSA, cfg.RunnerHeavyMachineType, false)
+	// Labels and taints are part of the pool's node template, which is what
+	// lets the autoscaler scale it up from zero for a pod that selects them.
+	nc.Labels = pulumi.StringMap{HeavyPoolKey: pulumi.String(HeavyPoolValue)}
+	nc.Taints = container.NodePoolNodeConfigTaintArray{
+		&container.NodePoolNodeConfigTaintArgs{
+			Key:    pulumi.String(HeavyPoolKey),
+			Value:  pulumi.String(HeavyPoolValue),
+			Effect: pulumi.String("NO_SCHEDULE"),
+		},
+	}
+
+	return container.NewNodePool(ctx, "gitea-runners-heavy-pool", &container.NodePoolArgs{
+		// Auto-named, like the main pool, so a machine type change creates
+		// the new pool before deleting the old one.
+		Cluster:  cluster.ID(),
+		Location: pulumi.String(cfg.Zone),
+
+		InitialNodeCount: pulumi.Int(0),
+		Autoscaling: &container.NodePoolAutoscalingArgs{
+			MinNodeCount: pulumi.Int(0),
+			MaxNodeCount: pulumi.Int(cfg.RunnerHeavyMaxNodes),
+		},
+		Management: &container.NodePoolManagementArgs{
+			AutoRepair:  pulumi.Bool(true),
+			AutoUpgrade: pulumi.Bool(true),
+		},
+		MaxPodsPerNode: pulumi.Int(32),
+		UpgradeSettings: &container.NodePoolUpgradeSettingsArgs{
+			Strategy:       pulumi.String("SURGE"),
+			MaxSurge:       pulumi.Int(1),
+			MaxUnavailable: pulumi.Int(0),
+		},
+		NodeConfig: nc,
+	}, opts,
+		pulumi.DependsOn([]pulumi.Resource{nodeRole}),
+		pulumi.IgnoreChanges([]string{"initialNodeCount"}),
+	)
+}
+
+// nodeConfig is what every runner node pool's machines share: the minimal
+// node identity, COS, Shielded VM, and the GKE metadata server in front of pods.
+func nodeConfig(nodeSA *serviceaccount.Account, machineType string, spot bool) *container.NodePoolNodeConfigArgs {
+	return &container.NodePoolNodeConfigArgs{
+		MachineType: pulumi.String(machineType),
+		Spot:        pulumi.Bool(spot),
+		ImageType:   pulumi.String("COS_CONTAINERD"),
+
+		ServiceAccount: nodeSA.Email,
+		OauthScopes:    pulumi.ToStringArray([]string{"https://www.googleapis.com/auth/cloud-platform"}),
+
+		// Job images and build layers live on the runner's PVCs, not here.
+		DiskType:   pulumi.String("pd-balanced"),
+		DiskSizeGb: pulumi.Int(30),
+
+		// GKE_METADATA is what puts the GKE metadata server in front of
+		// pods. Without it, pods would see the node's real metadata server
+		// and could take the node SA's token.
+		WorkloadMetadataConfig: &container.NodePoolNodeConfigWorkloadMetadataConfigArgs{
+			Mode: pulumi.String("GKE_METADATA"),
+		},
+		ShieldedInstanceConfig: &container.NodePoolNodeConfigShieldedInstanceConfigArgs{
+			EnableSecureBoot:          pulumi.Bool(true),
+			EnableIntegrityMonitoring: pulumi.Bool(true),
+		},
+		KubeletConfig: &container.NodePoolNodeConfigKubeletConfigArgs{
+			// A string, not a bool, in this provider.
+			InsecureKubeletReadonlyPortEnabled: pulumi.String("FALSE"),
+		},
+		ResourceLabels: pulumi.StringMap{"app": pulumi.String("gitea")},
+	}
 }

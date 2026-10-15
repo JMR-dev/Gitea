@@ -67,6 +67,17 @@ type Config struct {
 	RunnerJobCapacity int
 	RunnerJobCPU      string
 	RunnerJobMemory   string
+
+	// The heavy pool, for `runs-on: heavy` jobs (Pulumi and other
+	// memory-hungry builds): pod-runner jobs scheduled onto a node pool of
+	// their own, which scales from zero to RunnerHeavyMaxNodes with the queue.
+	// 0 removes the pool and the label. Each heavy job pod requests
+	// RunnerHeavyCPU and RunnerHeavyMemory; the machine type must have room
+	// for that after GKE's own reservations.
+	RunnerHeavyMaxNodes    int
+	RunnerHeavyMachineType string
+	RunnerHeavyCPU         string
+	RunnerHeavyMemory      string
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -104,6 +115,10 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		RunnerMaxNodes:    c.GetInt("runnerMaxNodes"),
 		RunnerJobCPU:      c.Get("runnerJobCpu"),
 		RunnerJobMemory:   c.Get("runnerJobMemory"),
+
+		RunnerHeavyMachineType: c.Get("runnerHeavyMachineType"),
+		RunnerHeavyCPU:         c.Get("runnerHeavyCpu"),
+		RunnerHeavyMemory:      c.Get("runnerHeavyMemory"),
 	}
 
 	// These have non-zero defaults where zero/false is ALSO a meaningful
@@ -123,6 +138,12 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 			return nil, fmt.Errorf("gitea:runnerJobCapacity: %w", err)
 		}
 		cfg.RunnerJobCapacity = 6
+	}
+	if cfg.RunnerHeavyMaxNodes, err = c.TryInt("runnerHeavyMaxNodes"); err != nil {
+		if !errors.Is(err, config.ErrMissingVar) {
+			return nil, fmt.Errorf("gitea:runnerHeavyMaxNodes: %w", err)
+		}
+		cfg.RunnerHeavyMaxNodes = 2
 	}
 	if cfg.RunnerSpot, err = c.TryBool("runnerSpot"); err != nil {
 		if !errors.Is(err, config.ErrMissingVar) {
@@ -198,6 +219,18 @@ func applyDefaults(c *Config) {
 	if c.RunnerJobMemory == "" {
 		c.RunnerJobMemory = "1536Mi"
 	}
+	if c.RunnerHeavyMachineType == "" {
+		// 4 vCPU / 16 GB: about 12.5 GiB allocatable after GKE's reservations,
+		// so one 8Gi job per node with room to burst. Compiling a Pulumi Go
+		// program against pulumi-gcp is what needs it.
+		c.RunnerHeavyMachineType = "e2-standard-4"
+	}
+	if c.RunnerHeavyCPU == "" {
+		c.RunnerHeavyCPU = "2"
+	}
+	if c.RunnerHeavyMemory == "" {
+		c.RunnerHeavyMemory = "8Gi"
+	}
 }
 
 // quantity is a loose match for a Kubernetes resource quantity, enough to make a
@@ -243,6 +276,16 @@ func validate(c *Config) error {
 		}
 		if !quantity.MatchString(c.RunnerJobMemory) {
 			return fmt.Errorf("gitea:runnerJobMemory %q is not a Kubernetes quantity (e.g. 1536Mi, 2Gi)", c.RunnerJobMemory)
+		}
+		if c.RunnerHeavyMaxNodes < 0 || c.RunnerHeavyMaxNodes > 5 {
+			// A cost guard: these are on-demand 16 GB machines.
+			return fmt.Errorf("gitea:runnerHeavyMaxNodes %d must be between 0 and 5", c.RunnerHeavyMaxNodes)
+		}
+		if !quantity.MatchString(c.RunnerHeavyCPU) {
+			return fmt.Errorf("gitea:runnerHeavyCpu %q is not a Kubernetes quantity (e.g. 2, 3500m)", c.RunnerHeavyCPU)
+		}
+		if !quantity.MatchString(c.RunnerHeavyMemory) {
+			return fmt.Errorf("gitea:runnerHeavyMemory %q is not a Kubernetes quantity (e.g. 8Gi)", c.RunnerHeavyMemory)
 		}
 		if !strings.HasSuffix(c.RunnerImageTag, "-dind-rootless") {
 			// The pod spec hard-codes the rootless image's uid and paths

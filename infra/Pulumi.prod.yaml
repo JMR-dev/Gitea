@@ -52,6 +52,15 @@ config:
   gitea:runnerJobCapacity: "6"
   gitea:runnerJobCpu: 400m
   gitea:runnerJobMemory: 1536Mi
+  # `runs-on: heavy` jobs (Pulumi, other memory-hungry builds) are pods on a
+  # separate on-demand pool of runnerHeavyMachineType nodes, scaled from zero
+  # to runnerHeavyMaxNodes (0 removes the pool and the label). One heavy job
+  # per node; each requests runnerHeavyCpu / runnerHeavyMemory. They count
+  # towards runnerJobCapacity.
+  gitea:runnerHeavyMaxNodes: "2"
+  gitea:runnerHeavyMachineType: e2-standard-4
+  gitea:runnerHeavyCpu: "2"
+  gitea:runnerHeavyMemory: 8Gi
   # `runs-on: docker` jobs (docker build, Docker actions) run on the
   # Docker-in-Docker runner: one pod per node (pod anti-affinity), each running
   # up to runnerCapacity jobs at once.

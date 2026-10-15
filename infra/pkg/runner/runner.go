@@ -518,6 +518,36 @@ func podsConfig(cfg *config.Config) string {
 	// fits on none. No CPU limit, so a job can burst into a node's idle CPU.
 	// The memory limit keeps one runaway job from OOMing its neighbours.
 	//
+	// `runs-on: heavy` gets the same image on the heavy pool, through a
+	// pod_templates entry keyed by the label: it selects and tolerates the
+	// pool, and asks for enough memory that the autoscaler can only satisfy it
+	// with a heavy node. The memory limit is twice the request, as below;
+	// with one heavy job per node that is effectively the whole node.
+	var heavy string
+	if cfg.RunnerHeavyMaxNodes > 0 {
+		labels = append(labels, "heavy:kubernetes://docker.io/gitea/runner-images:ubuntu-latest")
+		heavy = fmt.Sprintf(`  pod_templates:
+    heavy:
+      spec:
+        nodeSelector:
+          %s: %s
+        tolerations:
+          - key: %s
+            operator: Equal
+            value: %s
+            effect: NoSchedule
+        containers:
+          - name: job
+            resources:
+              requests:
+                cpu: %q
+                memory: %q
+              limits:
+                memory: %q
+`, gke.HeavyPoolKey, gke.HeavyPoolValue, gke.HeavyPoolKey, gke.HeavyPoolValue,
+			cfg.RunnerHeavyCPU, cfg.RunnerHeavyMemory, double(cfg.RunnerHeavyMemory))
+	}
+
 	// "$services" is literal, as in upstream's docs/kubernetes.md: config
 	// values expand ${NAME}, and a container of that name merges into every
 	// service container.
@@ -548,7 +578,7 @@ kubernetes:
               memory: 256Mi
             limits:
               memory: 1Gi
-`, metricsPort, JobsNamespace, cfg.RunnerJobCPU, cfg.RunnerJobMemory, double(cfg.RunnerJobMemory))
+`, metricsPort, JobsNamespace, cfg.RunnerJobCPU, cfg.RunnerJobMemory, double(cfg.RunnerJobMemory)) + heavy
 }
 
 // double doubles a resource quantity that config.validate has already matched,

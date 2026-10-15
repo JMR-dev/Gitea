@@ -13,6 +13,7 @@ There are two runners, and a job's `runs-on` picks one:
 | `runs-on` | Runner | How the job runs |
 |---|---|---|
 | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | **pod runner** (`gitea-runner-pods`) | As its own pod in the `gitea-jobs` namespace. Jobs run in parallel, up to `gitea:runnerJobCapacity`, and the node pool grows to fit them. |
+| `heavy` | **pod runner**, on the **heavy pool** | Like `ubuntu-latest`, but the pod requests 8 Gi and 2 CPUs and runs alone on an on-demand `e2-standard-4` (16 GB) node. The pool scales up from zero for it. For Pulumi and other memory-hungry jobs. |
 | `docker` | **DinD runner** (`gitea-runner`) | Inside that runner's rootless Docker daemon, one node per replica, `gitea:runnerCapacity` jobs at a time. |
 
 **A job that needs a Docker daemon must use `runs-on: docker`.** Job pods have
@@ -25,7 +26,8 @@ container's `options`, `volumes` or `credentials` fail the job, and so does
 | Piece | Choice | Where |
 |---|---|---|
 | Cluster | GKE **Standard**, zonal (`gitea:zone`), named `gitea-runners`, used for nothing else | `infra/pkg/gke` |
-| Nodes | One autoscaled pool, `e2-standard-2` **spot** by default, private (no external IPs), COS | `infra/pkg/gke` |
+| Nodes | An autoscaled pool, `e2-standard-2` **spot** by default, private (no external IPs), COS | `infra/pkg/gke` |
+| Heavy nodes | A second pool, `e2-standard-4` **on demand**, 0 to `runnerHeavyMaxNodes`, tainted so only `heavy` jobs land there | `infra/pkg/gke` |
 | Node identity | `gitea-gke-nodes@`, holding only `roles/container.defaultNodeServiceAccount` | `infra/pkg/gke` |
 | Egress | Cloud NAT on a **reserved static IP** (`runnerEgressIp` stack output) | `infra/pkg/network` |
 | Control plane | **DNS endpoint only**, authorised by IAM; IP endpoints are disabled | `infra/pkg/gke` |
@@ -58,7 +60,10 @@ fee. Idle means one node, carrying the DinD runner and the pod runner:
 | boot disk 30 GB + PVCs 10 + 20 + 10 GB, pd-balanced | $7 |
 
 Busy periods add **burst nodes**. Each one costs a spot `e2-standard-2` plus its
-boot disk, about $0.03/hour together, only while it exists. The autoscaler
+boot disk, about $0.03/hour together, only while it exists. A **heavy node**
+is an on-demand `e2-standard-4`, about $0.14/hour, also only while it exists.
+That is roughly 3 cents for a 10-minute `pulumi up`, plus the node's boot time
+and the 10 minutes the autoscaler waits before removing it. The autoscaler
 removes a node about 10 minutes after its last job pod finishes. Each extra
 DinD replica adds an always-on node and two PVCs.
 
@@ -203,6 +208,12 @@ jobs:
         run: curl -s https://api.ipify.org   # must equal `pulumi stack output runnerEgressIp`
       - run: sleep 120                     # hold the pods long enough to watch them
 
+  heavy:                        # one pod on a heavy node, scaled up from zero
+    runs-on: heavy
+    steps:
+      - run: free -g && nproc                 # about 15 GB and 4 CPUs: an e2-standard-4
+      - run: cat /sys/fs/cgroup/memory.max     # 17179869184: the 16Gi limit
+
   docker:
     runs-on: docker
     steps:
@@ -220,7 +231,9 @@ jobs:
 
 While it runs, `make runners` should show the four `fan-out` pods in
 `gitea-jobs` **at the same time**. Usually they land on more than one node, and
-the node count goes up. Push twice: the second run's `cached/stamp` files
+the node count goes up. The `heavy` job's pod waits Pending until a heavy node
+has booted, then runs alone on it. That node goes away about 10 minutes after
+the run. Push twice: the second run's `cached/stamp` files
 should have two lines. `make logs` should show **no** Coraza audit entries for
 `/api/actions`, `/api/actions_pipeline` or `/twirp/`.
 
@@ -230,6 +243,7 @@ should have two lines. `make logs` should show **no** Coraza audit entries for
 |---|---|
 | More parallel `ubuntu-*` jobs | `gitea:runnerJobCapacity`, and `gitea:runnerMaxNodes` (max 10) so they fit |
 | Bigger or smaller job pods | `gitea:runnerJobCpu` / `gitea:runnerJobMemory` (requests; the memory limit is twice the request) |
+| Heavy jobs | `runs-on: heavy`. Size with `gitea:runnerHeavyCpu` / `gitea:runnerHeavyMemory` and `gitea:runnerHeavyMachineType` (the request must fit the machine's allocatable memory: about 12.5 GiB on `e2-standard-4`); `gitea:runnerHeavyMaxNodes` caps how many run at once, 0 removes the pool |
 | More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (a node each, ≤ `runnerMaxNodes`) |
 | On-demand instead of spot | `gitea:runnerSpot false`. The pool is replaced create-first, so the runners reschedule. |
 | Bigger nodes | `gitea:runnerMachineType e2-standard-4` |
@@ -252,7 +266,15 @@ within it that find no room become Pending pods. Whether the runner waits for
 such a pod indefinitely or eventually fails the job is not yet verified. Until
 it is, keep the capacity within what the nodes can hold.
 
-The pool's floor is `max(1, runnerReplicas)`. Pod anti-affinity gives each DinD
+**The heavy pool idles at zero nodes.** Its NoSchedule taint keeps the runners,
+ordinary job pods and GKE's own Deployments off it. A `heavy` job pod both
+selects and tolerates it, so it is the only thing that can make the autoscaler
+add a heavy node. The first heavy job after an idle spell therefore waits a few
+minutes for a node to boot and pull the job image. The pool is on demand rather
+than spot because `pulumi up` runs here: a preempted apply leaves the stack
+with pending operations to clear by hand.
+
+The main pool's floor is `max(1, runnerReplicas)`. Pod anti-affinity gives each DinD
 runner a node of its own, and the floor is at least 1 because the runners must
 keep polling Gitea. The pod runner prefers the DinD runner's node, which the
 pool keeps anyway.
@@ -395,6 +417,15 @@ private endpoint is a Private Service Connect address in the node subnet
 The `gitea-runner-pods` NetworkPolicy allows TCP 443 to the node subnet,
 because Dataplane V2 evaluates policy after translating the Service address. If
 the endpoint ever moves out of `10.20.0.0/24`, that rule must follow it.
+
+**A `heavy` job stays Pending with "didn't match Pod's node affinity/selector"
+on every node, and no heavy node appears.** The autoscaler sizes the pool from
+its node template. Check that the pool exists and has the
+`gitea-runner-pool=heavy` label and taint (`gcloud container node-pools
+describe`), and that `runnerHeavyMemory` fits `runnerHeavyMachineType`. If the
+request is larger than one node's allocatable memory, the autoscaler never adds
+a node. `kubectl -n gitea-jobs describe pod` then shows "pod didn't trigger
+scale-up".
 
 **A job fails on the pod runner with "not supported".** It uses a Docker
 action, a `docker://` step, or a job container's `options`, `volumes` or
