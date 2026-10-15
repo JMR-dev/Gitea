@@ -50,7 +50,15 @@ const (
 	// The rootless image's dockerd reads $XDG_CONFIG_HOME/docker/daemon.json,
 	// i.e. this directory -- NOT /etc/docker, which it ignores.
 	dockerConfigDir = "/home/rootless/.config/docker"
-	dockerDataRoot  = "/home/rootless/.local/share/docker"
+	// The docker-data PVC mounts at the rootless default data root, but dockerd
+	// is pointed one level down. It chmods its data root whenever that already
+	// exists, and the mount point is owned by host root -- which fsGroup does
+	// not change, and which is unmapped inside rootlesskit's user namespace --
+	// so `chmod ...: operation not permitted` kills the daemon on every start.
+	// A subdirectory dockerd creates itself is owned by its own (namespaced)
+	// root, and fsGroup makes the mount point group-writable for it to do so.
+	dockerDataMount = "/home/rootless/.local/share/docker"
+	dockerDataRoot  = dockerDataMount + "/data"
 
 	// Fixed rather than random, so the NetworkPolicy can name it. Job
 	// containers reach the runner's cache server on the pod IP at this port.
@@ -327,6 +335,7 @@ func daemonJSON() (string, error) {
 		// subject to Docker Hub's per-IP limit. Hub-only: other registries are
 		// pulled directly.
 		"registry-mirrors": []string{"https://mirror.gcr.io"},
+		"data-root":        dockerDataRoot,
 		// "mtu" covers the default bridge; act creates a network per job, which
 		// only default-network-opts reaches.
 		"mtu": mtu,
@@ -385,6 +394,11 @@ func networkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networki
 			Egress: networkingv1.NetworkPolicyEgressRuleArray{
 				// Cluster DNS. Without it, the RFC1918 exclusion below would
 				// break name resolution for the runner and every job.
+				//
+				// Both labels: GKE enables NodeLocal DNSCache by default on new
+				// clusters, and then queries to the kube-dns Service IP are
+				// answered by the node-local-dns pod on the same node, not by
+				// kube-dns. Allowing kube-dns alone resolves nothing.
 				&networkingv1.NetworkPolicyEgressRuleArgs{
 					To: networkingv1.NetworkPolicyPeerArray{
 						&networkingv1.NetworkPolicyPeerArgs{
@@ -392,7 +406,13 @@ func networkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networki
 								MatchLabels: pulumi.StringMap{"kubernetes.io/metadata.name": pulumi.String("kube-system")},
 							},
 							PodSelector: &metav1.LabelSelectorArgs{
-								MatchLabels: pulumi.StringMap{"k8s-app": pulumi.String("kube-dns")},
+								MatchExpressions: metav1.LabelSelectorRequirementArray{
+									&metav1.LabelSelectorRequirementArgs{
+										Key:      pulumi.String("k8s-app"),
+										Operator: pulumi.String("In"),
+										Values:   pulumi.ToStringArray([]string{"kube-dns", "node-local-dns"}),
+									},
+								},
 							},
 						},
 					},
@@ -579,10 +599,24 @@ func statefulSet(
 							},
 							VolumeMounts: corev1.VolumeMountArray{
 								&corev1.VolumeMountArgs{Name: pulumi.String("runner-data"), MountPath: pulumi.String("/data")},
-								&corev1.VolumeMountArgs{Name: pulumi.String("docker-data"), MountPath: pulumi.String(dockerDataRoot)},
+								&corev1.VolumeMountArgs{Name: pulumi.String("docker-data"), MountPath: pulumi.String(dockerDataMount)},
 								&corev1.VolumeMountArgs{Name: pulumi.String("config"), MountPath: pulumi.String(configDir), ReadOnly: pulumi.Bool(true)},
 								&corev1.VolumeMountArgs{Name: pulumi.String("docker-config"), MountPath: pulumi.String(dockerConfigDir), ReadOnly: pulumi.Bool(true)},
 								&corev1.VolumeMountArgs{Name: pulumi.String("registration-token"), MountPath: pulumi.String(tokenDir), ReadOnly: pulumi.Bool(true)},
+							},
+							// Without a probe the container counts as ready the
+							// moment it starts, so `pulumi up` reports success
+							// for a runner whose dockerd is crash-looping. This
+							// is what makes the StatefulSet await mean "the
+							// daemon jobs need is up".
+							ReadinessProbe: &corev1.ProbeArgs{
+								Exec: &corev1.ExecActionArgs{
+									Command: pulumi.ToStringArray([]string{"docker", "info", "--format", "{{.ServerVersion}}"}),
+								},
+								InitialDelaySeconds: pulumi.Int(5),
+								PeriodSeconds:       pulumi.Int(20),
+								TimeoutSeconds:      pulumi.Int(10),
+								FailureThreshold:    pulumi.Int(3),
 							},
 							// The CPU request is what the scheduler and the
 							// autoscaler reason about. There is deliberately no

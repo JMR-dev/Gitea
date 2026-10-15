@@ -111,11 +111,12 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 		EnableShieldedNodes: pulumi.Bool(true),
 
 		// Private nodes: no external IPs, all egress through the NAT in
-		// package network. EnablePrivateNodes ONLY -- with IP endpoints disabled
-		// below, also setting EnablePrivateEndpoint or MasterGlobalAccessConfig
-		// produces a diff that never converges on this provider version.
+		// package network. EnablePrivateEndpoint is not a choice here: with IP
+		// endpoints disabled below, the provider reads it back as true, so
+		// leaving it unset is a diff on every run that never converges.
 		PrivateClusterConfig: &container.ClusterPrivateClusterConfigArgs{
-			EnablePrivateNodes: pulumi.Bool(true),
+			EnablePrivateNodes:    pulumi.Bool(true),
+			EnablePrivateEndpoint: pulumi.Bool(true),
 		},
 		// The control plane is reachable only through its DNS endpoint, which
 		// is authorised by IAM alone. That works from Cloud Build's default

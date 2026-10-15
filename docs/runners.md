@@ -262,7 +262,8 @@ re-runs the program and fetches a fresh one. As a last resort for a cluster
 that is already gone, set `PULUMI_K8S_DELETE_UNREACHABLE=true` for one run.
 
 **Pod crashloops; the log mentions user namespaces.** Rootless dockerd needs
-`/proc/sys/user/max_user_namespaces` > 0 on the node:
+`/proc/sys/user/max_user_namespaces` > 0 on the node. COS_CONTAINERD on GKE
+1.36 has it; check if a node image change ever breaks this:
 
 ```bash
 kubectl --context=… debug node/<node> -it --image=busybox -- cat /proc/sys/user/max_user_namespaces
@@ -286,9 +287,22 @@ NetworkPolicy already allows it between runner pods. If it still fails, set
 `cache.host` explicitly in `runnerConfig` (`infra/pkg/runner`) from a downward-API
 `POD_IP` environment variable; the config expands `${NAME}`.
 
-**The runner cannot reach Gitea at all.** Some NAT paths do not hairpin to
-another GCP external address. The fix has three parts:
-- `hostAliases` pointing the domain at the VM's internal IP;
-- a NetworkPolicy egress allow for that `/32` on 443, because the RFC1918
-  exclusion would otherwise block it silently;
-- the pod range in fail2ban's `ignoreip`.
+**The runner cannot reach Gitea at all** (`cannot ping the Gitea instance
+server: deadline_exceeded`). Check DNS first:
+
+```bash
+kubectl --context=… -n gitea-runner exec gitea-runner-0 -- nslookup gitea.jasonmross.dev
+```
+
+A timeout here means the NetworkPolicy is not letting queries through. GKE
+enables NodeLocal DNSCache on new clusters, so the kube-dns Service IP is
+answered by the `node-local-dns` pod on the node. The DNS egress rule must
+allow `k8s-app=node-local-dns` as well as `k8s-app=kube-dns`. If DNS works,
+note that Cloud NAT does hairpin to the VM's external address (verified on
+the first deploy). Look at the VPC firewall and fail2ban on the VM next.
+
+**dockerd exits with `chmod /home/rootless/.local/share/docker: operation not
+permitted`.** dockerd was given the PVC mount point itself as its data root.
+That directory is owned by host root, which is unmapped inside rootlesskit's
+user namespace. The data root must be a subdirectory that dockerd creates
+itself: `data-root` in `daemon.json`, `dockerDataRoot` in `infra/pkg/runner`.
