@@ -29,10 +29,16 @@ podman ps                                            # both healthy
 
 ```bash
 sudo nft list ruleset | grep -E '^table (inet gitea_filter|inet netavark|ip netavark)'
-sudo systemctl reload nftables
-sudo podman ps        # container networking must still work
+sudo nft -f /etc/sysconfig/nftables.conf    # exactly what bootstrap.sh does
+sudo nft list table inet netavark | grep -E 'dport (443|2222) dnat'   # both survive
 curl -fsS https://gitea.jasonmross.dev/api/healthz
 ```
+
+Never `systemctl reload` (or `restart`/`stop`) nftables on this box. On EL the
+unit's reload is `flush ruleset` plus an include, so it wipes netavark's DNAT
+rules and fail2ban's bans. Every container not restarted afterwards loses its
+published ports, with nothing in `podman ps` to show it. If it happens anyway,
+`sudo systemctl restart gitea caddy` puts the port forwards back.
 
 **Subnet agreement** — a mismatch here is what silently breaks fail2ban:
 

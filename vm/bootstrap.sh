@@ -217,7 +217,15 @@ setup_nftables() {
     install -m 0600 "${tmp}" /etc/sysconfig/nftables.conf
     rm -f "${tmp}"
     systemctl enable --now nftables
-    systemctl reload nftables
+    # NOT `systemctl reload nftables`: on EL the unit's ExecReload is
+    # `nft 'flush ruleset; include ...'`, which wipes netavark's DNAT rules and
+    # fail2ban's ban table along with ours. Every container not restarted
+    # afterwards silently loses its published ports -- which is how 2222 went
+    # dark after a boot while 443 survived, because only Caddy restarted. The
+    # file replaces exactly one table (create-then-delete), so loading it
+    # directly is the reload. For the same reason, never `restart` or `stop`
+    # the unit either: its ExecStop is a bare `flush ruleset`.
+    nft -f /etc/sysconfig/nftables.conf
 
     # If this fails, the ruleset flushed something it should not have.
     nft list table inet gitea_filter >/dev/null || die "gitea_filter table missing after reload"
