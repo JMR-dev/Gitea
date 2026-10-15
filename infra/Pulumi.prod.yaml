@@ -40,11 +40,20 @@ config:
   gitea:runnersEnabled: "true"
   # Pinned. Must be a -dind-rootless tag; validated in infra/pkg/config.
   gitea:runnerImageTag: 5.1.0-dind-rootless
-  # One runner pod per node (enforced by pod anti-affinity), each running up to
-  # runnerCapacity jobs at once. 0 replicas is the first step of turning
-  # runners off cleanly -- it deletes the PVC disks.
+  # `runs-on: ubuntu-*` jobs each run as their own pod, up to runnerJobCapacity
+  # at once across the cluster, and the node pool grows (up to runnerMaxNodes)
+  # to fit them. Each job pod requests runnerJobCpu / runnerJobMemory; that
+  # request is what the autoscaler packs nodes by. 0 removes the pod runner.
+  gitea:runnerJobCapacity: "6"
+  gitea:runnerJobCpu: 400m
+  gitea:runnerJobMemory: 1536Mi
+  # `runs-on: docker` jobs (docker build, Docker actions) run on the
+  # Docker-in-Docker runner: one pod per node (pod anti-affinity), each running
+  # up to runnerCapacity jobs at once.
   gitea:runnerReplicas: "1"
   gitea:runnerCapacity: "1"
+  # Turning runners off cleanly starts with runnerReplicas AND runnerJobCapacity
+  # at 0 -- that deletes the PVC disks. See docs/runners.md.
   gitea:runnerMachineType: e2-standard-2
   gitea:runnerMaxNodes: "3"
   # Spot: about a third of the price; a preempted job fails and is re-run.

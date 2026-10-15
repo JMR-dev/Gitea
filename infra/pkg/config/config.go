@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -40,15 +41,27 @@ type Config struct {
 	InfraBuildServiceAccount string
 
 	// RunnersEnabled gates the whole GKE runner slice: the cluster, its network,
-	// and the runner workload. Off by default, because it depends on a secret
-	// that only exists after scripts/bootstrap.sh has been re-run.
+	// and both runners. Off by default, because it depends on a secret that
+	// only exists after scripts/bootstrap.sh has been re-run.
 	RunnersEnabled    bool
 	RunnerImageTag    string
-	RunnerReplicas    int
-	RunnerCapacity    int
 	RunnerMachineType string
 	RunnerMaxNodes    int
 	RunnerSpot        bool
+
+	// The Docker-in-Docker runner, for `runs-on: docker` jobs: one pod per
+	// node, each running up to RunnerCapacity jobs in its own dockerd.
+	RunnerReplicas int
+	RunnerCapacity int
+
+	// The pod runner, for `runs-on: ubuntu-*` jobs: each job is its own pod,
+	// so these jobs fan out over the node pool. RunnerJobCapacity is how many
+	// run at once across the whole cluster (0 removes the pod runner); the
+	// CPU and memory are each job pod's requests, which is what the node
+	// autoscaler packs nodes by.
+	RunnerJobCapacity int
+	RunnerJobCPU      string
+	RunnerJobMemory   string
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -84,18 +97,27 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		RunnerCapacity:    c.GetInt("runnerCapacity"),
 		RunnerMachineType: c.Get("runnerMachineType"),
 		RunnerMaxNodes:    c.GetInt("runnerMaxNodes"),
+		RunnerJobCPU:      c.Get("runnerJobCpu"),
+		RunnerJobMemory:   c.Get("runnerJobMemory"),
 	}
 
-	// These two have non-zero defaults where zero/false is ALSO a meaningful
-	// setting (replicas=0 is the clean-teardown step; spot=false is on-demand
-	// nodes), so GetInt/GetBool -- which cannot tell "unset" from 0/false --
-	// would make the explicit value impossible to express.
+	// These have non-zero defaults where zero/false is ALSO a meaningful
+	// setting (replicas=0 and jobCapacity=0 are the clean-teardown step;
+	// spot=false is on-demand nodes), so GetInt/GetBool -- which cannot tell
+	// "unset" from 0/false -- would make the explicit value impossible to
+	// express.
 	var err error
 	if cfg.RunnerReplicas, err = c.TryInt("runnerReplicas"); err != nil {
 		if !errors.Is(err, config.ErrMissingVar) {
 			return nil, fmt.Errorf("gitea:runnerReplicas: %w", err)
 		}
 		cfg.RunnerReplicas = 1
+	}
+	if cfg.RunnerJobCapacity, err = c.TryInt("runnerJobCapacity"); err != nil {
+		if !errors.Is(err, config.ErrMissingVar) {
+			return nil, fmt.Errorf("gitea:runnerJobCapacity: %w", err)
+		}
+		cfg.RunnerJobCapacity = 6
 	}
 	if cfg.RunnerSpot, err = c.TryBool("runnerSpot"); err != nil {
 		if !errors.Is(err, config.ErrMissingVar) {
@@ -152,14 +174,27 @@ func applyDefaults(c *Config) {
 		c.RunnerCapacity = 1
 	}
 	if c.RunnerMachineType == "" {
-		// 2 vCPU / 8 GB: enough for a docker build of a Go service. Each runner
-		// pod is sized to fill one of these, so replicas map to nodes.
+		// 2 vCPU / 8 GB: enough for a docker build of a Go service. Each DinD
+		// runner pod has one of these to itself; job pods share them.
 		c.RunnerMachineType = "e2-standard-2"
 	}
 	if c.RunnerMaxNodes == 0 {
 		c.RunnerMaxNodes = 3
 	}
+	if c.RunnerJobCPU == "" {
+		// About three jobs on an otherwise empty e2-standard-2, after GKE's
+		// own pods. A request, not a limit: an idle node's spare CPU is
+		// still there for a job that wants it.
+		c.RunnerJobCPU = "400m"
+	}
+	if c.RunnerJobMemory == "" {
+		c.RunnerJobMemory = "1536Mi"
+	}
 }
+
+// quantity is a loose match for a Kubernetes resource quantity, enough to make a
+// typo fail at preview rather than when the first job pod is created.
+var quantity = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(m|k|M|G|Ki|Mi|Gi)?$`)
 
 func validate(c *Config) error {
 	if !strings.Contains(c.Domain, ".") {
@@ -179,13 +214,22 @@ func validate(c *Config) error {
 			return fmt.Errorf("gitea:runnerMaxNodes %d must be between 1 and 10", c.RunnerMaxNodes)
 		}
 		if c.RunnerReplicas < 0 || c.RunnerReplicas > c.RunnerMaxNodes {
-			// One runner pod per node by construction (see pkg/runner), so more
-			// replicas than nodes would leave pods Pending forever.
+			// One DinD runner pod per node by construction (see pkg/runner), so
+			// more replicas than nodes would leave pods Pending forever.
 			return fmt.Errorf("gitea:runnerReplicas %d must be between 0 and gitea:runnerMaxNodes (%d)",
 				c.RunnerReplicas, c.RunnerMaxNodes)
 		}
 		if c.RunnerCapacity < 1 {
 			return fmt.Errorf("gitea:runnerCapacity %d must be at least 1", c.RunnerCapacity)
+		}
+		if c.RunnerJobCapacity < 0 {
+			return fmt.Errorf("gitea:runnerJobCapacity %d must not be negative", c.RunnerJobCapacity)
+		}
+		if !quantity.MatchString(c.RunnerJobCPU) {
+			return fmt.Errorf("gitea:runnerJobCpu %q is not a Kubernetes quantity (e.g. 500m, 1)", c.RunnerJobCPU)
+		}
+		if !quantity.MatchString(c.RunnerJobMemory) {
+			return fmt.Errorf("gitea:runnerJobMemory %q is not a Kubernetes quantity (e.g. 1536Mi, 2Gi)", c.RunnerJobMemory)
 		}
 		if !strings.HasSuffix(c.RunnerImageTag, "-dind-rootless") {
 			// The pod spec hard-codes the rootless image's uid and paths
@@ -211,8 +255,14 @@ func (c *Config) GitHubConfigured() bool {
 // ARHost is the Artifact Registry endpoint for the configured region.
 func (c *Config) ARHost() string { return c.Region + "-docker.pkg.dev" }
 
-// RunnerImage is the Gitea Actions runner image the GKE runners use.
+// RunnerImage is the Docker-in-Docker runner's image.
 func (c *Config) RunnerImage() string { return "docker.io/gitea/runner:" + c.RunnerImageTag }
+
+// RunnerPodsImage is the pod runner's image: the same release without a Docker
+// daemon, which a runner that only creates job pods has no use for.
+func (c *Config) RunnerPodsImage() string {
+	return "docker.io/gitea/runner:" + strings.TrimSuffix(c.RunnerImageTag, "-dind-rootless")
+}
 
 // FQDN returns the domain with a trailing dot, as Cloud DNS requires.
 func (c *Config) FQDN() string { return c.Domain + "." }

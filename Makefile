@@ -100,6 +100,9 @@ kube: ## Fetch kubectl credentials for the GKE runner cluster
 		--dns-endpoint --project=$(PROJECT)
 
 .PHONY: runners
-runners: ## Runner pods, disks, and recent runner logs (run `make kube` first)
+runners: ## Runner and job pods, disks, and recent runner logs (run `make kube` first)
+	kubectl --context=$(KUBE_CONTEXT) get nodes
 	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner get pods,pvc -o wide
-	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner logs statefulset/gitea-runner --tail=50
+	kubectl --context=$(KUBE_CONTEXT) -n gitea-jobs get pods -o wide
+	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner logs statefulset/gitea-runner --tail=30
+	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner logs statefulset/gitea-runner-pods --tail=30

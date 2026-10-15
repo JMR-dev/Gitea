@@ -15,7 +15,7 @@ Engine VM, served at `gitea.jasonmross.dev`.
 | Firewall | nftables + fail2ban on the host, VPC firewall outside it |
 | IaC | Pulumi, Go, self-managed GCS state backend |
 | CI/CD | Cloud Build — push triggers plus a weekly rebuild |
-| Gitea Actions | Optional runners on a dedicated GKE Standard cluster (rootless Docker-in-Docker, spot) — [docs/runners.md](docs/runners.md) |
+| Gitea Actions | Optional runners on a dedicated GKE Standard cluster (spot): each `ubuntu-*` job is its own autoscaled pod; `runs-on: docker` gets rootless Docker-in-Docker — [docs/runners.md](docs/runners.md) |
 
 ## Layout
 
@@ -158,12 +158,18 @@ Bumping the Gitea or Caddy version itself stays a deliberate change to
   `/api/actions_pipeline/`, the v4 artifact `twirp` service). The runner speaks
   protobuf over Connect, which CRS rejects in `On` mode. See
   [docs/runners.md](docs/runners.md).
-- **The runner NetworkPolicy is load-bearing.** Jobs share the runner pod's
-  network namespace, so blocking `169.254.0.0/16` is the only thing standing
-  between a workflow and the runner's Workload Identity token.
-- **Turning runners off is two applies**: `gitea:runnerReplicas 0` first, so the
-  PVC disks are deleted, then `gitea:runnersEnabled false`. Deleting the cluster
-  alone orphans billable disks.
+- **The runner NetworkPolicies are load-bearing.** `docker` jobs share the DinD
+  runner pod's network namespace, so blocking `169.254.0.0/16` is the only
+  thing standing between a workflow and that runner's Workload Identity token.
+  The same block keeps job pods in `gitea-jobs` off the metadata server and the
+  API server.
+- **Workflows that need Docker must say `runs-on: docker`.** `ubuntu-*` jobs run
+  as plain pods with no Docker daemon, so `docker build`, Docker actions and
+  `docker://` steps fail there.
+- **Turning runners off is two applies**: `gitea:runnerReplicas 0` and
+  `gitea:runnerJobCapacity 0` first, so the PVC disks are deleted, then
+  `gitea:runnersEnabled false`. Deleting the cluster alone orphans billable
+  disks.
 - **`image/caddy.version` and `image/coraza.version` are coupled.** coraza-caddy
   pins a minimum Caddy version; bump them together or the build fails.
 - **`us-east1` has no `-a` zone** (it is b/c/d). The stack pins `us-east1-b`.

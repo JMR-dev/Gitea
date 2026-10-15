@@ -8,6 +8,18 @@ loop [migrate-to-gitea-scm.md](migrate-to-gitea-scm.md) warns about.
 Everything here is behind one flag, `gitea:runnersEnabled`, which is off by
 default.
 
+There are two runners, and a job's `runs-on` picks one:
+
+| `runs-on` | Runner | How the job runs |
+|---|---|---|
+| `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | **pod runner** (`gitea-runner-pods`) | As its own pod in the `gitea-jobs` namespace. Jobs run in parallel, up to `gitea:runnerJobCapacity`, and the node pool grows to fit them. |
+| `docker` | **DinD runner** (`gitea-runner`) | Inside that runner's rootless Docker daemon, one node per replica, `gitea:runnerCapacity` jobs at a time. |
+
+**A job that needs a Docker daemon must use `runs-on: docker`.** Job pods have
+none. On the pod runner, Docker actions, `docker://` steps, and a job
+container's `options`, `volumes` or `credentials` fail the job, and so does
+`docker build` in a `run:` step.
+
 ## Shape
 
 | Piece | Choice | Where |
@@ -17,15 +29,17 @@ default.
 | Node identity | `gitea-gke-nodes@`, holding only `roles/container.defaultNodeServiceAccount` | `infra/pkg/gke` |
 | Egress | Cloud NAT on a **reserved static IP** (`runnerEgressIp` stack output) | `infra/pkg/network` |
 | Control plane | **DNS endpoint only**, authorised by IAM; IP endpoints are disabled | `infra/pkg/gke` |
-| Runner | StatefulSet of `docker.io/gitea/runner:<tag>-dind-rootless`, one pod per node | `infra/pkg/runner` |
+| Pod runner | StatefulSet of `docker.io/gitea/runner:<tag>` (no Docker daemon), one unprivileged pod that creates a pod per job | `infra/pkg/runner` |
+| Job pods | Namespace `gitea-jobs`, Pod Security `baseline` enforced, own NetworkPolicy | `infra/pkg/runner` |
+| DinD runner | StatefulSet of `docker.io/gitea/runner:<tag>-dind-rootless`, one pod per node | `infra/pkg/runner` |
 | Registration | Preset token in Secret Manager, shared by Gitea and the runners | `scripts/bootstrap.sh` |
 | WAF | Runner protocol and artifact routes bypass Coraza | `vm/config/Caddyfile.tmpl` |
 
-Why Standard and not Autopilot: workflows need a Docker daemon (`docker build`,
-Docker actions), which means a privileged Docker-in-Docker pod, and Autopilot
-refuses privileged pods. The runner's newer Kubernetes backend, which runs
-each job as its own pod, needs no privileges, but it cannot run Docker actions
-or `docker build`.
+Why Standard and not Autopilot: `docker` jobs need a Docker daemon (`docker
+build`, Docker actions), which means a privileged Docker-in-Docker pod, and
+Autopilot refuses privileged pods. The runner's Kubernetes backend, which runs
+each job as its own pod, needs no privileges. That is why `ubuntu-*` jobs use
+it, but it cannot run Docker actions or `docker build`.
 
 Why zonal: GKE's free tier credits the management fee of **one** zonal or
 Autopilot cluster per billing account. If this billing account already has a
@@ -33,44 +47,66 @@ cluster, this one adds about $73/month.
 
 ### Cost
 
-Roughly **$25–35/month** for one replica, provided the free-tier credit covers
-the cluster fee:
+Roughly **$25–35/month** idle, provided the free-tier credit covers the cluster
+fee. Idle means one node, carrying the DinD runner and the pod runner:
 
 | | approx. / month |
 |---|---|
 | spot `e2-standard-2` node | $15 |
 | static NAT IP (in use) | $3.65 |
 | Cloud NAT gateway + data processing | $1 + $0.045/GB |
-| boot disk 30 GB + PVCs 10 + 20 GB, pd-balanced | $6 |
+| boot disk 30 GB + PVCs 10 + 20 + 10 GB, pd-balanced | $7 |
 
-Each extra replica adds a node, its boot disk, and two PVCs.
+Busy periods add **burst nodes**. Each one costs a spot `e2-standard-2` plus its
+boot disk, about $0.03/hour together, only while it exists. The autoscaler
+removes a node about 10 minutes after its last job pod finishes. Each extra
+DinD replica adds an always-on node and two PVCs.
 
 ## Threat model
 
 Read this before pointing a repository you do not fully trust at these runners.
 
-- **Jobs can act as the runner.** Jobs run inside the runner pod's own dockerd
-  and get its socket, which is what makes `docker build` work. Through that
-  socket a job can read anything the daemon can see, including the runner's
-  `/data/.runner` credentials and the mounted registration token. A malicious
-  workflow could register a rogue runner, or impersonate this one and pick up
-  other repositories' jobs and secrets. That is acceptable here only because
-  this is a single-tenant instance with `DISABLE_REGISTRATION = true`: every
-  workflow author is already trusted with every secret.
+- **`docker` jobs can act as the runner.** They run inside the DinD runner
+  pod's own dockerd, and get its socket, which is what makes `docker build`
+  work. Through that socket a job can read anything the daemon can see,
+  including the runner's `/data/.runner` credentials and the mounted
+  registration token. A malicious workflow could register a rogue runner, or
+  impersonate this one and pick up other repositories' jobs and secrets. That
+  is acceptable here only because this is a single-tenant instance with
+  `DISABLE_REGISTRATION = true`: every workflow author is already trusted with
+  every secret.
+- **`ubuntu-*` jobs are better isolated.** Each runs in its own pod in
+  `gitea-jobs`, which shares nothing with the pod runner but the cache port.
+  It gets no Docker socket, no Kubernetes API token, and no view of the
+  runner's credentials. `gitea-jobs` enforces the `baseline` Pod Security
+  level, so no job pod can be privileged or use host namespaces or hostPath,
+  whatever creates it.
+- **The pod runner holds an API token, scoped to `gitea-jobs`.** It can create,
+  exec into and delete pods there, and create and delete Secrets. It cannot
+  read Secrets back, and it cannot touch `gitea-runner`, so it cannot exec into
+  the DinD runner. Only the pod runner may reach the API server: job pods are
+  blocked by the RFC1918 exclusion below.
 - **Jobs cannot reach Google Cloud.** This part is enforced, not assumed:
-  - **Job pods get no Google identity.** The runner's Kubernetes service
+  - **Jobs get no useful Google identity.** Each runner's Kubernetes service
     account holds exactly one permission, read access to the registration
-    token secret.
-  - **The metadata server is blocked.** Job containers' traffic leaves from
-    the runner pod's network namespace, so the GKE metadata server would issue
-    them that KSA's token. The NetworkPolicy blocks `169.254.0.0/16` for that
-    reason. It is **load-bearing**: do not "simplify" it away.
-  - **Escaping to the node gains little.** dockerd runs as uid 1000 (rootless),
-    so a job that breaks out of its own container lands as an unprivileged user.
-    Root on the node would only yield the node SA, which holds logging and
-    monitoring writes and nothing else.
-- **The cluster is not a path to the VM's private side.** The NetworkPolicy
-  also blocks all RFC1918 ranges. Jobs reach Gitea the way the rest of the
+    token secret. Job pods run as `gitea-jobs`'s `default` account, which holds
+    none.
+  - **The metadata server is blocked.** `docker` job containers' traffic
+    leaves from the DinD runner pod's network namespace, so the GKE metadata
+    server would issue them that KSA's token. The NetworkPolicies on both
+    namespaces block `169.254.0.0/16` for that reason. They are
+    **load-bearing**: do not "simplify" them away.
+  - **Escaping to the node gains little.** For `docker` jobs, dockerd runs as
+    uid 1000 (rootless), so a job that breaks out of its own container lands as
+    an unprivileged user. A job pod is an ordinary unprivileged container, so
+    escaping one takes a kernel or runtime exploit, and lands as root. Root on
+    the node would yield the node SA, which holds logging and monitoring writes
+    and nothing else, plus whatever the other pods on that node hold. That can
+    include the runners' credentials, since several jobs and runners now share
+    nodes. That is the same trust boundary as the first point.
+- **The cluster is not a path to the VM's private side.** The NetworkPolicies
+  also block all RFC1918 ranges. The one exception is the pod runner, which
+  may reach the control plane on 443. Jobs reach Gitea the way the rest of the
   internet does: through its public address, Caddy, and the WAF (except the
   bypassed runner routes below).
 
@@ -129,13 +165,14 @@ banned, which is acceptable under the threat model above.
    likely read the secret before its IAM grant had propagated. Run `make sync`.
 4. Check:
    ```bash
-   make kube && make runners    # pod Running, log shows it registered and declared
+   make kube && make runners    # both runner pods Running, logs show each registered and declared
    ```
    `make kube` needs `gke-gcloud-auth-plugin`: `gcloud components install
    gke-gcloud-auth-plugin`, or `google-cloud-cli-gke-gcloud-auth-plugin` from
    the same package repository as a distro-packaged gcloud.
-   Site Administration → Actions → Runners should list `gitea-runner-0` as
-   Idle, with labels `ubuntu-latest`, `ubuntu-24.04` and `ubuntu-22.04`.
+   Site Administration → Actions → Runners should list two runners as Idle:
+   `gitea-runner-pods-0`, with labels `ubuntu-latest`, `ubuntu-24.04` and
+   `ubuntu-22.04`, and `gitea-runner-0`, with label `docker`.
 5. Run the smoke workflow below once.
 
 ### Smoke workflow
@@ -145,8 +182,29 @@ Put this in a scratch repository as `.gitea/workflows/smoke.yaml`:
 ```yaml
 on: [push]
 jobs:
-  smoke:
+  fan-out:                      # four job pods at once
     runs-on: ubuntu-latest      # required: runner 5.x fails jobs without runs-on
+    strategy:
+      matrix: { n: [1, 2, 3, 4] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with: { path: cached, key: smoke-${{ matrix.n }}-${{ github.run_id }}, restore-keys: smoke-${{ matrix.n }}- }
+      - run: mkdir -p cached && date >> cached/stamp && cat cached/stamp
+      - uses: actions/upload-artifact@v4
+        with: { name: smoke-${{ matrix.n }}, path: cached }
+      - name: metadata server must be unreachable
+        run: |
+          ! curl -sf -m 5 -H 'Metadata-Flavor: Google' \
+            http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email
+      - name: API server must be unreachable
+        run: "! curl -sk -m 5 https://kubernetes.default.svc/version"
+      - name: egress IP
+        run: curl -s https://api.ipify.org   # must equal `pulumi stack output runnerEgressIp`
+      - run: sleep 120                     # hold the pods long enough to watch them
+
+  docker:
+    runs-on: docker
     steps:
       - uses: actions/checkout@v4
       - name: docker build
@@ -154,45 +212,56 @@ jobs:
           printf 'FROM alpine:3\nRUN echo built\n' > Dockerfile
           docker build -t smoke . && docker run --rm smoke echo ran
           docker info | grep -A1 'Registry Mirrors'    # expect mirror.gcr.io
-      - uses: actions/cache@v4
-        with: { path: cached, key: smoke-${{ github.run_id }}, restore-keys: smoke- }
-      - run: mkdir -p cached && date >> cached/stamp && cat cached/stamp
-      - uses: actions/upload-artifact@v4
-        with: { name: smoke, path: cached }
       - name: metadata server must be unreachable
         run: |
           ! curl -sf -m 5 -H 'Metadata-Flavor: Google' \
             http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email
-      - name: egress IP
-        run: curl -s https://api.ipify.org   # must equal `pulumi stack output runnerEgressIp`
 ```
 
-Push twice. The second run's `cached/stamp` should have two lines. While it
-runs, `make logs` should show **no** Coraza audit entries for `/api/actions`,
-`/api/actions_pipeline` or `/twirp/`.
+While it runs, `make runners` should show the four `fan-out` pods in
+`gitea-jobs` **at the same time**. Usually they land on more than one node, and
+the node count goes up. Push twice: the second run's `cached/stamp` files
+should have two lines. `make logs` should show **no** Coraza audit entries for
+`/api/actions`, `/api/actions_pipeline` or `/twirp/`.
 
 ## Day-to-day
 
 | Task | How |
 |---|---|
-| More parallel jobs on one node | `pulumi config set gitea:runnerCapacity 2` |
-| More nodes | `gitea:runnerReplicas` (≤ `gitea:runnerMaxNodes`, max 10) |
+| More parallel `ubuntu-*` jobs | `gitea:runnerJobCapacity`, and `gitea:runnerMaxNodes` (max 10) so they fit |
+| Bigger or smaller job pods | `gitea:runnerJobCpu` / `gitea:runnerJobMemory` (requests; the memory limit is twice the request) |
+| More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (a node each, ≤ `runnerMaxNodes`) |
 | On-demand instead of spot | `gitea:runnerSpot false`. The pool is replaced create-first, so the runners reschedule. |
 | Bigger nodes | `gitea:runnerMachineType e2-standard-4` |
 | Upgrade the runner | bump `gitea:runnerImageTag`; it must stay a `-dind-rootless` tag |
-| Shell into the runner | `kubectl --context=gke_<p>_<zone>_gitea-runners -n gitea-runner exec -it gitea-runner-0 -- sh` |
+| Shell into a runner | `kubectl --context=gke_<p>_<zone>_gitea-runners -n gitea-runner exec -it gitea-runner-pods-0 -- sh` (or `gitea-runner-0`) |
+| Watch job pods | `kubectl --context=… -n gitea-jobs get pods -o wide -w` |
 
-Scaling follows `gitea:runnerReplicas`, **not** the job queue. Pod
-anti-affinity puts one runner pod on each node. The node pool's minimum and
-initial size are `max(1, runnerReplicas)`: at least 1 because the runner must
-keep polling Gitea, and sized up front so that a first apply with several
-replicas does not hang waiting on node provisioning. After that, raising
-`runnerReplicas` triggers a normal autoscaler scale-up, one node per new pod,
-taking a few minutes each. The first time you go above 1, watch it with
-`make runners`.
+**Scaling follows the job queue.** Each `ubuntu-*` job pod requests
+`runnerJobCpu` and `runnerJobMemory`. When a job pod fits on no node, it waits
+Pending and the autoscaler adds a node, up to `runnerMaxNodes`. A node is
+removed about 10 minutes after its last job pod finishes. A running job pod
+blocks its node's removal, so scale-down never kills a job. A job that needs a
+new node waits for it to boot, and then for the node to pull the job image.
+That takes a few minutes, compared with seconds on a warm node.
+
+At most `runnerJobCapacity` jobs run at once. Size it to what `runnerMaxNodes`
+nodes can actually hold (`kubectl describe nodes` shows allocatable and what
+GKE's own pods take). Jobs beyond that capacity wait in Gitea's queue. Jobs
+within it that find no room become Pending pods. Whether the runner waits for
+such a pod indefinitely or eventually fails the job is not yet verified. Until
+it is, keep the capacity within what the nodes can hold.
+
+The pool's floor is `max(1, runnerReplicas)`. Pod anti-affinity gives each DinD
+runner a node of its own, and the floor is at least 1 because the runners must
+keep polling Gitea. The pod runner prefers the DinD runner's node, which the
+pool keeps anyway.
 
 **Spot preemption** gives a pod about 15 seconds, so a job running at the time
-fails. Re-run it. On on-demand nodes, a drain (node upgrade or scale-down) lets
+fails. Re-run it. **The pod runner is the runner for every `ubuntu-*` job**, so
+if its own node is preempted, every running `ubuntu-*` job fails. A rollout of
+the pod runner (a config change, a runner upgrade) waits up to 55 minutes for
+running jobs to finish. `pulumi up` waits with it. On on-demand nodes, a drain (node upgrade or scale-down) lets
 running jobs finish for up to 55 minutes. Node upgrades normally happen in the
 Sunday 05:00–09:00 UTC window, alongside the VM's reboot window. GKE can still
 push urgent security patches and auto-repairs outside it, and those interrupt
@@ -232,7 +301,8 @@ Two applies, in this order:
 
 ```bash
 cd infra
-pulumi config set gitea:runnerReplicas 0 && pulumi up     # 1. deletes the pods AND their PVC disks
+pulumi config set gitea:runnerReplicas 0 && pulumi config set gitea:runnerJobCapacity 0 \
+  && pulumi up                                            # 1. deletes the pods AND their PVC disks
 pulumi config set gitea:runnersEnabled false && pulumi up # 2. deletes the cluster, NAT, subnet, IP
 ```
 
@@ -281,11 +351,13 @@ inner dockerd can see its temp directory, and falls back to mounting the
 daemon socket directly if it cannot. If neither path works, it is the same
 fallback as above.
 
-**`actions/cache` never restores.** Jobs reach the runner's cache server at the
-pod IP on port 8088. If Dataplane V2 turns out to evaluate that traffic, the
-NetworkPolicy already allows it between runner pods. If it still fails, set
-`cache.host` explicitly in `runnerConfig` (`infra/pkg/runner`) from a downward-API
-`POD_IP` environment variable; the config expands `${NAME}`.
+**`actions/cache` never restores.** Jobs reach their runner's cache server at
+the runner pod's IP on port 8088. For job pods, that is real pod-to-pod
+traffic, allowed by the `gitea-jobs` policy (egress) and the
+`gitea-runner-pods` policy (ingress). If it still fails, check which address
+the runner advertises. If it is wrong, set `cache.host` explicitly in
+`runnerYAML` (`infra/pkg/runner`) from a downward-API `POD_IP` environment
+variable; the config expands `${NAME}`.
 
 **The runner cannot reach Gitea at all** (`cannot ping the Gitea instance
 server: deadline_exceeded`). Check DNS first:
@@ -306,3 +378,24 @@ permitted`.** dockerd was given the PVC mount point itself as its data root.
 That directory is owned by host root, which is unmapped inside rootlesskit's
 user namespace. The data root must be a subdirectory that dockerd creates
 itself: `data-root` in `daemon.json`, `dockerDataRoot` in `infra/pkg/runner`.
+
+**`ubuntu-*` jobs stay "Waiting" or their pods stay Pending.** `kubectl -n
+gitea-jobs describe pod <pod>` says why. `Insufficient cpu/memory` with the
+pool already at `runnerMaxNodes` means more jobs are admitted than the nodes
+hold: lower `runnerJobCapacity`, lower the job requests, or raise
+`runnerMaxNodes`. A job pod rejected outright with `violates PodSecurity
+"baseline"` means the runner built a pod spec baseline does not allow. That
+should not happen; do not relax the namespace label without understanding what
+asked for it.
+
+**The pod runner cannot create job pods** (timeouts or `connection refused`
+against `10.28.0.1:443` in its log). It must reach the API server, whose
+private endpoint is a Private Service Connect address in the node subnet
+(`kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes`).
+The `gitea-runner-pods` NetworkPolicy allows TCP 443 to the node subnet,
+because Dataplane V2 evaluates policy after translating the Service address. If
+the endpoint ever moves out of `10.20.0.0/24`, that rule must follow it.
+
+**A job fails on the pod runner with "not supported".** It uses a Docker
+action, a `docker://` step, or a job container's `options`, `volumes` or
+`credentials`. Move it to `runs-on: docker`.

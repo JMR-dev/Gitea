@@ -79,7 +79,8 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 			ServicesSecondaryRangeName: pulumi.String(network.RunnerServicesRange),
 		},
 		// A /26 per node instead of the default /24, so the /20 pod range
-		// covers 64 nodes rather than 16. A runner node hosts a handful of pods.
+		// covers 64 nodes rather than 16. A runner node hosts a handful of pods:
+		// GKE's own, a runner or two, and a few job pods.
 		DefaultMaxPodsPerNode: pulumi.Int(32),
 
 		// The default pool cannot be configured the way the real one is, so it
@@ -169,12 +170,14 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 		Cluster:  cluster.ID(),
 		Location: pulumi.String(cfg.Zone),
 
-		// One node per runner replica (pod anti-affinity allows no more), and
-		// never fewer than one: the runner has to stay up to poll Gitea.
-		// Starting the pool at that size means a first apply with several
-		// replicas does not hang the StatefulSet await on node provisioning;
-		// later replica increases are a normal autoscaler scale-up. Scaling
-		// tracks gitea:runnerReplicas, not the job queue.
+		// The floor is one node per DinD runner replica (pod anti-affinity
+		// allows no more per node), and never fewer than one: the runners have
+		// to stay up to poll Gitea. Starting the pool at that size means a
+		// first apply with several replicas does not hang the StatefulSet await
+		// on node provisioning. Above the floor the pool follows the job queue:
+		// the pod runner's job pods go Pending when no node has room for their
+		// requests, and the autoscaler adds a node; it removes one once no job
+		// pod is left on it.
 		InitialNodeCount: pulumi.Int(minNodes),
 		Autoscaling: &container.NodePoolAutoscalingArgs{
 			MinNodeCount: pulumi.Int(minNodes),

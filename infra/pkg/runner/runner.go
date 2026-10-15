@@ -1,24 +1,35 @@
-// Package runner deploys the Gitea Actions runner into the GKE cluster from
-// package gke: a StatefulSet of the official rootless Docker-in-Docker runner
-// image, the NetworkPolicy that keeps jobs away from the metadata server, and
-// the plumbing that gets the registration token into the pod without Pulumi
-// ever handling it.
+// Package runner deploys the Gitea Actions runners into the GKE cluster from
+// package gke, the NetworkPolicies that keep jobs away from the metadata
+// server, and the plumbing that gets the registration token into the runner
+// pods without Pulumi ever handling it. There are two runners, with disjoint
+// labels:
 //
-// Threat model, in one paragraph: jobs run inside the runner pod's own dockerd,
-// and they get its socket (that is what makes `docker build` work). A job can
-// therefore read anything that daemon can see -- the runner's /data/.runner
-// credentials and the registration token included. That is accepted: this is a
-// single-tenant instance with registration disabled, so every workflow author is
-// already trusted. What is NOT accepted is a job reaching Google Cloud. The
-// node SA holds nothing useful (package gke), the runner's own Kubernetes
-// service account holds only read access to that one token, and the
-// NetworkPolicy below stops jobs from asking the metadata server for even that.
+//   - The pod runner takes `runs-on: ubuntu-*`. It uses the runner's kubernetes
+//     backend: every job is its own unprivileged pod in JobsNamespace, so jobs
+//     fan out over the node pool and the autoscaler adds nodes while they
+//     queue. It cannot run Docker actions, `docker://` steps or `docker build`.
+//   - The DinD runner takes `runs-on: docker`, for exactly those. A StatefulSet
+//     of the official rootless Docker-in-Docker image, one pod per node.
+//
+// Threat model, in one paragraph: DinD jobs run inside that runner pod's own
+// dockerd, and they get its socket (that is what makes `docker build` work). A
+// job there can therefore read anything that daemon can see -- the runner's
+// /data/.runner credentials and the registration token included. That is
+// accepted: this is a single-tenant instance with registration disabled, so
+// every workflow author is already trusted. Pod jobs share nothing with their
+// runner but the cache port, and run under the baseline Pod Security level.
+// What is NOT accepted is a job reaching Google Cloud or the cluster. The node
+// SA holds nothing useful (package gke), the runners' Kubernetes service
+// accounts hold only read access to that one token, the pod runner's API token
+// reaches only JobsNamespace, and the NetworkPolicies below stop jobs from
+// asking the metadata server or the API server for anything.
 package runner
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/organizations"
@@ -29,21 +40,33 @@ import (
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/meta/v1"
 	networkingv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/networking/v1"
+	rbacv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/rbac/v1"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"gitea-infra/pkg/config"
 	"gitea-infra/pkg/gke"
+	"gitea-infra/pkg/network"
 	"gitea-infra/pkg/secrets"
 )
 
 const (
+	// Namespace holds both runners.
 	Namespace = "gitea-runner"
-	// KSAName is the Kubernetes service account the runner pods run as. It is
-	// spelled out in the Workload Identity principal, so renaming it means the
-	// IAM grant moves with it.
-	KSAName = "gitea-runner"
+	// JobsNamespace holds the pod runner's job pods and nothing else. It is
+	// the only namespace the pod runner's API token can touch, and it does not
+	// admit privileged pods.
+	JobsNamespace = "gitea-jobs"
+	// KSAName and PodsKSAName are the Kubernetes service accounts the DinD and
+	// pod runners run as. They are spelled out in the Workload Identity
+	// principals, so renaming one means its IAM grant moves with it.
+	KSAName     = "gitea-runner"
+	PodsKSAName = "gitea-runner-pods"
 
-	appLabel  = "gitea-runner"
+	// The DinD runner's label, and the selector of its StatefulSet: immutable,
+	// so it keeps the name it had when it was the only runner.
+	appLabel     = "gitea-runner"
+	podsAppLabel = "gitea-runner-pods"
+
 	spcName   = "gitea-runner-registration-token"
 	tokenDir  = "/var/run/secrets/gitea-runner"
 	configDir = "/etc/gitea-runner"
@@ -60,9 +83,12 @@ const (
 	dockerDataMount = "/home/rootless/.local/share/docker"
 	dockerDataRoot  = dockerDataMount + "/data"
 
-	// Fixed rather than random, so the NetworkPolicy can name it. Job
-	// containers reach the runner's cache server on the pod IP at this port.
+	// Fixed rather than random, so the NetworkPolicies can name it. Jobs
+	// reach their runner's cache server on the runner pod's IP at this port.
 	cachePort = 8088
+	// The pod runner's /healthz, for its readiness probe. Only the kubelet
+	// reaches it: kubelet probes come from the node, which no policy blocks.
+	metricsPort = 9101
 
 	// GCE's default VPC MTU. Docker defaults to 1500 inside, and the mismatch
 	// shows up as TLS handshakes that hang on large certificates.
@@ -70,8 +96,10 @@ const (
 )
 
 type Runner struct {
-	Provider    *kubernetes.Provider
-	StatefulSet *appsv1.StatefulSet
+	Provider *kubernetes.Provider
+	// StatefulSet is the DinD runner, PodsStatefulSet the pod runner.
+	StatefulSet     *appsv1.StatefulSet
+	PodsStatefulSet *appsv1.StatefulSet
 }
 
 // New returns nil (without error) when the cluster was not created.
@@ -124,7 +152,13 @@ func New(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, deps []pulumi
 		return nil, err
 	}
 
-	grant, err := grantToken(ctx, cfg, gk, opts)
+	proj, err := organizations.LookupProject(ctx, &organizations.LookupProjectArgs{
+		ProjectId: pulumi.StringRef(cfg.Project),
+	})
+	if err != nil {
+		return nil, err
+	}
+	grant, err := grantToken(ctx, cfg, gk, proj.Number, "runner-read-registration-token", KSAName, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +198,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, deps []pulumi
 		// a new name, which changes the pod template and rolls the runners.
 		Metadata: &metav1.ObjectMetaArgs{Namespace: pulumi.String(Namespace)},
 		Data: pulumi.StringMap{
-			"config.yaml": pulumi.String(runnerConfig(cfg)),
+			"config.yaml": pulumi.String(dindConfig(cfg)),
 			"daemon.json": pulumi.String(daemon),
 		},
 	}, inNS...)
@@ -186,7 +220,129 @@ func New(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, deps []pulumi
 		return nil, err
 	}
 
-	return &Runner{Provider: k8s, StatefulSet: sts}, nil
+	podsSts, err := podRunner(ctx, cfg, gk, proj.Number, opts, k8sOpts, inNS, []pulumi.Resource{netpol, spc})
+	if err != nil {
+		return nil, err
+	}
+
+	return &Runner{Provider: k8s, StatefulSet: sts, PodsStatefulSet: podsSts}, nil
+}
+
+// podRunner deploys the runner whose jobs are pods: their namespace, the
+// runner's access to it, both NetworkPolicies it adds, and the runner itself.
+// inNSDeps are the gitea-runner objects every runner pod waits for (the
+// namespace fence and the token's SecretProviderClass).
+func podRunner(
+	ctx *pulumi.Context,
+	cfg *config.Config,
+	gk *gke.Cluster,
+	projectNumber string,
+	opts pulumi.ResourceOption,
+	k8sOpts, inNS []pulumi.ResourceOption,
+	inNSDeps []pulumi.Resource,
+) (*appsv1.StatefulSet, error) {
+	jobsNS, err := corev1.NewNamespace(ctx, "gitea-jobs", &corev1.NamespaceArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name: pulumi.String(JobsNamespace),
+			Labels: pulumi.StringMap{
+				// Enforced: Pod Security admission is built into the API
+				// server. Baseline rather than restricted, because job images
+				// run as root -- but never privileged, never host namespaces
+				// or hostPath. Nothing the runner creates needs more.
+				"pod-security.kubernetes.io/enforce": pulumi.String("baseline"),
+			},
+		},
+	}, k8sOpts...)
+	if err != nil {
+		return nil, err
+	}
+	inJobsNS := with(k8sOpts, pulumi.DependsOn([]pulumi.Resource{jobsNS}))
+
+	ksa, err := corev1.NewServiceAccount(ctx, "gitea-runner-pods", &corev1.ServiceAccountArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(PodsKSAName),
+			Namespace: pulumi.String(Namespace),
+		},
+	}, inNS...)
+	if err != nil {
+		return nil, err
+	}
+
+	grant, err := grantToken(ctx, cfg, gk, projectNumber, "runner-pods-read-registration-token", PodsKSAName, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Exactly the verbs upstream's examples/kubernetes/kubernetes-pods.yaml
+	// grants, and only in the jobs namespace -- so the runner cannot exec into
+	// the DinD runner, or read the Secrets it creates for its own jobs back.
+	role, err := rbacv1.NewRole(ctx, "gitea-runner-pods", &rbacv1.RoleArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(PodsKSAName),
+			Namespace: pulumi.String(JobsNamespace),
+		},
+		Rules: rbacv1.PolicyRuleArray{
+			rule("pods", "create", "get", "list", "delete"),
+			rule("pods/exec", "create", "get"),
+			rule("pods/log", "get"),
+			rule("secrets", "create", "delete"),
+		},
+	}, inJobsNS...)
+	if err != nil {
+		return nil, err
+	}
+	binding, err := rbacv1.NewRoleBinding(ctx, "gitea-runner-pods", &rbacv1.RoleBindingArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(PodsKSAName),
+			Namespace: pulumi.String(JobsNamespace),
+		},
+		RoleRef: &rbacv1.RoleRefArgs{
+			ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+			Kind:     pulumi.String("Role"),
+			Name:     role.Metadata.Name().Elem(),
+		},
+		Subjects: rbacv1.SubjectArray{
+			&rbacv1.SubjectArgs{
+				Kind:      pulumi.String("ServiceAccount"),
+				Name:      ksa.Metadata.Name().Elem(),
+				Namespace: pulumi.String(Namespace),
+			},
+		},
+	}, inJobsNS...)
+	if err != nil {
+		return nil, err
+	}
+
+	jobsPol, err := jobsNetworkPolicy(ctx, inJobsNS)
+	if err != nil {
+		return nil, err
+	}
+	podsPol, err := podsNetworkPolicy(ctx, inNS)
+	if err != nil {
+		return nil, err
+	}
+
+	cm, err := corev1.NewConfigMap(ctx, "gitea-runner-pods-config", &corev1.ConfigMapArgs{
+		// Auto-named, like the DinD runner's, so a change rolls the pod.
+		Metadata: &metav1.ObjectMetaArgs{Namespace: pulumi.String(Namespace)},
+		Data:     pulumi.StringMap{"config.yaml": pulumi.String(podsConfig(cfg))},
+	}, inNS...)
+	if err != nil {
+		return nil, err
+	}
+
+	// No job pod may exist before its fence, and the runner cannot do its job
+	// before it can reach the API server and create pods.
+	deps := append([]pulumi.Resource{jobsPol, podsPol, role, binding, grant, gk.NodePool}, inNSDeps...)
+	return podsStatefulSet(ctx, cfg, ksa, cm, with(inNS, pulumi.DependsOn(deps)))
+}
+
+func rule(resource string, verbs ...string) *rbacv1.PolicyRuleArgs {
+	return &rbacv1.PolicyRuleArgs{
+		ApiGroups: pulumi.ToStringArray([]string{""}),
+		Resources: pulumi.ToStringArray([]string{resource}),
+		Verbs:     pulumi.ToStringArray(verbs),
+	}
 }
 
 // provider builds a Kubernetes provider for the cluster from a bearer token,
@@ -248,49 +404,34 @@ func kubeconfigJSON(endpoint, token string) (string, error) {
 	return string(b), err
 }
 
-// grantToken lets the runner's KSA -- and only it -- read the registration
+// grantToken lets one runner KSA -- and only it -- read the registration
 // token, through a Workload Identity Federation principal. No Google service
-// account is involved, so there is nothing to impersonate.
-func grantToken(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, opts pulumi.ResourceOption) (*secretmanager.SecretIamMember, error) {
-	proj, err := organizations.LookupProject(ctx, &organizations.LookupProjectArgs{
-		ProjectId: pulumi.StringRef(cfg.Project),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return secretmanager.NewSecretIamMember(ctx, "runner-read-registration-token", &secretmanager.SecretIamMemberArgs{
+// account is involved, so there is nothing to impersonate. One principal per
+// KSA rather than a principalSet for the namespace, so a pod that runs as any
+// other account in it gets nothing.
+func grantToken(
+	ctx *pulumi.Context,
+	cfg *config.Config,
+	gk *gke.Cluster,
+	projectNumber, name, ksa string,
+	opts pulumi.ResourceOption,
+) (*secretmanager.SecretIamMember, error) {
+	return secretmanager.NewSecretIamMember(ctx, name, &secretmanager.SecretIamMemberArgs{
 		Project:  pulumi.String(cfg.Project),
 		SecretId: pulumi.String(secrets.RunnerTokenName),
 		Role:     pulumi.String("roles/secretmanager.secretAccessor"),
 		Member: pulumi.String(fmt.Sprintf(
 			"principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s",
-			proj.Number, cfg.Project, Namespace, KSAName)),
+			projectNumber, cfg.Project, Namespace, ksa)),
 		// The <project>.svc.id.goog pool does not exist until the first
 		// Workload Identity cluster does, and IAM rejects principals in a pool
 		// it cannot find.
 	}, opts, pulumi.DependsOn([]pulumi.Resource{gk.Cluster}))
 }
 
-// runnerConfig is the runner's config.yaml. Keys are from the v5.1.0
-// config.example.yaml; anything not set here keeps its default.
-func runnerConfig(cfg *config.Config) string {
-	// Spot nodes get ~15s of notice before preemption, so there is no point in
-	// waiting for jobs to finish: they will not. On on-demand nodes, a drain
-	// (node upgrade, scale-down) waits up to an hour, so let running jobs use it.
-	shutdown := "55m"
-	if cfg.RunnerSpot {
-		shutdown = "20s"
-	}
-
-	// docker.io paths rather than docker.gitea.com: identical digests, but only
-	// Docker Hub can be served through the registry mirror in daemon.json.
-	// Every job behind one NAT IP would otherwise share Docker Hub's anonymous
-	// per-IP pull limit.
-	labels := []string{
-		"ubuntu-latest:docker://docker.io/gitea/runner-images:ubuntu-latest",
-		"ubuntu-24.04:docker://docker.io/gitea/runner-images:ubuntu-24.04",
-		"ubuntu-22.04:docker://docker.io/gitea/runner-images:ubuntu-22.04",
-	}
+// runnerYAML renders the parts of config.yaml both runners share. Keys are from
+// the v5.1.0 config.example.yaml; anything not set here keeps its default.
+func runnerYAML(capacity int, shutdown string, labels []string) string {
 	var lb strings.Builder
 	for _, l := range labels {
 		fmt.Fprintf(&lb, "    - %q\n", l)
@@ -314,7 +455,30 @@ cache:
   enabled: true
   dir: /data/cache
   port: %d
+`, capacity, shutdown, strings.TrimRight(lb.String(), "\n"), cachePort)
+}
 
+// dindConfig is the DinD runner's config.yaml.
+func dindConfig(cfg *config.Config) string {
+	// Spot nodes get ~15s of notice before preemption, so there is no point in
+	// waiting for jobs to finish: they will not. On on-demand nodes, a drain
+	// (node upgrade, scale-down) waits up to an hour, so let running jobs use it.
+	shutdown := "55m"
+	if cfg.RunnerSpot {
+		shutdown = "20s"
+	}
+
+	// One label, disjoint from the pod runner's: a job that needs a Docker
+	// daemon must say so with `runs-on: docker`, or it lands on a job pod that
+	// has none.
+	//
+	// docker.io paths rather than docker.gitea.com: identical digests, but only
+	// Docker Hub can be served through the registry mirror in daemon.json.
+	// Every job behind one NAT IP would otherwise share Docker Hub's anonymous
+	// per-IP pull limit.
+	labels := []string{"docker:docker://docker.io/gitea/runner-images:ubuntu-latest"}
+
+	return runnerYAML(cfg.RunnerCapacity, shutdown, labels) + `
 container:
   # Empty: a fresh network per job.
   network: ""
@@ -322,10 +486,83 @@ container:
   # Empty allows none. Jobs that need host paths are a design smell here.
   valid_volumes: []
   # Empty: auto-detect DOCKER_HOST (the rootless unix socket) AND mount it into
-  # job containers, which is what lets a job run `+"`docker build`"+`. "-" would
+  # job containers, which is what lets a job run ` + "`docker build`" + `. "-" would
   # auto-detect without mounting.
   docker_host: ""
-`, cfg.RunnerCapacity, shutdown, strings.TrimRight(lb.String(), "\n"), cachePort)
+`
+}
+
+// podsConfig is the pod runner's config.yaml.
+func podsConfig(cfg *config.Config) string {
+	// Long even on spot. Preemption cuts it to ~15s whatever is asked for, so
+	// it costs nothing there; on a rollout or a node upgrade it lets every
+	// running job finish, rather than failing all of them at once -- this one
+	// pod is the runner for every ubuntu-* job in the cluster. Must stay below
+	// the pod's terminationGracePeriodSeconds.
+	shutdown := "55m"
+
+	// Pulled by the nodes' containerd, not by a dockerd, so the daemon.json
+	// mirror does not apply. Each node pulls an image once and keeps it.
+	labels := []string{
+		"ubuntu-latest:kubernetes://docker.io/gitea/runner-images:ubuntu-latest",
+		"ubuntu-24.04:kubernetes://docker.io/gitea/runner-images:ubuntu-24.04",
+		"ubuntu-22.04:kubernetes://docker.io/gitea/runner-images:ubuntu-22.04",
+	}
+
+	// At 0 the StatefulSet has no replicas and nothing reads this; the runner
+	// would refuse to load a capacity of 0.
+	capacity := max(1, cfg.RunnerJobCapacity)
+
+	// The job container's requests are what make jobs fan out: the scheduler
+	// places pods by them, and the autoscaler adds a node when a pending pod
+	// fits on none. No CPU limit, so a job can burst into a node's idle CPU.
+	// The memory limit keeps one runaway job from OOMing its neighbours.
+	//
+	// "$services" is literal, as in upstream's docs/kubernetes.md: config
+	// values expand ${NAME}, and a container of that name merges into every
+	// service container.
+	return runnerYAML(capacity, shutdown, labels) + fmt.Sprintf(`
+metrics:
+  enabled: true
+  addr: ":%d"
+
+kubernetes:
+  namespace: %s
+  pod_template:
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+        - name: job
+          resources:
+            requests:
+              cpu: %q
+              memory: %q
+              ephemeral-storage: 2Gi
+            limits:
+              memory: %q
+        - name: $services
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+`, metricsPort, JobsNamespace, cfg.RunnerJobCPU, cfg.RunnerJobMemory, double(cfg.RunnerJobMemory))
+}
+
+// double doubles a resource quantity that config.validate has already matched,
+// keeping its suffix: "1536Mi" -> "3072Mi", "1.5Gi" -> "3Gi".
+func double(q string) string {
+	i := strings.IndexFunc(q, func(r rune) bool { return (r < '0' || r > '9') && r != '.' })
+	if i < 0 {
+		i = len(q)
+	}
+	v, err := strconv.ParseFloat(q[:i], 64)
+	if err != nil {
+		return q
+	}
+	return strconv.FormatFloat(2*v, 'f', -1, 64) + q[i:]
 }
 
 // daemonJSON configures the runner's inner dockerd.
@@ -346,28 +583,29 @@ func daemonJSON() (string, error) {
 	return string(b), err
 }
 
-// networkPolicy is load-bearing, not defence in depth.
+// networkPolicy fences everything in Namespace, both runners included. It is
+// load-bearing, not defence in depth.
 //
-// Job containers run inside the runner pod's dockerd, so their traffic leaves
-// from the runner pod's network namespace. The GKE metadata server identifies
-// callers by pod IP -- it would hand any job the runner KSA's federated token,
-// which can read the registration secret. Excluding 169.254.0.0/16 covers both
-// addresses Dataplane V2 uses for it (.254 on port 80, .252 on port 988).
+// DinD job containers run inside the runner pod's dockerd, so their traffic
+// leaves from the runner pod's network namespace. The GKE metadata server
+// identifies callers by pod IP -- it would hand any job the runner KSA's
+// federated token, which can read the registration secret. Excluding
+// 169.254.0.0/16 covers both addresses Dataplane V2 uses for it (.254 on port
+// 80, .252 on port 988).
 //
 // The RFC1918 exclusions cover the node, pod and service ranges, the control
 // plane's private address, and the VM's internal IP. Jobs reach Gitea the same
-// way the rest of the internet does: its public address, through Caddy.
+// way the rest of the internet does: its public address, through Caddy. The pod
+// runner alone gets the control plane back, in podsNetworkPolicy.
 //
-// Ingress is denied outright. That also covers the rootless image's Docker API,
+// Ingress is denied outright, apart from the cache ports. That also covers the rootless image's Docker API,
 // which listens on the pod IP at :2376 (mTLS) and cannot be switched off.
 //
 // The Secret Manager CSI mount is unaffected: the add-on fetches the token from
 // its own node DaemonSet, not from inside this pod.
 func networkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
 	runnerPods := &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(appLabel)}}
-	cache := networkingv1.NetworkPolicyPortArray{
-		&networkingv1.NetworkPolicyPortArgs{Protocol: pulumi.String("TCP"), Port: pulumi.Int(cachePort)},
-	}
+	cache := tcp(cachePort)
 
 	return networkingv1.NewNetworkPolicy(ctx, "gitea-runner", &networkingv1.NetworkPolicyArgs{
 		Metadata: &metav1.ObjectMetaArgs{
@@ -375,16 +613,16 @@ func networkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networki
 			Namespace: pulumi.String(Namespace),
 		},
 		Spec: &networkingv1.NetworkPolicySpecArgs{
-			// Every pod in the namespace, not just the runner: nothing else
+			// Every pod in the namespace, not just the runners: nothing else
 			// should be here, and anything that is gets the same fence.
 			PodSelector: &metav1.LabelSelectorArgs{},
 			PolicyTypes: pulumi.ToStringArray([]string{"Ingress", "Egress"}),
 
 			Ingress: networkingv1.NetworkPolicyIngressRuleArray{
-				// The runner's cache server, for jobs. Their traffic most likely
-				// never leaves the pod's own namespace (and so is never
-				// evaluated), but if the dataplane does see it, this is the one
-				// thing that should be let through.
+				// The DinD runner's cache server, for its jobs. Their traffic
+				// most likely never leaves the pod's own namespace (and so is
+				// never evaluated), but if the dataplane does see it, this is
+				// the one thing that should be let through.
 				&networkingv1.NetworkPolicyIngressRuleArgs{
 					From:  networkingv1.NetworkPolicyPeerArray{&networkingv1.NetworkPolicyPeerArgs{PodSelector: runnerPods}},
 					Ports: cache,
@@ -392,58 +630,145 @@ func networkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networki
 			},
 
 			Egress: networkingv1.NetworkPolicyEgressRuleArray{
-				// Cluster DNS. Without it, the RFC1918 exclusion below would
-				// break name resolution for the runner and every job.
-				//
-				// Both labels: GKE enables NodeLocal DNSCache by default on new
-				// clusters, and then queries to the kube-dns Service IP are
-				// answered by the node-local-dns pod on the same node, not by
-				// kube-dns. Allowing kube-dns alone resolves nothing.
-				&networkingv1.NetworkPolicyEgressRuleArgs{
-					To: networkingv1.NetworkPolicyPeerArray{
-						&networkingv1.NetworkPolicyPeerArgs{
-							NamespaceSelector: &metav1.LabelSelectorArgs{
-								MatchLabels: pulumi.StringMap{"kubernetes.io/metadata.name": pulumi.String("kube-system")},
-							},
-							PodSelector: &metav1.LabelSelectorArgs{
-								MatchExpressions: metav1.LabelSelectorRequirementArray{
-									&metav1.LabelSelectorRequirementArgs{
-										Key:      pulumi.String("k8s-app"),
-										Operator: pulumi.String("In"),
-										Values:   pulumi.ToStringArray([]string{"kube-dns", "node-local-dns"}),
-									},
-								},
-							},
-						},
-					},
-					Ports: networkingv1.NetworkPolicyPortArray{
-						&networkingv1.NetworkPolicyPortArgs{Protocol: pulumi.String("UDP"), Port: pulumi.Int(53)},
-						&networkingv1.NetworkPolicyPortArgs{Protocol: pulumi.String("TCP"), Port: pulumi.Int(53)},
-					},
-				},
+				dnsEgress(),
 				&networkingv1.NetworkPolicyEgressRuleArgs{
 					To:    networkingv1.NetworkPolicyPeerArray{&networkingv1.NetworkPolicyPeerArgs{PodSelector: runnerPods}},
 					Ports: cache,
 				},
-				// The internet, minus everything private and link-local.
+				internetEgress(),
+			},
+		},
+	}, opts...)
+}
+
+// podsNetworkPolicy adds to networkPolicy for the pod runner alone. Policies
+// are additive, so it only opens what that runner needs beyond the fence:
+// its jobs' cache traffic, and the API server.
+func podsNetworkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
+	return networkingv1.NewNetworkPolicy(ctx, "gitea-runner-pods", &networkingv1.NetworkPolicyArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(PodsKSAName),
+			Namespace: pulumi.String(Namespace),
+		},
+		Spec: &networkingv1.NetworkPolicySpecArgs{
+			PodSelector: &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(podsAppLabel)}},
+			PolicyTypes: pulumi.ToStringArray([]string{"Ingress", "Egress"}),
+			Ingress: networkingv1.NetworkPolicyIngressRuleArray{
+				// Job pods, to the runner's cache server. Unlike DinD jobs,
+				// theirs is real pod-to-pod traffic, so this rule is needed.
+				&networkingv1.NetworkPolicyIngressRuleArgs{
+					From:  networkingv1.NetworkPolicyPeerArray{&networkingv1.NetworkPolicyPeerArgs{NamespaceSelector: namespace(JobsNamespace)}},
+					Ports: tcp(cachePort),
+				},
+			},
+			Egress: networkingv1.NetworkPolicyEgressRuleArray{
+				// The API server, to create and exec into job pods. Its private
+				// endpoint is a Private Service Connect address in the node
+				// subnet (the `kubernetes` EndpointSlice), and Dataplane V2
+				// evaluates policy after a Service address is translated to
+				// it -- so the rule names the node subnet, not the Service IP
+				// in the services range.
+				&networkingv1.NetworkPolicyEgressRuleArgs{
+					To: networkingv1.NetworkPolicyPeerArray{
+						&networkingv1.NetworkPolicyPeerArgs{IpBlock: &networkingv1.IPBlockArgs{Cidr: pulumi.String(network.RunnerNodeCIDR)}},
+					},
+					Ports: tcp(443),
+				},
+			},
+		},
+	}, opts...)
+}
+
+// jobsNetworkPolicy fences JobsNamespace the way networkPolicy fences the
+// runners: no ingress, and egress to DNS, the pod runner's cache server and the
+// internet minus everything private and link-local. That last exclusion is
+// what keeps job pods away from the metadata server and the API server, so it
+// is load-bearing here too.
+func jobsNetworkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
+	return networkingv1.NewNetworkPolicy(ctx, "gitea-jobs", &networkingv1.NetworkPolicyArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(JobsNamespace),
+			Namespace: pulumi.String(JobsNamespace),
+		},
+		Spec: &networkingv1.NetworkPolicySpecArgs{
+			PodSelector: &metav1.LabelSelectorArgs{},
+			PolicyTypes: pulumi.ToStringArray([]string{"Ingress", "Egress"}),
+			Egress: networkingv1.NetworkPolicyEgressRuleArray{
+				dnsEgress(),
 				&networkingv1.NetworkPolicyEgressRuleArgs{
 					To: networkingv1.NetworkPolicyPeerArray{
 						&networkingv1.NetworkPolicyPeerArgs{
-							IpBlock: &networkingv1.IPBlockArgs{
-								Cidr: pulumi.String("0.0.0.0/0"),
-								Except: pulumi.ToStringArray([]string{
-									"10.0.0.0/8",
-									"172.16.0.0/12",
-									"192.168.0.0/16",
-									"169.254.0.0/16",
-								}),
-							},
+							NamespaceSelector: namespace(Namespace),
+							PodSelector:       &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(podsAppLabel)}},
+						},
+					},
+					Ports: tcp(cachePort),
+				},
+				internetEgress(),
+			},
+		},
+	}, opts...)
+}
+
+// dnsEgress allows cluster DNS. Without it, the RFC1918 exclusion in
+// internetEgress would break name resolution for runners and jobs alike.
+//
+// Both labels: GKE enables NodeLocal DNSCache by default on new clusters, and
+// then queries to the kube-dns Service IP are answered by the node-local-dns
+// pod on the same node, not by kube-dns. Allowing kube-dns alone resolves
+// nothing.
+func dnsEgress() *networkingv1.NetworkPolicyEgressRuleArgs {
+	return &networkingv1.NetworkPolicyEgressRuleArgs{
+		To: networkingv1.NetworkPolicyPeerArray{
+			&networkingv1.NetworkPolicyPeerArgs{
+				NamespaceSelector: namespace("kube-system"),
+				PodSelector: &metav1.LabelSelectorArgs{
+					MatchExpressions: metav1.LabelSelectorRequirementArray{
+						&metav1.LabelSelectorRequirementArgs{
+							Key:      pulumi.String("k8s-app"),
+							Operator: pulumi.String("In"),
+							Values:   pulumi.ToStringArray([]string{"kube-dns", "node-local-dns"}),
 						},
 					},
 				},
 			},
 		},
-	}, opts...)
+		Ports: networkingv1.NetworkPolicyPortArray{
+			&networkingv1.NetworkPolicyPortArgs{Protocol: pulumi.String("UDP"), Port: pulumi.Int(53)},
+			&networkingv1.NetworkPolicyPortArgs{Protocol: pulumi.String("TCP"), Port: pulumi.Int(53)},
+		},
+	}
+}
+
+// internetEgress allows the internet, minus everything private and link-local.
+func internetEgress() *networkingv1.NetworkPolicyEgressRuleArgs {
+	return &networkingv1.NetworkPolicyEgressRuleArgs{
+		To: networkingv1.NetworkPolicyPeerArray{
+			&networkingv1.NetworkPolicyPeerArgs{
+				IpBlock: &networkingv1.IPBlockArgs{
+					Cidr: pulumi.String("0.0.0.0/0"),
+					Except: pulumi.ToStringArray([]string{
+						"10.0.0.0/8",
+						"172.16.0.0/12",
+						"192.168.0.0/16",
+						"169.254.0.0/16",
+					}),
+				},
+			},
+		},
+	}
+}
+
+func namespace(name string) *metav1.LabelSelectorArgs {
+	return &metav1.LabelSelectorArgs{
+		MatchLabels: pulumi.StringMap{"kubernetes.io/metadata.name": pulumi.String(name)},
+	}
+}
+
+func tcp(port int) networkingv1.NetworkPolicyPortArray {
+	return networkingv1.NetworkPolicyPortArray{
+		&networkingv1.NetworkPolicyPortArgs{Protocol: pulumi.String("TCP"), Port: pulumi.Int(port)},
+	}
 }
 
 func statefulSet(
@@ -463,19 +788,6 @@ func statefulSet(
 		grace = 25
 	}
 
-	pvc := func(name, size string) *corev1.PersistentVolumeClaimTypeArgs {
-		return &corev1.PersistentVolumeClaimTypeArgs{
-			Metadata: &metav1.ObjectMetaArgs{Name: pulumi.String(name)},
-			Spec: &corev1.PersistentVolumeClaimSpecArgs{
-				AccessModes:      pulumi.ToStringArray([]string{"ReadWriteOnce"}),
-				StorageClassName: pulumi.String("standard-rwo"),
-				Resources: &corev1.VolumeResourceRequirementsArgs{
-					Requests: pulumi.StringMap{"storage": pulumi.String(size)},
-				},
-			},
-		}
-	}
-
 	return appsv1.NewStatefulSet(ctx, "gitea-runner", &appsv1.StatefulSetArgs{
 		Metadata: &metav1.ObjectMetaArgs{
 			Name:      pulumi.String("gitea-runner"),
@@ -490,13 +802,8 @@ func statefulSet(
 			Replicas:            pulumi.Int(cfg.RunnerReplicas),
 			PodManagementPolicy: pulumi.String("Parallel"),
 			Selector:            &metav1.LabelSelectorArgs{MatchLabels: labels},
-			// Scaling down deletes the disks too. Leaving them would orphan PDs
-			// that keep billing after the pods are gone -- and a re-created
-			// pod would come back with a .runner Gitea may already have pruned.
-			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicyArgs{
-				WhenDeleted: pulumi.String("Delete"),
-				WhenScaled:  pulumi.String("Delete"),
-			},
+
+			PersistentVolumeClaimRetentionPolicy: deletePVCs(),
 			VolumeClaimTemplates: corev1.PersistentVolumeClaimTypeArray{
 				// .runner and the actions cache. 10Gi is pd-balanced's floor.
 				pvc("runner-data", "10Gi"),
@@ -516,11 +823,11 @@ func statefulSet(
 					// Required for the Secret Manager add-on on Standard
 					// clusters. Every node in a GKE_METADATA pool carries it.
 					NodeSelector: pulumi.StringMap{"iam.gke.io/gke-metadata-server-enabled": pulumi.String("true")},
-					// One runner per node, by construction rather than by
-					// arithmetic on resource requests. Each pod's jobs then have
-					// the whole node, gitea:runnerReplicas maps directly to
-					// nodes, and changing the machine type cannot silently
-					// stack two Docker daemons on one box.
+					// One DinD runner per node, by construction rather than by
+					// arithmetic on resource requests. gitea:runnerReplicas then
+					// maps directly to nodes, and changing the machine type
+					// cannot silently stack two Docker daemons on one box. Job
+					// pods and the pod runner may still share the node.
 					Affinity: &corev1.AffinityArgs{
 						PodAntiAffinity: &corev1.PodAntiAffinityArgs{
 							RequiredDuringSchedulingIgnoredDuringExecution: corev1.PodAffinityTermArray{
@@ -620,10 +927,10 @@ func statefulSet(
 							},
 							// The CPU request is what the scheduler and the
 							// autoscaler reason about. There is deliberately no
-							// memory limit: the pod has its node to itself
-							// (anti-affinity above), and a limit would only
-							// OOM-kill large builds that the node could have
-							// carried.
+							// memory limit: no other Docker daemon shares the
+							// node (anti-affinity above), and a limit would
+							// only OOM-kill large builds that the node could
+							// have carried.
 							Resources: &corev1.ResourceRequirementsArgs{
 								Requests: pulumi.StringMap{
 									"cpu":               pulumi.String("1"),
@@ -637,6 +944,184 @@ func statefulSet(
 			},
 		},
 	}, opts...)
+}
+
+// podsStatefulSet is the pod runner: one small, unprivileged pod that polls
+// Gitea and turns each job into a pod in JobsNamespace. A StatefulSet, like the
+// DinD runner, so its PVC keeps .runner and the actions cache across restarts.
+func podsStatefulSet(
+	ctx *pulumi.Context,
+	cfg *config.Config,
+	ksa *corev1.ServiceAccount,
+	cm *corev1.ConfigMap,
+	opts []pulumi.ResourceOption,
+) (*appsv1.StatefulSet, error) {
+	labels := pulumi.StringMap{"app": pulumi.String(podsAppLabel)}
+
+	// gitea:runnerJobCapacity 0 removes the pod runner, and with it its disk.
+	replicas := 0
+	if cfg.RunnerJobCapacity > 0 {
+		replicas = 1
+	}
+
+	return appsv1.NewStatefulSet(ctx, "gitea-runner-pods", &appsv1.StatefulSetArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(PodsKSAName),
+			Namespace: pulumi.String(Namespace),
+			Labels:    labels,
+		},
+		Spec: &appsv1.StatefulSetSpecArgs{
+			ServiceName:                          pulumi.String(PodsKSAName),
+			Replicas:                             pulumi.Int(replicas),
+			Selector:                             &metav1.LabelSelectorArgs{MatchLabels: labels},
+			PersistentVolumeClaimRetentionPolicy: deletePVCs(),
+			VolumeClaimTemplates: corev1.PersistentVolumeClaimTypeArray{
+				// .runner, the actions cache, and cloned actions ($HOME).
+				pvc("runner-data", "10Gi"),
+			},
+
+			Template: &corev1.PodTemplateSpecArgs{
+				Metadata: &metav1.ObjectMetaArgs{
+					Labels: labels,
+					Annotations: pulumi.StringMap{
+						// Every running ubuntu-* job dies with this pod. Without
+						// the annotation the autoscaler would evict it to empty
+						// a node it considers underused while jobs run on others.
+						"cluster-autoscaler.kubernetes.io/safe-to-evict": pulumi.String("false"),
+					},
+				},
+				Spec: &corev1.PodSpecArgs{
+					ServiceAccountName: ksa.Metadata.Name(),
+					// The one pod here that needs an API token: it creates,
+					// execs into and deletes job pods. The Role confines it to
+					// JobsNamespace.
+					AutomountServiceAccountToken: pulumi.Bool(true),
+					EnableServiceLinks:           pulumi.Bool(false),
+					// Above runner.shutdown_timeout (podsConfig), and long even
+					// on spot: see there.
+					TerminationGracePeriodSeconds: pulumi.Int(3600),
+
+					// Required for the Secret Manager add-on on Standard
+					// clusters. Every node in a GKE_METADATA pool carries it.
+					NodeSelector: pulumi.StringMap{"iam.gke.io/gke-metadata-server-enabled": pulumi.String("true")},
+					// Next to a DinD runner if there is room, i.e. on a node the
+					// pool keeps anyway. Otherwise the safe-to-evict annotation
+					// would hold whichever burst node it first landed on.
+					Affinity: &corev1.AffinityArgs{
+						PodAffinity: &corev1.PodAffinityArgs{
+							PreferredDuringSchedulingIgnoredDuringExecution: corev1.WeightedPodAffinityTermArray{
+								&corev1.WeightedPodAffinityTermArgs{
+									Weight: pulumi.Int(100),
+									PodAffinityTerm: &corev1.PodAffinityTermArgs{
+										LabelSelector: &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(appLabel)}},
+										TopologyKey:   pulumi.String("kubernetes.io/hostname"),
+									},
+								},
+							},
+						},
+					},
+
+					// The image is built to run as root and needs none of it.
+					// fsGroup makes the PVC and the token files readable.
+					SecurityContext: &corev1.PodSecurityContextArgs{
+						RunAsUser:           pulumi.Int(1000),
+						RunAsGroup:          pulumi.Int(1000),
+						RunAsNonRoot:        pulumi.Bool(true),
+						FsGroup:             pulumi.Int(1000),
+						FsGroupChangePolicy: pulumi.String("OnRootMismatch"),
+						SeccompProfile:      &corev1.SeccompProfileArgs{Type: pulumi.String("RuntimeDefault")},
+					},
+
+					Volumes: corev1.VolumeArray{
+						&corev1.VolumeArgs{
+							Name:      pulumi.String("config"),
+							ConfigMap: &corev1.ConfigMapVolumeSourceArgs{Name: cm.Metadata.Name()},
+						},
+						&corev1.VolumeArgs{
+							Name: pulumi.String("registration-token"),
+							Csi: &corev1.CSIVolumeSourceArgs{
+								Driver:           pulumi.String("secrets-store-gke.csi.k8s.io"),
+								ReadOnly:         pulumi.Bool(true),
+								VolumeAttributes: pulumi.StringMap{"secretProviderClass": pulumi.String(spcName)},
+							},
+						},
+					},
+
+					Containers: corev1.ContainerArray{
+						&corev1.ContainerArgs{
+							Name:  pulumi.String("runner"),
+							Image: pulumi.String(cfg.RunnerPodsImage()),
+							SecurityContext: &corev1.SecurityContextArgs{
+								AllowPrivilegeEscalation: pulumi.Bool(false),
+								Capabilities:             &corev1.CapabilitiesArgs{Drop: pulumi.ToStringArray([]string{"ALL"})},
+							},
+							Env: corev1.EnvVarArray{
+								env("GITEA_INSTANCE_URL", fmt.Sprintf("https://%s", cfg.Domain)),
+								env("GITEA_RUNNER_REGISTRATION_TOKEN_FILE", tokenDir+"/token"),
+								env("CONFIG_FILE", configDir+"/config.yaml"),
+								env("RUNNER_STATE_FILE", "/data/.runner"),
+								// uid 1000 has no home directory in the image. git
+								// and the action cache want one; the PVC is it.
+								env("HOME", "/data"),
+							},
+							Ports: corev1.ContainerPortArray{
+								&corev1.ContainerPortArgs{Name: pulumi.String("cache"), ContainerPort: pulumi.Int(cachePort)},
+								&corev1.ContainerPortArgs{Name: pulumi.String("metrics"), ContainerPort: pulumi.Int(metricsPort)},
+							},
+							VolumeMounts: corev1.VolumeMountArray{
+								&corev1.VolumeMountArgs{Name: pulumi.String("runner-data"), MountPath: pulumi.String("/data")},
+								&corev1.VolumeMountArgs{Name: pulumi.String("config"), MountPath: pulumi.String(configDir), ReadOnly: pulumi.Bool(true)},
+								&corev1.VolumeMountArgs{Name: pulumi.String("registration-token"), MountPath: pulumi.String(tokenDir), ReadOnly: pulumi.Bool(true)},
+							},
+							// Ready once the daemon serves /healthz, so the
+							// StatefulSet await means the runner is up.
+							ReadinessProbe: &corev1.ProbeArgs{
+								HttpGet: &corev1.HTTPGetActionArgs{
+									Path: pulumi.String("/healthz"),
+									Port: pulumi.Int(metricsPort),
+								},
+								InitialDelaySeconds: pulumi.Int(5),
+								PeriodSeconds:       pulumi.Int(20),
+								TimeoutSeconds:      pulumi.Int(5),
+								FailureThreshold:    pulumi.Int(3),
+							},
+							// It polls, streams logs and serves the cache; the
+							// jobs' own work happens in their pods.
+							Resources: &corev1.ResourceRequirementsArgs{
+								Requests: pulumi.StringMap{
+									"cpu":    pulumi.String("250m"),
+									"memory": pulumi.String("512Mi"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, opts...)
+}
+
+func pvc(name, size string) *corev1.PersistentVolumeClaimTypeArgs {
+	return &corev1.PersistentVolumeClaimTypeArgs{
+		Metadata: &metav1.ObjectMetaArgs{Name: pulumi.String(name)},
+		Spec: &corev1.PersistentVolumeClaimSpecArgs{
+			AccessModes:      pulumi.ToStringArray([]string{"ReadWriteOnce"}),
+			StorageClassName: pulumi.String("standard-rwo"),
+			Resources: &corev1.VolumeResourceRequirementsArgs{
+				Requests: pulumi.StringMap{"storage": pulumi.String(size)},
+			},
+		},
+	}
+}
+
+// deletePVCs: scaling down deletes the disks too. Leaving them would orphan PDs
+// that keep billing after the pods are gone -- and a re-created pod would come
+// back with a .runner Gitea may already have pruned.
+func deletePVCs() *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicyArgs {
+	return &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicyArgs{
+		WhenDeleted: pulumi.String("Delete"),
+		WhenScaled:  pulumi.String("Delete"),
+	}
 }
 
 // with returns base plus extra in a fresh slice. A bare append would share
