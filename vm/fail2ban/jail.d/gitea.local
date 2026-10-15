@@ -16,7 +16,15 @@ maxretry = 5
 
 # Never lock out loopback, the podman bridge, or the IAP range -- IAP is the
 # only way back into this box.
-ignoreip = 127.0.0.1/8 ::1 ${PODMAN_SUBNET} 35.235.240.0/20
+#
+# The last entry is the Cloud NAT address of the GKE runner cluster (instance
+# metadata runner-egress-ip), and empty when runners are off. Every runner and every CI job shares that one
+# address, so at maxretry = 5 a single job retrying a bad token would ban all of
+# CI for an hour -- and take the runners offline, since they poll through the
+# same IP. The cost of exempting it: hostile traffic from a job is never banned.
+# Acceptable with registration disabled and only trusted workflow authors; see
+# docs/runners.md.
+ignoreip = 127.0.0.1/8 ::1 ${PODMAN_SUBNET} 35.235.240.0/20 ${RUNNER_EGRESS_IP}
 
 [sshd]
 enabled  = true

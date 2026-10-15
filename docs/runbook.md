@@ -118,6 +118,19 @@ sudo journalctl CONTAINER_NAME=caddy --since '5 min ago' | grep 949110
 If neither blocks nor records, the WAF module is not in the request path — check
 `order coraza_waf first` survived the last Caddyfile edit.
 
+### Actions runners, if `gitea:runnersEnabled` is on
+
+```bash
+make kube && make runners                       # gitea-runner-0 Running, registered
+make ssh
+sudo ls -l /etc/gitea/runner-token              # -r-------- 1000 1000
+sudo fail2ban-client get gitea ignoreip         # includes `pulumi stack output runnerEgressIp`
+```
+
+Then run the smoke workflow in [runners.md](runners.md) — it checks `docker
+build`, the cache, artifacts, and that the metadata server is unreachable from a
+job. The last one is the check that matters most and fails most quietly.
+
 ### fail2ban's WAF jail follows the mode
 
 ```bash
@@ -207,8 +220,9 @@ not to enlarge the swap file. Things that will push you over:
 
 - repositories in the multi-GB range, or many concurrent clones
 - switching from SQLite to a PostgreSQL container on the same host
-- adding a Gitea Actions runner to this VM (don't — see
-  [migrate-to-gitea-scm.md](migrate-to-gitea-scm.md))
+- adding a Gitea Actions runner to this VM (don't — runners live on GKE, see
+  [runners.md](runners.md); and [migrate-to-gitea-scm.md](migrate-to-gitea-scm.md)
+  for why a runner must not live on the host it deploys)
 
 ### Resilience
 

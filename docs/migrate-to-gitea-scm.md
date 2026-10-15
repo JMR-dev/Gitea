@@ -19,9 +19,15 @@ Two workable shapes:
    authenticated endpoint (Cloud Run or a Cloud Function) that validates the
    webhook signature and calls `cloudbuild.projects.triggers.run`. The deploy
    path stays entirely outside the VM. **This is the recommended option.**
-2. **A Gitea Actions runner on separate infrastructure** — a second small VM or a
-   Cloud Run job. Self-contained, but you now operate a runner, and the infra
-   pipeline still needs GCP credentials.
+2. **A Gitea Actions runner on separate infrastructure.** That infrastructure
+   now exists: `gitea:runnersEnabled` creates a dedicated GKE cluster
+   ([runners.md](runners.md)). But it is built for CI, not deploys. Job pods
+   deliberately hold **no** Google Cloud identity, and the threat model assumes
+   jobs cannot reach GCP. Running the infra pipeline there would mean giving a
+   `deploy`-labelled job a Workload Identity that can run `pulumi up` with
+   `cb-infra@`-level permissions, from a pod whose jobs can already read each
+   other's runner credentials. That needs its own design. It is not a config
+   change.
 
 Either way, keep the GitHub trigger working until the replacement has
 successfully deployed at least once.

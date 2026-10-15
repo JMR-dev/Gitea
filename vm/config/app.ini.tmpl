@@ -99,6 +99,11 @@ ROOT_PATH = /var/lib/gitea/log
 ; Gitea Actions does not need a config change + restart.
 ENABLED       = true
 DEFAULT_ACTIONS_URL = github
+; Runners run on GKE (docs/runners.md), but their logs and artifacts land HERE,
+; on the 30 GB data disk next to the repositories. Gitea's defaults are 365 and
+; 90 days; on this disk that is unbounded growth with a long fuse.
+LOG_RETENTION_DAYS      = 90
+ARTIFACT_RETENTION_DAYS = 30
 
 [cron.update_checker]
 ENABLED = false

@@ -42,6 +42,9 @@ PODMAN_GATEWAY=$(meta podman-gateway)
 REQUIRE_SIGNIN_VIEW=$(meta require-signin-view)
 WAF_MODE=$(meta waf-mode)
 DATA_DISK_DEVICE=$(meta data-disk-device)
+# Only present when gitea:runnersEnabled is set: the Cloud NAT address the GKE
+# runners egress from. Empty is fine everywhere it is used.
+RUNNER_EGRESS_IP=$(meta runner-egress-ip)
 
 [[ -n "${CONFIG_BUCKET}" ]] || die "config-bucket metadata is missing; nothing to sync from"
 [[ -n "${DOMAIN}"        ]] || die "domain metadata is missing"
@@ -345,6 +348,55 @@ fetch_or_create_secret() {
     printf '%s' "${value}"
 }
 
+# Writes a value (not a template) to dst only if it differs, and reports whether
+# it changed -- render() for content that must not go through envsubst.
+install_content() {
+    local dst="$1" owner="$2" mode="$3" content="$4"
+    local tmp
+    tmp=$(mktemp)
+    printf '%s' "${content}" > "${tmp}"
+    if [[ -f "${dst}" ]] && cmp -s "${tmp}" "${dst}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    install -o "${owner%:*}" -g "${owner#*:}" -m "${mode}" "${tmp}" "${dst}"
+    rm -f "${tmp}"
+    log "wrote ${dst}"
+    return 0
+}
+
+# The Gitea Actions runner registration token, for GITEA_RUNNER_REGISTRATION_TOKEN_FILE
+# (docs/runners.md). Prints the quadlet lines for gitea.container and returns 0
+# if the token file changed.
+#
+# Read, never generated: scripts/bootstrap.sh owns this secret, and the GKE
+# runners must see the same value. The file and the lines that reference it
+# come from this one decision, because Gitea calls log.Fatal when that variable
+# names a file it cannot read.
+#
+# On a failed read, an existing file is KEPT rather than removed. A transient
+# Secret Manager error should not restart Gitea, and nothing is gained by
+# dropping the token -- already-registered runners do not use it, and Gitea
+# keeps the token active in its database regardless. Revoking it is done with
+# "Reset registration token" in the admin UI, not here.
+render_runner_token() {
+    local dst=/etc/gitea/runner-token value="" changed=1
+    if value=$(gcloud secrets versions access latest --secret=gitea-runner-registration-token \
+                  --project="${GCP_PROJECT}" 2>/dev/null) && [[ -n "${value}" ]]; then
+        install_content "${dst}" 1000:1000 0400 "${value}" && changed=0
+    elif [[ -f "${dst}" ]]; then
+        warn "runner registration token unreadable -- keeping the existing ${dst}"
+    fi
+    if [[ -f "${dst}" ]]; then
+        printf '%s\n%s' \
+            "Volume=${dst}:${dst}:ro,Z" \
+            "Environment=GITEA_RUNNER_REGISTRATION_TOKEN_FILE=${dst}"
+    else
+        printf '%s' "# No runner registration token: gitea:runnersEnabled is off, or the secret does not exist yet."
+    fi
+    return "${changed}"
+}
+
 # Renders src -> dst only if the content actually differs, and reports whether
 # it changed. Keeps config-sync from restarting healthy services for no reason.
 render() {
@@ -462,6 +514,13 @@ render_all() {
 
     local changed=0
 
+    # Declared separately: `local x=$(...)` would replace the function's exit
+    # status -- which says whether the token changed -- with local's own.
+    local runner_token_lines
+    if runner_token_lines=$(render_runner_token); then
+        changed=1
+    fi
+
     export GITEA_SECRET_KEY="${secret_key}" \
            GITEA_INTERNAL_TOKEN="${internal_token}" \
            GITEA_OAUTH2_JWT_SECRET="${oauth2_jwt}" \
@@ -471,7 +530,8 @@ render_all() {
            CADDY_NETWORK="${caddy_network}" \
            CADDY_PUBLISH_PORTS="${caddy_publish}" \
            CADDY_SYSCTL="${caddy_sysctl}" \
-           CADDY_EMAIL="${caddy_email}"
+           CADDY_EMAIL="${caddy_email}" \
+           GITEA_RUNNER_TOKEN="${runner_token_lines}"
 
     # app.ini is 0400 owned by uid 1000: it holds SECRET_KEY and INTERNAL_TOKEN,
     # and the container runs as that uid and must be able to read it.
@@ -486,7 +546,7 @@ render_all() {
     local unit
     for unit in gitea.network gitea.container caddy.container caddy-data.volume caddy-config.volume; do
         render "${STATE_DIR}/quadlets/${unit}" "${RENDER_DIR}/${unit}" root:root 0644 \
-            '${IMAGE_GITEA} ${IMAGE_CADDY} ${PODMAN_SUBNET} ${PODMAN_GATEWAY} ${GCP_PROJECT} ${CADDY_NETWORK} ${CADDY_PUBLISH_PORTS} ${CADDY_SYSCTL}' \
+            '${IMAGE_GITEA} ${IMAGE_CADDY} ${PODMAN_SUBNET} ${PODMAN_GATEWAY} ${GCP_PROJECT} ${CADDY_NETWORK} ${CADDY_PUBLISH_PORTS} ${CADDY_SYSCTL} ${GITEA_RUNNER_TOKEN}' \
             && changed=1
     done
 
@@ -532,7 +592,11 @@ setup_fail2ban() {
     export CORAZA_JAIL_ENABLED="${coraza_enabled}"
     log "coraza fail2ban jail enabled=${coraza_enabled} (waf-mode=${WAF_MODE})"
 
-    envsubst '${PODMAN_SUBNET} ${CORAZA_JAIL_ENABLED}' \
+    # Empty when runners are off, which leaves ignoreip exactly as it was.
+    export RUNNER_EGRESS_IP
+    [[ -n "${RUNNER_EGRESS_IP}" ]] && log "fail2ban ignoring runner egress ${RUNNER_EGRESS_IP}"
+
+    envsubst '${PODMAN_SUBNET} ${CORAZA_JAIL_ENABLED} ${RUNNER_EGRESS_IP}' \
         < "${STATE_DIR}/fail2ban/jail.d/gitea.local" > /etc/fail2ban/jail.d/gitea.local
     chmod 0644 /etc/fail2ban/jail.d/gitea.local
     systemctl enable --now fail2ban

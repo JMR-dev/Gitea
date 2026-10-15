@@ -5,5 +5,8 @@ runtime:
     binary: ./gitea-infra
 description: Gitea on a GCE VM running podman quadlets, fronted by Caddy with ACME DNS-01.
 config:
+  # Kubernetes resources must name the GKE runner cluster's provider explicitly
+  # (infra/pkg/runner). Without this, one that forgot would silently deploy into
+  # whatever kube context is current on the machine running `pulumi up`.
   pulumi:disable-default-providers:
-    value: []
+    value: ["kubernetes"]

@@ -101,6 +101,47 @@ func New(
 	imageGitea := fmt.Sprintf("%s/%s/%s/gitea:prod", cfg.ARHost(), cfg.Project, registry.RepoID)
 	imageCaddy := fmt.Sprintf("%s/%s/%s/caddy:prod", cfg.ARHost(), cfg.Project, registry.RepoID)
 
+	metadata := pulumi.StringMap{
+		// OS Login means SSH access follows IAM instead of metadata keys.
+		"enable-oslogin":         pulumi.String("TRUE"),
+		"google-logging-enabled": pulumi.String("true"),
+
+		"config-bucket": buckets.Name,
+		"backup-bucket": backupBucket.Name,
+		"gcp-project":   pulumi.String(cfg.Project),
+		"gcp-region":    pulumi.String(cfg.Region),
+		"ar-host":       pulumi.String(cfg.ARHost()),
+
+		// Floating :prod tags -- AutoUpdate=registry has nothing to poll if
+		// these are digests.
+		"image-gitea": pulumi.String(imageGitea),
+		"image-caddy": pulumi.String(imageCaddy),
+
+		"domain":              pulumi.String(cfg.Domain),
+		"app-name":            pulumi.String(cfg.AppName),
+		"require-signin-view": pulumi.String(strconv.FormatBool(cfg.RequireSigninView)),
+
+		// Drives Coraza's SecRuleEngine and, from the same value, whether
+		// the fail2ban jail acting on WAF verdicts is enabled.
+		"waf-mode": pulumi.String(cfg.WAFMode),
+
+		"podman-subnet":  pulumi.String(cfg.PodmanCIDR),
+		"podman-gateway": pulumi.String(gatewayFor(cfg.PodmanCIDR)),
+
+		"data-disk-device": pulumi.String("/dev/disk/by-id/google-" + DataDiskDeviceName),
+
+		// Not read by the guest -- it exists so `gcloud compute instances
+		// describe` shows which revision of vm/ the box was built against.
+		"config-hash": pulumi.String(configHash),
+	}
+	if net.Runners != nil {
+		// The Cloud NAT address every GKE runner and CI job egresses from.
+		// vm/bootstrap.sh puts it in fail2ban's ignoreip: one misconfigured job
+		// retrying a bad token would otherwise ban all of CI at once. Omitted,
+		// not empty, when runners are off -- meta() already returns "" on 404.
+		metadata["runner-egress-ip"] = net.Runners.EgressIP.Address
+	}
+
 	vm, err := gcpcompute.NewInstance(ctx, "gitea-vm", &gcpcompute.InstanceArgs{
 		Name:        pulumi.String("gitea-vm"),
 		Zone:        pulumi.String(cfg.Zone),
@@ -152,39 +193,7 @@ func New(
 			EnableIntegrityMonitoring: pulumi.Bool(true),
 		},
 
-		Metadata: pulumi.StringMap{
-			// OS Login means SSH access follows IAM instead of metadata keys.
-			"enable-oslogin":         pulumi.String("TRUE"),
-			"google-logging-enabled": pulumi.String("true"),
-
-			"config-bucket": buckets.Name,
-			"backup-bucket": backupBucket.Name,
-			"gcp-project":   pulumi.String(cfg.Project),
-			"gcp-region":    pulumi.String(cfg.Region),
-			"ar-host":       pulumi.String(cfg.ARHost()),
-
-			// Floating :prod tags -- AutoUpdate=registry has nothing to poll if
-			// these are digests.
-			"image-gitea": pulumi.String(imageGitea),
-			"image-caddy": pulumi.String(imageCaddy),
-
-			"domain":              pulumi.String(cfg.Domain),
-			"app-name":            pulumi.String(cfg.AppName),
-			"require-signin-view": pulumi.String(strconv.FormatBool(cfg.RequireSigninView)),
-
-			// Drives Coraza's SecRuleEngine and, from the same value, whether
-			// the fail2ban jail acting on WAF verdicts is enabled.
-			"waf-mode": pulumi.String(cfg.WAFMode),
-
-			"podman-subnet":  pulumi.String(cfg.PodmanCIDR),
-			"podman-gateway": pulumi.String(gatewayFor(cfg.PodmanCIDR)),
-
-			"data-disk-device": pulumi.String("/dev/disk/by-id/google-" + DataDiskDeviceName),
-
-			// Not read by the guest -- it exists so `gcloud compute instances
-			// describe` shows which revision of vm/ the box was built against.
-			"config-hash": pulumi.String(configHash),
-		},
+		Metadata: metadata,
 
 		MetadataStartupScript: pulumi.String(string(startupScript)),
 

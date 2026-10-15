@@ -6,6 +6,10 @@ REGION  ?= $(shell cd infra && pulumi config get gcp:region 2>/dev/null || echo 
 # -b, matching the default in infra/pkg/config: us-east1 has no -a zone.
 ZONE    ?= $(shell cd infra && pulumi config get gitea:zone 2>/dev/null || echo $(REGION)-b)
 VM      ?= gitea-vm
+# The GKE runner cluster (docs/runners.md). kubectl targets name the context
+# explicitly, so they never act on whatever cluster happens to be current.
+RUNNER_CLUSTER ?= gitea-runners
+KUBE_CONTEXT   ?= gke_$(PROJECT)_$(ZONE)_$(RUNNER_CLUSTER)
 
 .PHONY: help
 help:
@@ -87,3 +91,15 @@ status: ## Health summary from the VM
 backup: ## Take an on-demand Gitea dump to the backup bucket
 	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
 		--command 'sudo systemctl start gitea-backup.service && sudo journalctl -u gitea-backup -n 20 --no-pager'
+
+# --dns-endpoint: the runner cluster has no IP endpoint at all; access is IAM
+# only (roles/container.developer or above on the project).
+.PHONY: kube
+kube: ## Fetch kubectl credentials for the GKE runner cluster
+	gcloud container clusters get-credentials $(RUNNER_CLUSTER) --zone=$(ZONE) \
+		--dns-endpoint --project=$(PROJECT)
+
+.PHONY: runners
+runners: ## Runner pods, disks, and recent runner logs (run `make kube` first)
+	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner get pods,pvc -o wide
+	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner logs statefulset/gitea-runner --tail=50

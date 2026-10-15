@@ -21,6 +21,9 @@ var services = []string{
 	"cloudscheduler.googleapis.com",
 	"iamcredentials.googleapis.com",
 	"oslogin.googleapis.com",
+	// Ungated, unlike the runner cluster itself: enabling an API costs nothing,
+	// and scripts/bootstrap.sh enables the same list.
+	"container.googleapis.com",
 }
 
 // EnableAPIs returns resources every other package should depend on, so nothing

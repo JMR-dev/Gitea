@@ -36,6 +36,16 @@ authenticates every one of these requests — it only breaks the product.
 
 If you change the matcher, re-run the git drill in `docs/runbook.md`.
 
+### Gitea Actions routes bypass it too
+
+`/api/actions/*`, `/api/actions_pipeline/*` and
+`/twirp/github.actions.results.api.v1.ArtifactService/*` go to Gitea under a
+second matcher, `@actions`. The runner's Connect RPC bodies are binary protobuf
+(`application/proto`) and artifact uploads are PUT/PATCH octet streams. CRS's
+default allowed content types and methods refuse both, so in `On` mode every
+runner would go offline. Same argument as git: every one of these routes
+authenticates with a runner or task token. Details in [runners.md](runners.md).
+
 ## 2. `wafMode` drives both the WAF and the fail2ban jail
 
 One stack config value, `gitea:wafMode`:

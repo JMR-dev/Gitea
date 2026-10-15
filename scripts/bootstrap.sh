@@ -11,6 +11,8 @@
 #   * Gitea's signing secrets -- INTERNAL_TOKEN must be a valid Gitea-issued
 #     JWT, so `gitea generate secret` has to produce it, and the values must
 #     exist before the VM first boots and tries to render app.ini
+#   * the Gitea Actions runner registration token, shared by Gitea and the GKE
+#     runners -- Pulumi grants access to it but must never hold the value
 #
 # Idempotent: safe to re-run.
 #
@@ -50,7 +52,8 @@ gcloud services enable --project="${PROJECT}" \
     monitoring.googleapis.com \
     cloudscheduler.googleapis.com \
     iamcredentials.googleapis.com \
-    oslogin.googleapis.com
+    oslogin.googleapis.com \
+    container.googleapis.com
 
 # ---------------------------------------------------------------------------
 log "creating Pulumi state bucket gs://${STATE_BUCKET}"
@@ -143,6 +146,24 @@ for name in "${!GITEA_SECRETS[@]}"; do
         | gcloud secrets versions add "${name}" --project="${PROJECT}" --data-file=-
 done
 
+# The Gitea Actions runner registration token (docs/runners.md). Gitea reads it
+# at startup via GITEA_RUNNER_REGISTRATION_TOKEN_FILE and the GKE runners mount
+# the same value, so a runner can register without anyone copying a token out of
+# the admin UI.
+#
+# A plain random string is correct here -- unlike INTERNAL_TOKEN it is not a
+# JWT. Gitea requires at least 32 characters; this is 64.
+#
+# Never re-add a value this secret has held before. Gitea deactivates every
+# older token when a new one appears, and never reactivates one -- so rotating
+# back to a previous value leaves runners unable to register.
+ensure_secret gitea-runner-registration-token
+if ! has_version gitea-runner-registration-token; then
+    log "generating gitea-runner-registration-token"
+    openssl rand -hex 32 | tr -d '\n' \
+        | gcloud secrets versions add gitea-runner-registration-token --project="${PROJECT}" --data-file=-
+fi
+
 # ---------------------------------------------------------------------------
 log "creating the Pulumi runner service account ${INFRA_SA_EMAIL}"
 # ---------------------------------------------------------------------------
@@ -206,6 +227,10 @@ INFRA_ROLES=(
     roles/resourcemanager.projectIamAdmin
     roles/serviceusage.serviceUsageAdmin
     roles/cloudscheduler.admin
+    # The Gitea Actions runner cluster, and the Kubernetes objects inside it.
+    # Includes container.clusters.connect, which the IAM-only DNS endpoint
+    # requires. Router, NAT, and address are already covered by compute.admin.
+    roles/container.admin
     roles/cloudbuild.builds.editor
     roles/iap.tunnelResourceAccessor
     roles/compute.osAdminLogin
@@ -258,6 +283,8 @@ Next:
      pulumi config set gcp:project ${PROJECT}
      pulumi config set gitea:infraBuildServiceAccount ${INFRA_SA_EMAIL}
      # ...plus domain, dnsZone, githubOwner, githubAppInstallationId
+     # Optional, any time after this script has run (docs/runners.md):
+     #   pulumi config set gitea:runnersEnabled true
      pulumi up
   4. make build     # or, spelled out:
      gcloud builds submit --config cloudbuild/image.yaml --project ${PROJECT} \\

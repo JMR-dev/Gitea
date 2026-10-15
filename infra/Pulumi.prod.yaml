@@ -33,4 +33,20 @@ config:
   # Created by scripts/bootstrap.sh before the first `pulumi up`, because it is
   # the identity that runs Pulumi and therefore cannot be created by Pulumi.
   gitea:infraBuildServiceAccount: cb-infra@gitea-496920.iam.gserviceaccount.com
+
+  # Gitea Actions runners on GKE -- see docs/runners.md. Off until
+  # scripts/bootstrap.sh has been re-run: it creates the registration token
+  # secret these depend on, and grants cb-infra@ roles/container.admin.
+  gitea:runnersEnabled: "false"
+  # Pinned. Must be a -dind-rootless tag; validated in infra/pkg/config.
+  gitea:runnerImageTag: 5.1.0-dind-rootless
+  # One runner pod per node (enforced by pod anti-affinity), each running up to
+  # runnerCapacity jobs at once. 0 replicas is the first step of turning
+  # runners off cleanly -- it deletes the PVC disks.
+  gitea:runnerReplicas: "1"
+  gitea:runnerCapacity: "1"
+  gitea:runnerMachineType: e2-standard-2
+  gitea:runnerMaxNodes: "3"
+  # Spot: about a third of the price; a preempted job fails and is re-run.
+  gitea:runnerSpot: "true"
 encryptionsalt: v1:pIXPmM64Bzc=:v1:0pkb4B2RVM5LFu2v:ZEPaG4RB9ySlpmaHkaBy8v6FQ3paHg==

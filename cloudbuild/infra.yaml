@@ -12,7 +12,10 @@ substitutions:
 options:
   logging: CLOUD_LOGGING_ONLY
 
-timeout: 1800s
+# An hour, not thirty minutes: the first `pulumi up` with gitea:runnersEnabled
+# creates a GKE cluster (6-10 min), its node pool (3-5 min), and then waits for
+# the runner StatefulSet to become ready.
+timeout: 3600s
 
 availableSecrets:
   secretManager:

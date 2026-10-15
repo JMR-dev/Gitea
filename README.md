@@ -15,17 +15,19 @@ Engine VM, served at `gitea.jasonmross.dev`.
 | Firewall | nftables + fail2ban on the host, VPC firewall outside it |
 | IaC | Pulumi, Go, self-managed GCS state backend |
 | CI/CD | Cloud Build — push triggers plus a weekly rebuild |
+| Gitea Actions | Optional runners on a dedicated GKE Standard cluster (rootless Docker-in-Docker, spot) — [docs/runners.md](docs/runners.md) |
 
 ## Layout
 
 ```
-infra/        Pulumi program (Go). One package per slice of infrastructure.
+infra/        Pulumi program (Go). One package per slice of infrastructure;
+              pkg/gke and pkg/runner are the optional Actions runner cluster.
 image/        Dockerfiles for the Gitea and Caddy images, plus pinned versions.
 vm/           Everything that lands on the VM: quadlets, systemd units,
               nftables, fail2ban, config templates, and bootstrap.sh.
 cloudbuild/   The two build pipelines.
 scripts/      One-time project bootstrap.
-docs/         Runbook, WAF tuning guide, migration-to-Gitea-SCM plan.
+docs/         Runbook, WAF tuning guide, Actions runners, migration-to-Gitea-SCM plan.
 ```
 
 `vm/` is uploaded to a GCS bucket by Pulumi and pulled down by the instance, so
@@ -78,6 +80,10 @@ cd .. && make build
 make ssh
 sudo podman exec -u 1000 gitea gitea admin user create \
     -c /etc/gitea/app.ini --admin --username <you> --email <you@example.com> --random-password
+
+# 7. Optional: Gitea Actions runners on GKE. Read docs/runners.md first --
+#    it covers the threat model, the cost, and the two-step teardown.
+cd infra && pulumi config set gitea:runnersEnabled true && pulumi up
 ```
 
 ### Expected on the first run, not a bug
@@ -148,6 +154,16 @@ Bumping the Gitea or Caddy version itself stays a deliberate change to
   by design, so `pulumi destroy` cannot take them with it.
 - **Git and LFS deliberately bypass the WAF.** Remove that bypass and `git push`
   returns 403 — verified, not theoretical. See [docs/waf.md](docs/waf.md).
+- **So do the Gitea Actions runner routes** (`/api/actions/`,
+  `/api/actions_pipeline/`, the v4 artifact `twirp` service). The runner speaks
+  protobuf over Connect, which CRS rejects in `On` mode. See
+  [docs/runners.md](docs/runners.md).
+- **The runner NetworkPolicy is load-bearing.** Jobs share the runner pod's
+  network namespace, so blocking `169.254.0.0/16` is the only thing standing
+  between a workflow and the runner's Workload Identity token.
+- **Turning runners off is two applies**: `gitea:runnerReplicas 0` first, so the
+  PVC disks are deleted, then `gitea:runnersEnabled false`. Deleting the cluster
+  alone orphans billable disks.
 - **`image/caddy.version` and `image/coraza.version` are coupled.** coraza-caddy
   pins a minimum Caddy version; bump them together or the build fails.
 - **`us-east1` has no `-a` zone** (it is b/c/d). The stack pins `us-east1-b`.

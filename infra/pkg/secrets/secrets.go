@@ -32,3 +32,19 @@ var Names = []string{
 // repository and out of instance metadata. Unlike Names it is supplied by the
 // operator, never generated, so the VM gets read access only.
 const ACMEEmail = "gitea-acme-email"
+
+// RunnerTokenName is the Secret Manager id of the Gitea Actions runner
+// registration token. Like Names, it is created by scripts/bootstrap.sh and
+// never read by Pulumi; unlike Names, it is deliberately NOT in that list.
+//
+// vm/bootstrap.sh treats Names as all-or-nothing -- render_all skips rendering
+// app.ini entirely if any one of them is missing, and fetch_or_create_secret
+// maps each to a `gitea generate secret` key by suffix. This token is neither:
+// it is a random string from `openssl rand`, it is optional (only needed when
+// gitea:runnersEnabled is set), and a missing one must not take the rest of the
+// config down with it.
+//
+// The same value reaches both ends: the VM passes it to Gitea as
+// GITEA_RUNNER_REGISTRATION_TOKEN_FILE, and the runner pods mount it through the
+// GKE Secret Manager CSI add-on.
+const RunnerTokenName = "gitea-runner-registration-token"

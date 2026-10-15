@@ -1,6 +1,7 @@
 // Command gitea-infra provisions the Gitea deployment: a single AlmaLinux 10
 // VM running podman quadlets, fronted by Caddy with ACME DNS-01 against an
-// existing Cloud DNS zone, with images built and rolled out by Cloud Build.
+// existing Cloud DNS zone, with images built and rolled out by Cloud Build --
+// and, behind gitea:runnersEnabled, a GKE cluster running Gitea Actions jobs.
 //
 // The program is deliberately thin. Each package owns one slice of the
 // infrastructure and the wiring order below is the dependency order.
@@ -15,10 +16,12 @@ import (
 	"gitea-infra/pkg/compute"
 	"gitea-infra/pkg/config"
 	"gitea-infra/pkg/dns"
+	"gitea-infra/pkg/gke"
 	"gitea-infra/pkg/iam"
 	"gitea-infra/pkg/network"
 	"gitea-infra/pkg/project"
 	"gitea-infra/pkg/registry"
+	"gitea-infra/pkg/runner"
 	"gitea-infra/pkg/secrets"
 	"gitea-infra/pkg/storage"
 )
@@ -66,6 +69,15 @@ func main() {
 		if err := iam.GrantSecretRead(ctx, cfg, accounts, secrets.ACMEEmail); err != nil {
 			return err
 		}
+		// Read only: the VM hands the runner registration token to Gitea but
+		// never generates it. Gated, because the binding fails outright if the
+		// secret does not exist, and it only exists once scripts/bootstrap.sh
+		// has been re-run.
+		if cfg.RunnersEnabled {
+			if err := iam.GrantSecretRead(ctx, cfg, accounts, secrets.RunnerTokenName); err != nil {
+				return err
+			}
+		}
 
 		buckets, err := storage.New(ctx, cfg, vmDir, apis)
 		if err != nil {
@@ -95,6 +107,17 @@ func main() {
 			return err
 		}
 
+		// Both return nil when gitea:runnersEnabled is off. The runner NAT
+		// address already lives on net, so the VM above did not have to wait
+		// for any of this.
+		cluster, err := gke.New(ctx, cfg, net, apis)
+		if err != nil {
+			return err
+		}
+		if _, err := runner.New(ctx, cfg, cluster, apis); err != nil {
+			return err
+		}
+
 		ctx.Export("address", net.Address.Address)
 		ctx.Export("url", pulumi.Sprintf("https://%s/", cfg.Domain))
 		ctx.Export("cloneSSH", pulumi.Sprintf("ssh://git@%s:2222/", cfg.Domain))
@@ -111,6 +134,17 @@ func main() {
 		ctx.Export("sshCommand", pulumi.Sprintf(
 			"gcloud compute ssh %s --zone=%s --tunnel-through-iap --project=%s",
 			inst.VM.Name, cfg.Zone, cfg.Project))
+
+		if cluster != nil {
+			ctx.Export("runnerCluster", cluster.Cluster.Name)
+			// What the VM puts in fail2ban's ignoreip, and what a CI job sees
+			// as its public address.
+			ctx.Export("runnerEgressIp", net.Runners.EgressIP.Address)
+			// --dns-endpoint: the cluster has no IP endpoint to fall back to.
+			ctx.Export("runnerCredentialsCommand", pulumi.Sprintf(
+				"gcloud container clusters get-credentials %s --zone=%s --dns-endpoint --project=%s",
+				cluster.Cluster.Name, cfg.Zone, cfg.Project))
+		}
 
 		return nil
 	})

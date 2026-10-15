@@ -54,6 +54,33 @@ ${DOMAIN} {
 	}
 
 	# ---------------------------------------------------------------------
+	# Gitea Actions runner protocol and artifacts: also NOT behind the WAF.
+	#
+	# The runner speaks Connect RPC with binary protobuf bodies
+	# (Content-Type: application/proto), and artifact uploads are PUT/PATCH
+	# with application/octet-stream. CRS rejects both outright -- the content
+	# type is not in tx.allowed_request_content_type, and PUT/PATCH are not in
+	# tx.allowed_methods -- so with wafMode On every runner would go offline,
+	# and log uploads (arbitrary build output) would trip SQLi/XSS rules even
+	# if they did not. Same reasoning as git above: inspecting this traffic
+	# breaks it without protecting anything. Every route here authenticates
+	# with a runner or task token, which Gitea checks.
+	#
+	# Prefixes, not an RPC-name list, so a Gitea upgrade that adds an RPC does
+	# not silently start 403ing. /api/v1/ is a different prefix and stays
+	# behind the WAF. See docs/runners.md.
+	# ---------------------------------------------------------------------
+	@actions path /api/actions/* /api/actions_pipeline/* /twirp/github.actions.results.api.v1.ArtifactService/*
+	handle @actions {
+		reverse_proxy ${GITEA_UPSTREAM} {
+			transport http {
+				read_timeout 900s
+				write_timeout 900s
+			}
+		}
+	}
+
+	# ---------------------------------------------------------------------
 	# Everything else -- web UI and API -- goes through the WAF.
 	# ---------------------------------------------------------------------
 	handle {

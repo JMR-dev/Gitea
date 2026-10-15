@@ -40,6 +40,13 @@ PublishPort=127.0.0.1:3000:3000
 Volume=/var/lib/gitea:/var/lib/gitea
 Volume=/etc/gitea/app.ini:/etc/gitea/app.ini:ro,Z
 
+# Gitea Actions runner registration token: a Volume= for /etc/gitea/runner-token
+# plus Environment=GITEA_RUNNER_REGISTRATION_TOKEN_FILE, or a comment when the
+# secret does not exist. bootstrap.sh decides both from the same check: Gitea
+# calls log.Fatal if that variable names a file it cannot read, so the env line
+# must never be rendered without the file. See docs/runners.md.
+${GITEA_RUNNER_TOKEN}
+
 User=1000:1000
 Environment=GITEA_WORK_DIR=/var/lib/gitea
 
