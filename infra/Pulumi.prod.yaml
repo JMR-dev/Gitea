@@ -18,7 +18,12 @@ config:
   gitea:bootDiskGb: "20"
   gitea:dataDiskGb: "30"
   gitea:appName: Gitea
-  gitea:requireSigninView: "false"
+  # false | true | expensive. "expensive" keeps repo home pages, releases and
+  # profiles public, but sends anonymous visitors to the login page for code,
+  # history, source archives, issues, pull requests and wikis -- the pages AI
+  # crawlers were hammering. Gitea calls this mode experimental. Clones and
+  # release attachments are unaffected.
+  gitea:requireSigninView: expensive
   gitea:podmanSubnet: 10.89.10.0/24
   # Coraza WAF: On | DetectionOnly | Off.
   # Start in DetectionOnly, review what it flags (docs/waf.md), then switch to

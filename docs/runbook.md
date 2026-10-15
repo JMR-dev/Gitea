@@ -230,6 +230,31 @@ not to enlarge the swap file. Things that will push you over:
   [runners.md](runners.md); and [migrate-to-gitea-scm.md](migrate-to-gitea-scm.md)
   for why a runner must not live on the host it deploys)
 
+### CPU: check for crawlers before resizing
+
+On 2026-10-15, Gitea sat at a full core while memory and swap were fine. AI
+crawlers (ClaudeBot, GPTBot) were walking every `src/`, `commits/`, `raw/` and
+`blame/` page of every public repo, a few requests a second at 1.5 s of git
+work each. Two things now keep that load off:
+
+- **`/robots.txt`**, answered by Caddy (`vm/config/Caddyfile.tmpl`). It
+  disallows the expensive repository routes. Well-behaved crawlers stop within
+  a crawl cycle.
+- **`gitea:requireSigninView expensive`**. Anonymous visitors are redirected to
+  the login page for code, history, source archives, issues, pull requests and
+  wikis. Repo home pages, releases, profiles, clones and release attachments
+  stay public. This catches crawlers that ignore robots.txt. Set it back to
+  `false` (then `pulumi up` and `make sync`) to reopen those pages.
+
+If Gitea is slow again, see who is asking before reaching for `e2-medium`:
+
+```bash
+sudo podman stats --no-stream                          # is it gitea, and CPU or memory?
+sudo journalctl -u caddy --since -30min -o cat \
+  | jq -r 'select(.request) | .request.headers["User-Agent"][0]' \
+  | sort | uniq -c | sort -rn | head                   # top user agents
+```
+
 ### Resilience
 
 ```bash

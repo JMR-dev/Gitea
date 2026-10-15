@@ -4,7 +4,6 @@ package compute
 import (
 	"fmt"
 	"os"
-	"strconv"
 
 	gcpcompute "github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/compute"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/serviceaccount"
@@ -119,7 +118,7 @@ func New(
 
 		"domain":              pulumi.String(cfg.Domain),
 		"app-name":            pulumi.String(cfg.AppName),
-		"require-signin-view": pulumi.String(strconv.FormatBool(cfg.RequireSigninView)),
+		"require-signin-view": pulumi.String(cfg.RequireSigninView),
 
 		// Drives Coraza's SecRuleEngine and, from the same value, whether
 		// the fail2ban jail acting on WAF verdicts is enabled.

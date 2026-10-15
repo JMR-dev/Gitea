@@ -27,7 +27,12 @@ type Config struct {
 	BootDiskGB  int
 	DataDiskGB  int
 
-	RequireSigninView bool
+	// RequireSigninView is Gitea's [service] REQUIRE_SIGNIN_VIEW: "false",
+	// "true" (no anonymous access at all) or "expensive" (anonymous visitors
+	// keep repo home pages, releases and profiles, but code, history, source
+	// archives, issues, pull requests and wikis redirect to the login page).
+	// Gitea refuses to start on any other value, so it is checked here.
+	RequireSigninView string
 
 	// WAFMode is the Coraza SecRuleEngine setting. It also decides whether the
 	// fail2ban jail that acts on WAF verdicts is enabled at all.
@@ -82,7 +87,7 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		BootDiskGB:  c.GetInt("bootDiskGb"),
 		DataDiskGB:  c.GetInt("dataDiskGb"),
 
-		RequireSigninView: c.GetBool("requireSigninView"),
+		RequireSigninView: c.Get("requireSigninView"),
 		WAFMode:           c.Get("wafMode"),
 
 		GitHubOwner:          c.Get("githubOwner"),
@@ -159,6 +164,9 @@ func applyDefaults(c *Config) {
 	if c.GitHubPATSecret == "" {
 		c.GitHubPATSecret = "github-pat"
 	}
+	if c.RequireSigninView == "" {
+		c.RequireSigninView = "false"
+	}
 	if c.WAFMode == "" {
 		// Detect first, tune, then block. Starting a WAF in blocking mode in
 		// front of an app that legitimately carries code and markdown in POST
@@ -202,6 +210,11 @@ func validate(c *Config) error {
 	}
 	if !strings.HasPrefix(c.Zone, c.Region) {
 		return fmt.Errorf("gitea:zone %q is not in gcp:region %q", c.Zone, c.Region)
+	}
+	switch c.RequireSigninView {
+	case "false", "true", "expensive":
+	default:
+		return fmt.Errorf("gitea:requireSigninView %q must be false, true, or expensive", c.RequireSigninView)
 	}
 	switch c.WAFMode {
 	case "On", "DetectionOnly", "Off":
