@@ -34,10 +34,10 @@ config:
   # the identity that runs Pulumi and therefore cannot be created by Pulumi.
   gitea:infraBuildServiceAccount: cb-infra@gitea-496920.iam.gserviceaccount.com
 
-  # Gitea Actions runners on GKE -- see docs/runners.md. Off until
+  # Gitea Actions runners on GKE -- see docs/runners.md. Leave off until
   # scripts/bootstrap.sh has been re-run: it creates the registration token
   # secret these depend on, and grants cb-infra@ roles/container.admin.
-  gitea:runnersEnabled: "false"
+  gitea:runnersEnabled: "true"
   # Pinned. Must be a -dind-rootless tag; validated in infra/pkg/config.
   gitea:runnerImageTag: 5.1.0-dind-rootless
   # One runner pod per node (enforced by pod anti-affinity), each running up to
