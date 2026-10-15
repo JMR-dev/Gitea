@@ -36,6 +36,41 @@ ${DOMAIN} {
 	}
 
 	# ---------------------------------------------------------------------
+	# robots.txt, answered here: Gitea ships none and returns 404, and
+	# without one AI crawlers walked every src/commits/raw/blame page of every
+	# public repo, a few requests a second at 1.5s of git work each, which
+	# kept Gitea at a full core. The list mirrors the routes Gitea itself
+	# treats as expensive (routers/common/blockexpensive.go), which
+	# REQUIRE_SIGNIN_VIEW = expensive closes to anonymous users anyway, plus
+	# the editor pages, the API and the login redirects they lead to.
+	# Repository home pages, releases and profiles stay crawlable.
+	# ---------------------------------------------------------------------
+	handle /robots.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `User-agent: *
+Disallow: /*/*/archive/
+Disallow: /*/*/blame/
+Disallow: /*/*/commit/
+Disallow: /*/*/commits/
+Disallow: /*/*/compare/
+Disallow: /*/*/graph
+Disallow: /*/*/media/
+Disallow: /*/*/raw/
+Disallow: /*/*/rss/branch/
+Disallow: /*/*/src/
+Disallow: /*/*/issues
+Disallow: /*/*/pulls
+Disallow: /*/*/wiki/
+Disallow: /*/*/activity
+Disallow: /*/*/find/
+Disallow: /*/*/search
+Disallow: /*/*/_
+Disallow: /api/
+Disallow: /user/
+` 200
+	}
+
+	# ---------------------------------------------------------------------
 	# Git transport and LFS: deliberately NOT behind the WAF.
 	#
 	# Packfiles are binary and trip CRS's SQLi/XSS rules constantly, and
