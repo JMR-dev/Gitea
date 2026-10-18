@@ -13,7 +13,7 @@ There are two runners, and a job's `runs-on` picks one:
 | `runs-on` | Runner | How the job runs |
 |---|---|---|
 | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | **pod runner** (`gitea-runner-pods`) | As its own pod in the `gitea-jobs` namespace. Jobs run in parallel, up to `gitea:runnerJobCapacity`, on burst nodes added to fit them. |
-| `heavy` | **pod runner**, on the **heavy pool** | Like `ubuntu-latest`, but the pod requests 8 Gi and 2 CPUs and runs alone on an on-demand `e2-standard-4` (16 GB) node. The pool scales up from zero for it. For Pulumi and other memory-hungry jobs. |
+| `heavy` | **pod runner**, on the **heavy pool** | Like `ubuntu-latest`, but the pod requests 12 Gi and 2 CPUs (a 24 Gi memory limit) and runs alone on an on-demand `e2-highmem-4` (32 GB) node. The pool scales up from zero for it. For Pulumi and other memory-hungry jobs. |
 | `docker` | **DinD runner** (`gitea-runner`) | Inside that runner's rootless Docker daemon, one node per replica, `gitea:runnerCapacity` jobs at a time. |
 
 **A job that needs a Docker daemon must use `runs-on: docker`.** Job pods have
@@ -28,7 +28,7 @@ container's `options`, `volumes` or `credentials` fail the job, and so does
 | Cluster | GKE **Standard**, zonal (`gitea:zone`), named `gitea-runners`, used for nothing else | `infra/pkg/gke` |
 | Base nodes | `max(1, runnerReplicas)` × `e2-standard-2`, **on demand**, never autoscaled. Both runners and all of GKE's own pods. One node can be covered by a 1-year commitment (`runnerBaseCommitment`, not yet bought) | `infra/pkg/gke` |
 | Burst nodes | `e2-standard-2`, on demand, 0 to `runnerBurstMaxNodes`, tainted so only job pods land there | `infra/pkg/gke` |
-| Heavy nodes | `e2-standard-4`, on demand, 0 to `runnerHeavyMaxNodes`, tainted so only `heavy` jobs land there | `infra/pkg/gke` |
+| Heavy nodes | `e2-highmem-4`, on demand, 0 to `runnerHeavyMaxNodes`, tainted so only `heavy` jobs land there | `infra/pkg/gke` |
 | All nodes | Private (no external IPs), COS, Shielded | `infra/pkg/gke` |
 | Tunnel pods | GKE's `konnectivity-agent`, pinned at 2 instead of one per node | `infra/pkg/runner` |
 | Node identity | `gitea-gke-nodes@`, holding only `roles/container.defaultNodeServiceAccount` | `infra/pkg/gke` |
@@ -106,12 +106,12 @@ These are us-east1 list prices from October 2026. For comparison, a spot
 
 Busy periods add **burst nodes**. Each one costs an on-demand `e2-standard-2`
 plus its boot disk, about $0.07/hour together, only while it exists. A **heavy
-node** is an on-demand `e2-standard-4`, about $0.14/hour, also only while it
-exists. That is roughly 3 cents for a 10-minute `pulumi up`, plus the node's
-boot time and the 10 minutes the autoscaler waits before removing it. The
-autoscaler removes a burst or heavy node about 10 minutes after its last job pod
-finishes. Each extra DinD replica adds an always-on, on-demand base node and
-two PVCs.
+node** is an on-demand `e2-highmem-4` plus its boot disk, about $0.18/hour,
+also only while it exists. That is roughly 3 cents for a 10-minute `pulumi up`,
+plus the node's boot time and the 10 minutes the autoscaler waits before
+removing it. The autoscaler removes a burst or heavy node about 10 minutes after
+its last job pod finishes. Each extra DinD replica adds an always-on, on-demand
+base node and two PVCs.
 
 ### The commitment
 
@@ -278,8 +278,8 @@ jobs:
   heavy:                        # one pod on a heavy node, scaled up from zero
     runs-on: heavy
     steps:
-      - run: free -g && nproc                 # about 15 GB and 4 CPUs: an e2-standard-4
-      - run: cat /sys/fs/cgroup/memory.max     # 17179869184: the 16Gi limit
+      - run: free -g && nproc                 # about 31 GB and 4 CPUs: an e2-highmem-4
+      - run: cat /sys/fs/cgroup/memory.max     # 25769803776: the 24Gi limit
 
   docker:
     runs-on: docker
@@ -310,7 +310,7 @@ should have two lines. `make logs` should show **no** Coraza audit entries for
 |---|---|
 | More parallel `ubuntu-*` jobs | `gitea:runnerJobCapacity`, and `gitea:runnerBurstMaxNodes` (max 10) so they fit: about 3 job pods per burst node |
 | Bigger or smaller job pods | `gitea:runnerJobCpu` / `gitea:runnerJobMemory` (requests; the memory limit is twice the request) |
-| Heavy jobs | `runs-on: heavy`. Size with `gitea:runnerHeavyCpu` / `gitea:runnerHeavyMemory` and `gitea:runnerHeavyMachineType` (the request must fit the machine's allocatable memory: about 12.5 GiB on `e2-standard-4`); `gitea:runnerHeavyMaxNodes` caps how many run at once, 0 removes the pool |
+| Heavy jobs | `runs-on: heavy`. Size with `gitea:runnerHeavyCpu` / `gitea:runnerHeavyMemory` and `gitea:runnerHeavyMachineType` (the memory request must fit the machine's allocatable memory, about 28 GiB on `e2-highmem-4`, and the CPU request is what keeps it to one job per node); `gitea:runnerHeavyMaxNodes` caps how many run at once, 0 removes the pool |
 | More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (an always-on, on-demand base node each, max 10) |
 | Spot burst nodes | `gitea:runnerBurstSpot true`: about 40% off each burst node-hour, and a preemption fails only the jobs on that node. The base pool is always on demand. |
 | Bigger nodes | `gitea:runnerMachineType e2-standard-4`, for both the base and burst pools. Each is replaced create-first, so the runners reschedule. The commitment does not grow with it (*The commitment*). |
@@ -344,6 +344,17 @@ than spot because `pulumi up` runs here: a preempted apply leaves the stack
 with pending operations to clear by hand. The runner and the tunnel pods a
 heavy job streams through are on the on-demand base pool too, so nothing on
 the path is spot.
+
+**A heavy node is an `e2-highmem-4` because of one Go package.** The
+pulumi-cloudflare v6 Go SDK is a single package, and its one `compile` process
+peaks at about 14.4 GB. `-p=1` and `GOGC` cannot split it, and an
+`e2-standard-4` has only about 13 GiB allocatable, so a `heavy` job compiling
+it was OOM-killed (exit 137) every time. The job pod requests 12 Gi, so its limit is 24 Gi.
+**The CPU request, not the memory one, keeps it to one heavy job per node.**
+An `e2-highmem-4` has 3920m of allocatable CPU, and GKE's per-node pods take
+about 630m of it. Two 12 Gi pods would fit in the memory, but two 2-CPU pods do
+not fit in the ~3.3 CPUs left, so a second heavy job waits for a second node.
+At a `runnerHeavyCpu` of about 1.6 or less, two would share a node.
 
 **The base pool is a fixed `max(1, runnerReplicas)` nodes.** Pod anti-affinity
 gives each DinD runner a node of its own, and there is always at least one node

@@ -241,16 +241,21 @@ func applyDefaults(c *Config) {
 		c.RunnerJobMemory = "1536Mi"
 	}
 	if c.RunnerHeavyMachineType == "" {
-		// 4 vCPU / 16 GB: about 12.5 GiB allocatable after GKE's reservations,
-		// so one 8Gi job per node with room to burst. Compiling a Pulumi Go
-		// program against pulumi-gcp is what needs it.
-		c.RunnerHeavyMachineType = "e2-standard-4"
+		// 4 vCPU / 32 GB: about 28 GiB allocatable after GKE's reservations,
+		// so one 12Gi job per node with room to burst to its 24Gi limit.
+		// Compiling a Pulumi Go program against pulumi-cloudflare v6 is what
+		// needs it: that SDK is one package, and its one compile process peaks
+		// at about 14.4 GB, more than an e2-standard-4 holds.
+		c.RunnerHeavyMachineType = "e2-highmem-4"
 	}
 	if c.RunnerHeavyCPU == "" {
+		// Also what keeps it to one heavy job per node: two 12Gi pods fit in
+		// an e2-highmem-4's memory, but two 2-CPU pods do not fit in the CPU
+		// GKE's own pods leave free.
 		c.RunnerHeavyCPU = "2"
 	}
 	if c.RunnerHeavyMemory == "" {
-		c.RunnerHeavyMemory = "8Gi"
+		c.RunnerHeavyMemory = "12Gi"
 	}
 }
 
@@ -308,14 +313,14 @@ func validate(c *Config) error {
 			return fmt.Errorf("gitea:runnerJobMemory %q is not a Kubernetes quantity (e.g. 1536Mi, 2Gi)", c.RunnerJobMemory)
 		}
 		if c.RunnerHeavyMaxNodes < 0 || c.RunnerHeavyMaxNodes > 5 {
-			// A cost guard: these are on-demand 16 GB machines.
+			// A cost guard: these are on-demand 32 GB machines.
 			return fmt.Errorf("gitea:runnerHeavyMaxNodes %d must be between 0 and 5", c.RunnerHeavyMaxNodes)
 		}
 		if !quantity.MatchString(c.RunnerHeavyCPU) {
 			return fmt.Errorf("gitea:runnerHeavyCpu %q is not a Kubernetes quantity (e.g. 2, 3500m)", c.RunnerHeavyCPU)
 		}
 		if !quantity.MatchString(c.RunnerHeavyMemory) {
-			return fmt.Errorf("gitea:runnerHeavyMemory %q is not a Kubernetes quantity (e.g. 8Gi)", c.RunnerHeavyMemory)
+			return fmt.Errorf("gitea:runnerHeavyMemory %q is not a Kubernetes quantity (e.g. 12Gi)", c.RunnerHeavyMemory)
 		}
 		if !strings.HasSuffix(c.RunnerImageTag, "-dind-rootless") {
 			// The pod spec hard-codes the rootless image's uid and paths

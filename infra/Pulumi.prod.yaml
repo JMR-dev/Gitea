@@ -56,11 +56,17 @@ config:
   # separate on-demand pool of runnerHeavyMachineType nodes, scaled from zero
   # to runnerHeavyMaxNodes (0 removes the pool and the label). One heavy job
   # per node; each requests runnerHeavyCpu / runnerHeavyMemory. They count
-  # towards runnerJobCapacity.
+  # towards runnerJobCapacity. e2-highmem-4 (4 vCPU / 32 GB, about 28 GiB
+  # allocatable), because compiling the pulumi-cloudflare v6 Go SDK is ONE
+  # compile process that peaks at about 14.4 GB, more than an e2-standard-4
+  # holds. The memory limit is twice the request, so 12Gi gives a job 24Gi.
   gitea:runnerHeavyMaxNodes: "2"
-  gitea:runnerHeavyMachineType: e2-standard-4
+  gitea:runnerHeavyMachineType: e2-highmem-4
+  # The CPU request, not the memory one, is what keeps it to one heavy job per
+  # node: two 12Gi pods fit in the memory, but two 2-CPU pods do not fit in
+  # the ~3.3 CPUs GKE's own pods leave free. At about 1.6 or less, two would.
   gitea:runnerHeavyCpu: "2"
-  gitea:runnerHeavyMemory: 8Gi
+  gitea:runnerHeavyMemory: 12Gi
   # `runs-on: docker` jobs (docker build, Docker actions) run on the
   # Docker-in-Docker runner: one pod per base node (pod anti-affinity), each
   # running up to runnerCapacity jobs at once. The base pool is

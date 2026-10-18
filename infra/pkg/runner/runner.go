@@ -525,8 +525,9 @@ func podsConfig(cfg *config.Config) string {
 	// `runs-on: heavy` gets the same image on the heavy pool, through a
 	// pod_templates entry keyed by the label: it selects and tolerates the
 	// pool, and asks for enough memory that the autoscaler can only satisfy it
-	// with a heavy node. The memory limit is twice the request, as below;
-	// with one heavy job per node that is effectively the whole node.
+	// with a heavy node. The memory limit is twice the request, as below:
+	// most of the node, since there is one heavy job per node. That is held
+	// by the CPU request, not the memory one (gitea:runnerHeavyCpu).
 	var heavy string
 	if cfg.RunnerHeavyMaxNodes > 0 {
 		labels = append(labels, "heavy:kubernetes://docker.io/gitea/runner-images:ubuntu-latest")
