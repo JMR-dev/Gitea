@@ -1,7 +1,20 @@
 // Package gke builds the cluster that runs Gitea Actions jobs: one zonal GKE
-// Standard cluster, used for nothing else, with an autoscaled spot pool for
-// the runners and ordinary jobs, and a tainted on-demand pool for heavy jobs
-// that scales from zero.
+// Standard cluster, used for nothing else, with three node pools:
+//
+//   - base: a fixed number of on-demand nodes for both runners and all of
+//     GKE's own pods. Never autoscaled.
+//   - burst: tainted, scaled from zero for ubuntu-* job pods and nothing else.
+//   - heavy: tainted, scaled from zero for `runs-on: heavy` job pods.
+//
+// Why the runners and GKE's pods get a pool nothing scales down: every step of
+// a pod-runner job is an exec stream from the runner, through the API server
+// and a konnectivity-agent pod (GKE's tunnel to the nodes), to the job pod's
+// kubelet. The job dies if any of them goes away, including a tunnel pod on a
+// node the job never touched. GKE marks the tunnel pods safe to evict and
+// spreads them over every node, so with one autoscaled pool the autoscaler
+// emptying an idle node killed jobs elsewhere. The taints keep tunnel pods
+// off the burst and heavy pools, and package runner pins their count, which
+// otherwise follows the number of nodes.
 //
 // Why GKE at all: the runner must not live on gitea-vm. The 2 GB box has no
 // headroom for it (docs/runbook.md), and a runner on the host it deploys is the
@@ -17,6 +30,9 @@
 package gke
 
 import (
+	"strconv"
+
+	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/compute"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/container"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/projects"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/serviceaccount"
@@ -30,19 +46,25 @@ import (
 // get-credentials` and the runbook never have to look it up.
 const Name = "gitea-runners"
 
-// HeavyPoolKey and HeavyPoolValue are the node label, and the NoSchedule taint,
-// that mark the heavy pool. `runs-on: heavy` job pods select and tolerate it
-// (package runner). Nothing else does, so the pool runs nothing between heavy
-// jobs and the autoscaler takes it back to zero.
+// PoolKey is the node label, and the NoSchedule taint, that marks the burst
+// and heavy pools, with the values below. Every job pod tolerates the burst
+// taint; `runs-on: heavy` job pods also select and tolerate the heavy one
+// (package runner). Nothing else does -- not the runners, not GKE's own
+// Deployments -- so between jobs both pools are empty and the autoscaler
+// takes them back to zero.
 const (
-	HeavyPoolKey   = "gitea-runner-pool"
+	PoolKey        = "gitea-runner-pool"
+	BurstPoolValue = "burst"
 	HeavyPoolValue = "heavy"
 )
 
 type Cluster struct {
-	Cluster  *container.Cluster
+	Cluster *container.Cluster
+	// NodePool is the base pool, where the runners run.
 	NodePool *container.NodePool
-	// HeavyPool is nil when gitea:runnerHeavyMaxNodes is 0.
+	// BurstPool is nil when gitea:runnerBurstMaxNodes is 0, HeavyPool when
+	// gitea:runnerHeavyMaxNodes is.
+	BurstPool *container.NodePool
 	HeavyPool *container.NodePool
 	NodeSA    *serviceaccount.Account
 }
@@ -175,27 +197,18 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 		return nil, err
 	}
 
-	minNodes := max(1, cfg.RunnerReplicas)
 	pool, err := container.NewNodePool(ctx, "gitea-runners-pool", &container.NodePoolArgs{
-		// No Name: Pulumi auto-names it, so force-new changes (toggling spot,
-		// changing machine type) create the new pool before deleting the old
-		// one, and the runners reschedule instead of going dark.
+		// No Name: Pulumi auto-names it, so force-new changes (changing the
+		// machine type, say) create the new pool before deleting the old one,
+		// and the runners reschedule instead of going dark.
 		Cluster:  cluster.ID(),
 		Location: pulumi.String(cfg.Zone),
 
-		// The floor is one node per DinD runner replica (pod anti-affinity
-		// allows no more per node), and never fewer than one: the runners have
-		// to stay up to poll Gitea. Starting the pool at that size means a
-		// first apply with several replicas does not hang the StatefulSet await
-		// on node provisioning. Above the floor the pool follows the job queue:
-		// the pod runner's job pods go Pending when no node has room for their
-		// requests, and the autoscaler adds a node; it removes one once no job
-		// pod is left on it.
-		InitialNodeCount: pulumi.Int(minNodes),
-		Autoscaling: &container.NodePoolAutoscalingArgs{
-			MinNodeCount: pulumi.Int(minNodes),
-			MaxNodeCount: pulumi.Int(cfg.RunnerMaxNodes),
-		},
+		// Fixed, and never autoscaled: the autoscaler only drains nodes of
+		// pools it scales, so nothing here -- the runners, the tunnel pods
+		// every job's steps stream through -- is ever evicted to save a node.
+		// Node upgrades and auto-repair still drain it.
+		NodeCount: pulumi.Int(cfg.RunnerBaseNodes()),
 		Management: &container.NodePoolManagementArgs{
 			AutoRepair:  pulumi.Bool(true),
 			AutoUpgrade: pulumi.Bool(true),
@@ -207,70 +220,136 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 			MaxUnavailable: pulumi.Int(0),
 		},
 
-		// Spot by default: roughly a third of the on-demand price, at the cost
-		// of the occasional preempted job, which can simply be re-run.
-		NodeConfig: nodeConfig(nodeSA, cfg.RunnerMachineType, cfg.RunnerSpot),
+		// On demand, always. The pod runner here is the runner for every
+		// ubuntu-* job, and every job's steps stream through the tunnel pods
+		// here, so preempting this node would fail every running job at once,
+		// heavy ones included. The cost side is in docs/runners.md.
+		NodeConfig: nodeConfig(nodeSA, cfg.RunnerMachineType, false),
 	}, opts,
 		// Nodes created before the role binding lands cannot write logs, and
 		// GKE marks the pool unhealthy.
 		pulumi.DependsOn([]pulumi.Resource{nodeRole}),
-		// The autoscaler owns the node count after creation.
-		pulumi.IgnoreChanges([]string{"initialNodeCount"}),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	heavy, err := heavyPool(ctx, cfg, cluster, nodeSA, opts, nodeRole)
-	if err != nil {
+	if err := baseCommitment(ctx, cfg, opts); err != nil {
 		return nil, err
 	}
 
-	return &Cluster{Cluster: cluster, NodePool: pool, HeavyPool: heavy, NodeSA: nodeSA}, nil
+	// Job pods go Pending when no node has room for their requests, and the
+	// autoscaler adds a burst node; it removes one about 10 minutes after the
+	// last job pod on it has finished. Spot only if asked for: a preempted
+	// burst node fails just the jobs on it.
+	var burst *container.NodePool
+	if cfg.RunnerBurstMaxNodes > 0 {
+		burst, err = taintedPool(ctx, "gitea-runners-burst-pool", BurstPoolValue,
+			cfg.Zone, cfg.RunnerMachineType, cfg.RunnerBurstSpot, cfg.RunnerBurstMaxNodes,
+			cluster, nodeSA, opts, nodeRole)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// On demand, not spot, on purpose: this is where `pulumi up` runs, and a
+	// preempted apply leaves a stack with pending operations to clear by hand.
+	// A pool that exists only while a job runs makes the price difference
+	// small.
+	var heavy *container.NodePool
+	if cfg.RunnerHeavyMaxNodes > 0 {
+		heavy, err = taintedPool(ctx, "gitea-runners-heavy-pool", HeavyPoolValue,
+			cfg.Zone, cfg.RunnerHeavyMachineType, false, cfg.RunnerHeavyMaxNodes,
+			cluster, nodeSA, opts, nodeRole)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Cluster{Cluster: cluster, NodePool: pool, BurstPool: burst, HeavyPool: heavy, NodeSA: nodeSA}, nil
 }
 
-// heavyPool is the node pool `runs-on: heavy` jobs run on: bigger machines,
-// from zero nodes. Its taint keeps everything else -- the runners, ordinary job
-// pods, GKE's own Deployments -- off it, so an idle pool really is empty and
-// costs nothing but its configuration.
+// baseCommitment buys the committed use discount gitea:runnerBaseCommitment
+// asks for: one base node's worth of E2 vCPUs and memory in the region. It
+// covers that much E2 usage in this project, not one particular node, so the
+// base node uses all of it and burst, heavy and surge-upgrade nodes bill at
+// the on-demand rate.
 //
-// On demand, not spot, on purpose: this is where `pulumi up` runs, and a
-// preempted apply leaves a stack with pending operations to clear by hand.
-// A pool that exists only while a job runs makes the price difference small.
-func heavyPool(
+// A commitment is a purchase, not configuration: it cannot be cancelled,
+// changed or deleted, and it bills every month of its term, used or not. So
+// it is write-once here. Changes to its inputs are ignored -- a different
+// machine type later must not mean buying a second commitment -- and Protect
+// is the backstop: Pulumi refuses to replace or delete a protected resource
+// before it creates anything. RetainOnDelete, because there is no delete to
+// call: unprotecting and dropping it only removes it from state.
+func baseCommitment(ctx *pulumi.Context, cfg *config.Config, opts pulumi.ResourceOption) error {
+	plan := cfg.CommitmentPlan()
+	if plan == "" {
+		return nil
+	}
+	vcpus, memoryMB, err := config.E2Shape(cfg.RunnerMachineType)
+	if err != nil {
+		return err
+	}
+	_, err = compute.NewRegionCommitment(ctx, "gitea-runners-base-commitment", &compute.RegionCommitmentArgs{
+		Name:        pulumi.String("gitea-runners-base"),
+		Region:      pulumi.String(cfg.Region),
+		Description: pulumi.String("One base node of the Gitea Actions runner cluster (docs/runners.md)"),
+		Type:        pulumi.String("GENERAL_PURPOSE_E2"),
+		Plan:        pulumi.String(plan),
+		Resources: compute.RegionCommitmentResourceArray{
+			&compute.RegionCommitmentResourceArgs{Type: pulumi.String("VCPU"), Amount: pulumi.String(strconv.Itoa(vcpus))},
+			&compute.RegionCommitmentResourceArgs{Type: pulumi.String("MEMORY"), Amount: pulumi.String(strconv.Itoa(memoryMB))},
+		},
+		// Whether to keep the discount is decided when the term nears its end
+		// (docs/runners.md), and the answer lives in the console, not here.
+		AutoRenew: pulumi.Bool(false),
+	}, opts,
+		pulumi.Protect(true),
+		pulumi.RetainOnDelete(true),
+		pulumi.IgnoreChanges([]string{"description", "type", "plan", "resources", "autoRenew"}),
+	)
+	return err
+}
+
+// taintedPool is a node pool that scales from zero for the job pods that
+// tolerate its taint, and holds nothing else. The taint keeps everything else
+// -- the runners, GKE's own Deployments and with them the tunnel pods -- off
+// it, so an idle pool really is empty, costs nothing but its configuration,
+// and scaling it down never takes anything a running job depends on.
+func taintedPool(
 	ctx *pulumi.Context,
-	cfg *config.Config,
+	name, poolValue, zone, machineType string,
+	spot bool,
+	maxNodes int,
 	cluster *container.Cluster,
 	nodeSA *serviceaccount.Account,
 	opts pulumi.ResourceOption,
 	nodeRole pulumi.Resource,
 ) (*container.NodePool, error) {
-	if cfg.RunnerHeavyMaxNodes == 0 {
-		return nil, nil
-	}
-
-	nc := nodeConfig(nodeSA, cfg.RunnerHeavyMachineType, false)
+	nc := nodeConfig(nodeSA, machineType, spot)
 	// Labels and taints are part of the pool's node template, which is what
-	// lets the autoscaler scale it up from zero for a pod that selects them.
-	nc.Labels = pulumi.StringMap{HeavyPoolKey: pulumi.String(HeavyPoolValue)}
+	// lets the autoscaler scale it up from zero for a pod that tolerates or
+	// selects them.
+	nc.Labels = pulumi.StringMap{PoolKey: pulumi.String(poolValue)}
 	nc.Taints = container.NodePoolNodeConfigTaintArray{
 		&container.NodePoolNodeConfigTaintArgs{
-			Key:    pulumi.String(HeavyPoolKey),
-			Value:  pulumi.String(HeavyPoolValue),
+			Key:    pulumi.String(PoolKey),
+			Value:  pulumi.String(poolValue),
 			Effect: pulumi.String("NO_SCHEDULE"),
 		},
 	}
 
-	return container.NewNodePool(ctx, "gitea-runners-heavy-pool", &container.NodePoolArgs{
-		// Auto-named, like the main pool, so a machine type change creates
+	return container.NewNodePool(ctx, name, &container.NodePoolArgs{
+		// Auto-named, like the base pool, so a machine type change creates
 		// the new pool before deleting the old one.
 		Cluster:  cluster.ID(),
-		Location: pulumi.String(cfg.Zone),
+		Location: pulumi.String(zone),
 
 		InitialNodeCount: pulumi.Int(0),
 		Autoscaling: &container.NodePoolAutoscalingArgs{
 			MinNodeCount: pulumi.Int(0),
-			MaxNodeCount: pulumi.Int(cfg.RunnerHeavyMaxNodes),
+			MaxNodeCount: pulumi.Int(maxNodes),
 		},
 		Management: &container.NodePoolManagementArgs{
 			AutoRepair:  pulumi.Bool(true),

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -51,8 +52,16 @@ type Config struct {
 	RunnersEnabled    bool
 	RunnerImageTag    string
 	RunnerMachineType string
-	RunnerMaxNodes    int
-	RunnerSpot        bool
+
+	// The base pool holds both runners and GKE's own pods: RunnerBaseNodes()
+	// on-demand nodes, never autoscaled. RunnerBaseCommitment ("", "1y" or
+	// "3y") buys a committed use discount covering ONE of them.
+	RunnerBaseCommitment string
+
+	// The burst pool holds nothing but ubuntu-* job pods: 0 to
+	// RunnerBurstMaxNodes nodes, following the job queue. 0 removes it.
+	RunnerBurstMaxNodes int
+	RunnerBurstSpot     bool
 
 	// The Docker-in-Docker runner, for `runs-on: docker` jobs: one pod per
 	// node, each running up to RunnerCapacity jobs in its own dockerd.
@@ -112,20 +121,34 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		RunnerImageTag:    c.Get("runnerImageTag"),
 		RunnerCapacity:    c.GetInt("runnerCapacity"),
 		RunnerMachineType: c.Get("runnerMachineType"),
-		RunnerMaxNodes:    c.GetInt("runnerMaxNodes"),
 		RunnerJobCPU:      c.Get("runnerJobCpu"),
 		RunnerJobMemory:   c.Get("runnerJobMemory"),
+
+		RunnerBaseCommitment: c.Get("runnerBaseCommitment"),
+		RunnerBurstSpot:      c.GetBool("runnerBurstSpot"),
 
 		RunnerHeavyMachineType: c.Get("runnerHeavyMachineType"),
 		RunnerHeavyCPU:         c.Get("runnerHeavyCpu"),
 		RunnerHeavyMemory:      c.Get("runnerHeavyMemory"),
 	}
 
-	// These have non-zero defaults where zero/false is ALSO a meaningful
-	// setting (replicas=0 and jobCapacity=0 are the clean-teardown step;
-	// spot=false is on-demand nodes), so GetInt/GetBool -- which cannot tell
-	// "unset" from 0/false -- would make the explicit value impossible to
-	// express.
+	// Both meant something else before the node pool was split into base and
+	// burst pools (the size of, and spot for, the one pool that held the
+	// runners). Refused rather than ignored, so a stale stack config cannot
+	// quietly keep the old behaviour in mind.
+	for _, k := range []struct{ old, now string }{
+		{"runnerMaxNodes", "runnerBurstMaxNodes (burst nodes only; the base pool is sized by runnerReplicas)"},
+		{"runnerSpot", "runnerBurstSpot (the base pool is always on demand)"},
+	} {
+		if _, err := c.Try(k.old); err == nil {
+			return nil, fmt.Errorf("gitea:%s is no longer read: use gitea:%s", k.old, k.now)
+		}
+	}
+
+	// These have non-zero defaults where zero is ALSO a meaningful setting
+	// (replicas=0 and jobCapacity=0 are the clean-teardown step; 0 burst or
+	// heavy nodes removes that pool), so GetInt -- which cannot tell "unset"
+	// from 0 -- would make the explicit value impossible to express.
 	var err error
 	if cfg.RunnerReplicas, err = c.TryInt("runnerReplicas"); err != nil {
 		if !errors.Is(err, config.ErrMissingVar) {
@@ -145,11 +168,11 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		}
 		cfg.RunnerHeavyMaxNodes = 2
 	}
-	if cfg.RunnerSpot, err = c.TryBool("runnerSpot"); err != nil {
+	if cfg.RunnerBurstMaxNodes, err = c.TryInt("runnerBurstMaxNodes"); err != nil {
 		if !errors.Is(err, config.ErrMissingVar) {
-			return nil, fmt.Errorf("gitea:runnerSpot: %w", err)
+			return nil, fmt.Errorf("gitea:runnerBurstMaxNodes: %w", err)
 		}
-		cfg.RunnerSpot = true
+		cfg.RunnerBurstMaxNodes = 2
 	}
 
 	applyDefaults(cfg)
@@ -203,12 +226,10 @@ func applyDefaults(c *Config) {
 		c.RunnerCapacity = 1
 	}
 	if c.RunnerMachineType == "" {
-		// 2 vCPU / 8 GB: enough for a docker build of a Go service. Each DinD
-		// runner pod has one of these to itself; job pods share them.
+		// 2 vCPU / 8 GB, for both pools. A base node carries both runners
+		// and all of GKE's own pods, which only just fits (docs/runners.md);
+		// a burst node carries about three job pods.
 		c.RunnerMachineType = "e2-standard-2"
-	}
-	if c.RunnerMaxNodes == 0 {
-		c.RunnerMaxNodes = 3
 	}
 	if c.RunnerJobCPU == "" {
 		// About three jobs on an otherwise empty e2-standard-2, after GKE's
@@ -255,15 +276,24 @@ func validate(c *Config) error {
 		return fmt.Errorf("gitea:wafMode %q must be On, DetectionOnly, or Off", c.WAFMode)
 	}
 	if c.RunnersEnabled {
-		if c.RunnerMaxNodes < 1 || c.RunnerMaxNodes > 10 {
+		if c.RunnerBurstMaxNodes < 0 || c.RunnerBurstMaxNodes > 10 {
 			// The upper bound is a cost guard, not a technical limit.
-			return fmt.Errorf("gitea:runnerMaxNodes %d must be between 1 and 10", c.RunnerMaxNodes)
+			return fmt.Errorf("gitea:runnerBurstMaxNodes %d must be between 0 and 10", c.RunnerBurstMaxNodes)
 		}
-		if c.RunnerReplicas < 0 || c.RunnerReplicas > c.RunnerMaxNodes {
-			// One DinD runner pod per node by construction (see pkg/runner), so
-			// more replicas than nodes would leave pods Pending forever.
-			return fmt.Errorf("gitea:runnerReplicas %d must be between 0 and gitea:runnerMaxNodes (%d)",
-				c.RunnerReplicas, c.RunnerMaxNodes)
+		if c.RunnerReplicas < 0 || c.RunnerReplicas > 10 {
+			// Each replica is an always-on base node of its own (one DinD
+			// runner per node, see pkg/runner). Also a cost guard.
+			return fmt.Errorf("gitea:runnerReplicas %d must be between 0 and 10", c.RunnerReplicas)
+		}
+		switch c.RunnerBaseCommitment {
+		case "", "1y", "3y":
+		default:
+			return fmt.Errorf("gitea:runnerBaseCommitment %q must be 1y, 3y, or unset", c.RunnerBaseCommitment)
+		}
+		if c.RunnerBaseCommitment != "" {
+			if _, _, err := E2Shape(c.RunnerMachineType); err != nil {
+				return fmt.Errorf("gitea:runnerBaseCommitment: %w", err)
+			}
 		}
 		if c.RunnerCapacity < 1 {
 			return fmt.Errorf("gitea:runnerCapacity %d must be at least 1", c.RunnerCapacity)
@@ -310,6 +340,48 @@ func (c *Config) GitHubConfigured() bool {
 
 // ARHost is the Artifact Registry endpoint for the configured region.
 func (c *Config) ARHost() string { return c.Region + "-docker.pkg.dev" }
+
+// RunnerBaseNodes is the base pool's fixed size: one node per DinD runner
+// replica (pod anti-affinity allows no more per node), and never fewer than
+// one, because the runners have to stay up to poll Gitea.
+func (c *Config) RunnerBaseNodes() int { return max(1, c.RunnerReplicas) }
+
+// CommitmentPlan is the Compute Engine plan for gitea:runnerBaseCommitment, or
+// "" when there is none.
+func (c *Config) CommitmentPlan() string {
+	switch c.RunnerBaseCommitment {
+	case "1y":
+		return "TWELVE_MONTH"
+	case "3y":
+		return "THIRTY_SIX_MONTH"
+	}
+	return ""
+}
+
+var (
+	e2Predefined = regexp.MustCompile(`^e2-(standard|highmem|highcpu)-([0-9]+)$`)
+	e2Custom     = regexp.MustCompile(`^e2-custom-([0-9]+)-([0-9]+)$`)
+	// Memory per vCPU, in MB, of each predefined E2 family.
+	e2PerVCPU = map[string]int{"standard": 4096, "highmem": 8192, "highcpu": 1024}
+)
+
+// E2Shape returns the vCPUs and memory (MB) of an E2 machine type, which is
+// what a resource-based commitment is bought in. Shared-core types
+// (e2-micro/small/medium) cannot be committed to and are refused, as is
+// anything that is not E2, whose commitments are a different type.
+func E2Shape(machineType string) (vcpus, memoryMB int, err error) {
+	if m := e2Custom.FindStringSubmatch(machineType); m != nil {
+		vcpus, _ = strconv.Atoi(m[1])
+		memoryMB, _ = strconv.Atoi(m[2])
+		return vcpus, memoryMB, nil
+	}
+	if m := e2Predefined.FindStringSubmatch(machineType); m != nil {
+		vcpus, _ = strconv.Atoi(m[2])
+		return vcpus, vcpus * e2PerVCPU[m[1]], nil
+	}
+	return 0, 0, fmt.Errorf("%q is not an E2 machine type a commitment can be sized from "+
+		"(e2-standard-N, e2-highmem-N, e2-highcpu-N or e2-custom-N-M)", machineType)
+}
 
 // RunnerImage is the Docker-in-Docker runner's image.
 func (c *Config) RunnerImage() string { return "docker.io/gitea/runner:" + c.RunnerImageTag }

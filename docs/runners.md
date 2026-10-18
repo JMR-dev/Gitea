@@ -12,7 +12,7 @@ There are two runners, and a job's `runs-on` picks one:
 
 | `runs-on` | Runner | How the job runs |
 |---|---|---|
-| `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | **pod runner** (`gitea-runner-pods`) | As its own pod in the `gitea-jobs` namespace. Jobs run in parallel, up to `gitea:runnerJobCapacity`, and the node pool grows to fit them. |
+| `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | **pod runner** (`gitea-runner-pods`) | As its own pod in the `gitea-jobs` namespace. Jobs run in parallel, up to `gitea:runnerJobCapacity`, on burst nodes added to fit them. |
 | `heavy` | **pod runner**, on the **heavy pool** | Like `ubuntu-latest`, but the pod requests 8 Gi and 2 CPUs and runs alone on an on-demand `e2-standard-4` (16 GB) node. The pool scales up from zero for it. For Pulumi and other memory-hungry jobs. |
 | `docker` | **DinD runner** (`gitea-runner`) | Inside that runner's rootless Docker daemon, one node per replica, `gitea:runnerCapacity` jobs at a time. |
 
@@ -26,8 +26,11 @@ container's `options`, `volumes` or `credentials` fail the job, and so does
 | Piece | Choice | Where |
 |---|---|---|
 | Cluster | GKE **Standard**, zonal (`gitea:zone`), named `gitea-runners`, used for nothing else | `infra/pkg/gke` |
-| Nodes | An autoscaled pool, `e2-standard-2` **spot** by default, private (no external IPs), COS | `infra/pkg/gke` |
-| Heavy nodes | A second pool, `e2-standard-4` **on demand**, 0 to `runnerHeavyMaxNodes`, tainted so only `heavy` jobs land there | `infra/pkg/gke` |
+| Base nodes | `max(1, runnerReplicas)` × `e2-standard-2`, **on demand**, never autoscaled. Both runners and all of GKE's own pods. One node can be covered by a 1-year commitment (`runnerBaseCommitment`, not yet bought) | `infra/pkg/gke` |
+| Burst nodes | `e2-standard-2`, on demand, 0 to `runnerBurstMaxNodes`, tainted so only job pods land there | `infra/pkg/gke` |
+| Heavy nodes | `e2-standard-4`, on demand, 0 to `runnerHeavyMaxNodes`, tainted so only `heavy` jobs land there | `infra/pkg/gke` |
+| All nodes | Private (no external IPs), COS, Shielded | `infra/pkg/gke` |
+| Tunnel pods | GKE's `konnectivity-agent`, pinned at 2 instead of one per node | `infra/pkg/runner` |
 | Node identity | `gitea-gke-nodes@`, holding only `roles/container.defaultNodeServiceAccount` | `infra/pkg/gke` |
 | Egress | Cloud NAT on a **reserved static IP** (`runnerEgressIp` stack output) | `infra/pkg/network` |
 | Control plane | **DNS endpoint only**, authorised by IAM; IP endpoints are disabled | `infra/pkg/gke` |
@@ -47,25 +50,89 @@ Why zonal: GKE's free tier credits the management fee of **one** zonal or
 Autopilot cluster per billing account. If this billing account already has a
 cluster, this one adds about $73/month.
 
+### Why three node pools
+
+Every step of an `ubuntu-*` or `heavy` job is an exec stream: from the pod
+runner, through the API server and a `konnectivity-agent` pod (GKE's tunnel
+from the control plane to the nodes), to the kubelet on the job's node. A job
+fails with `exec in pod … ended without an exit status: failed to read frame
+header: EOF` if any of those goes away, including a tunnel pod on a node the
+job never touched.
+
+With one autoscaled spot pool, that happened in routine operation:
+
+- GKE marks the tunnel pods safe to evict and spreads them over every node.
+  When the autoscaler removed an idle burst node, the tunnel pod on it died,
+  and so did the jobs streaming through it on other nodes.
+- GKE runs one tunnel pod per node, up to six, so every node joining or
+  leaving (a burst node, a heavy node) added or deleted one.
+- The pod runner and the tunnel pods were on spot nodes, so a preemption
+  failed every running job at once, `heavy` ones included.
+
+So the runners and GKE's own pods now live on the base pool, which nothing
+scales down and which is never spot. The burst and heavy pools are tainted, so
+nothing a job depends on can land there, and the tunnel-pod count is pinned at
+2 (`infra/pkg/runner/tunnel.go`). What still interrupts running jobs: node
+upgrades and auto-repairs of the base pool, which normally happen in the Sunday
+maintenance window.
+
+**The base node is full by design.** One `e2-standard-2` has 1930m of
+allocatable CPU. GKE's per-node pods take about 630m and its other system pods
+about 460m, so the runners get the rest: 500m for the DinD runner and 200m for
+the pod runner. That leaves about 140m, too little for a 400m job pod, so jobs
+always run on burst nodes. CPU requests only steer scheduling. With no CPU
+limits, the DinD runner's builds use whatever the node has idle. Memory is
+tighter too: `docker` builds now share the node's ~6 GiB allocatable with the
+pod runner and all of GKE's pods, rather than having a node mostly to
+themselves. A build that peaks well above 2 GiB can push the node into memory
+pressure, and the kubelet then evicts pods rather than OOM-killing the build.
+If a GKE upgrade adds system pods beyond the spare 140m, see *Troubleshooting*.
+
 ### Cost
 
-Roughly **$25–35/month** idle, provided the free-tier credit covers the cluster
-fee. Idle means one node, carrying the DinD runner and the pod runner:
+Roughly **$61/month** idle, or **$43** with the optional base commitment,
+provided the free-tier credit covers the cluster fee. Idle means one base node
+carrying both runners:
 
 | | approx. / month |
 |---|---|
-| spot `e2-standard-2` node | $15 |
+| base `e2-standard-2`, on demand ($30.82 with the 1-year commitment) | $48.92 |
 | static NAT IP (in use) | $3.65 |
 | Cloud NAT gateway + data processing | $1 + $0.045/GB |
 | boot disk 30 GB + PVCs 10 + 20 + 10 GB, pd-balanced | $7 |
 
-Busy periods add **burst nodes**. Each one costs a spot `e2-standard-2` plus its
-boot disk, about $0.03/hour together, only while it exists. A **heavy node**
-is an on-demand `e2-standard-4`, about $0.14/hour, also only while it exists.
-That is roughly 3 cents for a 10-minute `pulumi up`, plus the node's boot time
-and the 10 minutes the autoscaler waits before removing it. The autoscaler
-removes a node about 10 minutes after its last job pod finishes. Each extra
-DinD replica adds an always-on node and two PVCs.
+These are us-east1 list prices from October 2026. For comparison, a spot
+`e2-standard-2` was $29.35/month: spot saves about 40%, not two thirds.
+
+Busy periods add **burst nodes**. Each one costs an on-demand `e2-standard-2`
+plus its boot disk, about $0.07/hour together, only while it exists. A **heavy
+node** is an on-demand `e2-standard-4`, about $0.14/hour, also only while it
+exists. That is roughly 3 cents for a 10-minute `pulumi up`, plus the node's
+boot time and the 10 minutes the autoscaler waits before removing it. The
+autoscaler removes a burst or heavy node about 10 minutes after its last job pod
+finishes. Each extra DinD replica adds an always-on, on-demand base node and
+two PVCs.
+
+### The commitment
+
+`gitea:runnerBaseCommitment 1y` buys a resource-based committed use discount,
+`gitea-runners-base`: one base node's worth of E2 (2 vCPUs and 8 GB) in the
+region. It covers that much E2 usage in this project, not one particular node.
+The base node uses all of it, and burst, heavy and surge-upgrade nodes bill on
+demand.
+
+- **It cannot be cancelled.** It bills monthly for the whole term, used or
+  not. Changing `runnerMachineType` or removing the key does not change or end
+  it. The program ignores changes to it, and protects it so that Pulumi refuses
+  to replace or delete it.
+- **Before the term ends**, decide. Turn on auto-renew in the console (Compute
+  Engine → Committed use discounts) any time before it expires, or let it
+  lapse, and the base node bills on demand again.
+- **A bigger base node later** needs a second commitment for the difference.
+  This one keeps covering its 2 vCPUs and 8 GB of whatever E2 runs.
+- **Turning the runners off** while it is active: step 2 below fails on the
+  protected commitment. Run `pulumi state unprotect` on its URN first. Pulumi
+  then only forgets it, and it keeps billing until its end date.
 
 ## Threat model
 
@@ -230,8 +297,8 @@ jobs:
 ```
 
 While it runs, `make runners` should show the four `fan-out` pods in
-`gitea-jobs` **at the same time**. Usually they land on more than one node, and
-the node count goes up. The `heavy` job's pod waits Pending until a heavy node
+`gitea-jobs` **at the same time**, on burst nodes the autoscaler adds for them
+(the base node has no room for job pods). The `heavy` job's pod waits Pending until a heavy node
 has booted, then runs alone on it. That node goes away about 10 minutes after
 the run. Push twice: the second run's `cached/stamp` files
 should have two lines. `make logs` should show **no** Coraza audit entries for
@@ -241,27 +308,29 @@ should have two lines. `make logs` should show **no** Coraza audit entries for
 
 | Task | How |
 |---|---|
-| More parallel `ubuntu-*` jobs | `gitea:runnerJobCapacity`, and `gitea:runnerMaxNodes` (max 10) so they fit |
+| More parallel `ubuntu-*` jobs | `gitea:runnerJobCapacity`, and `gitea:runnerBurstMaxNodes` (max 10) so they fit: about 3 job pods per burst node |
 | Bigger or smaller job pods | `gitea:runnerJobCpu` / `gitea:runnerJobMemory` (requests; the memory limit is twice the request) |
 | Heavy jobs | `runs-on: heavy`. Size with `gitea:runnerHeavyCpu` / `gitea:runnerHeavyMemory` and `gitea:runnerHeavyMachineType` (the request must fit the machine's allocatable memory: about 12.5 GiB on `e2-standard-4`); `gitea:runnerHeavyMaxNodes` caps how many run at once, 0 removes the pool |
-| More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (a node each, ≤ `runnerMaxNodes`) |
-| On-demand instead of spot | `gitea:runnerSpot false`. The pool is replaced create-first, so the runners reschedule. |
-| Bigger nodes | `gitea:runnerMachineType e2-standard-4` |
+| More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (an always-on, on-demand base node each, max 10) |
+| Spot burst nodes | `gitea:runnerBurstSpot true`: about 40% off each burst node-hour, and a preemption fails only the jobs on that node. The base pool is always on demand. |
+| Bigger nodes | `gitea:runnerMachineType e2-standard-4`, for both the base and burst pools. Each is replaced create-first, so the runners reschedule. The commitment does not grow with it (*The commitment*). |
 | Upgrade the runner | bump `gitea:runnerImageTag`; it must stay a `-dind-rootless` tag |
 | Shell into a runner | `kubectl --context=gke_<p>_<zone>_gitea-runners -n gitea-runner exec -it gitea-runner-pods-0 -- sh` (or `gitea-runner-0`) |
 | Watch job pods | `kubectl --context=… -n gitea-jobs get pods -o wide -w` |
 
 **Scaling follows the job queue.** Each `ubuntu-*` job pod requests
 `runnerJobCpu` and `runnerJobMemory`. When a job pod fits on no node, it waits
-Pending and the autoscaler adds a node, up to `runnerMaxNodes`. A node is
-removed about 10 minutes after its last job pod finishes. A running job pod
-blocks its node's removal, so scale-down never kills a job. A job that needs a
-new node waits for it to boot, and then for the node to pull the job image.
-That takes a few minutes, compared with seconds on a warm node.
+Pending and the autoscaler adds a burst node, up to `runnerBurstMaxNodes`. A
+burst node is removed about 10 minutes after its last job pod finishes. A
+running job pod blocks its node's removal, and nothing else a job depends on
+runs on burst nodes, so scale-down never kills a job. A job that needs a new
+node waits for it to boot, and then for the node to pull the job image. That
+takes a few minutes, compared with seconds on a warm node. Because the base
+node has no room for job pods, the first job after an idle spell always waits.
 
-At most `runnerJobCapacity` jobs run at once. Size it to what `runnerMaxNodes`
-nodes can actually hold (`kubectl describe nodes` shows allocatable and what
-GKE's own pods take). Jobs beyond that capacity wait in Gitea's queue. Jobs
+At most `runnerJobCapacity` jobs run at once. Size it to what
+`runnerBurstMaxNodes` burst nodes can actually hold (`kubectl describe nodes`
+shows allocatable and what GKE's own pods take). Jobs beyond that capacity wait in Gitea's queue. Jobs
 within it that find no room become Pending pods. Whether the runner waits for
 such a pod indefinitely or eventually fails the job is not yet verified. Until
 it is, keep the capacity within what the nodes can hold.
@@ -272,22 +341,24 @@ selects and tolerates it, so it is the only thing that can make the autoscaler
 add a heavy node. The first heavy job after an idle spell therefore waits a few
 minutes for a node to boot and pull the job image. The pool is on demand rather
 than spot because `pulumi up` runs here: a preempted apply leaves the stack
-with pending operations to clear by hand.
+with pending operations to clear by hand. The runner and the tunnel pods a
+heavy job streams through are on the on-demand base pool too, so nothing on
+the path is spot.
 
-The main pool's floor is `max(1, runnerReplicas)`. Pod anti-affinity gives each DinD
-runner a node of its own, and the floor is at least 1 because the runners must
-keep polling Gitea. The pod runner prefers the DinD runner's node, which the
-pool keeps anyway.
+**The base pool is a fixed `max(1, runnerReplicas)` nodes.** Pod anti-affinity
+gives each DinD runner a node of its own, and there is always at least one node
+because the runners must keep polling Gitea. A commitment, once bought, covers
+one of them.
 
-**Spot preemption** gives a pod about 15 seconds, so a job running at the time
-fails. Re-run it. **The pod runner is the runner for every `ubuntu-*` job**, so
-if its own node is preempted, every running `ubuntu-*` job fails. A rollout of
-the pod runner (a config change, a runner upgrade) waits up to 55 minutes for
-running jobs to finish. `pulumi up` waits with it. On on-demand nodes, a drain (node upgrade or scale-down) lets
-running jobs finish for up to 55 minutes. Node upgrades normally happen in the
-Sunday 05:00–09:00 UTC window, alongside the VM's reboot window. GKE can still
-push urgent security patches and auto-repairs outside it, and those interrupt
-running jobs without warning, just as preemption does.
+**The pod runner is the runner for every `ubuntu-*` job**, so every running
+`ubuntu-*` job fails if it goes away. A rollout of the pod runner (a config
+change, a runner upgrade) waits up to 55 minutes for running jobs to finish,
+and `pulumi up` waits with it. So does a drain of a base node for a node
+upgrade. Node upgrades normally happen in the Sunday
+05:00–09:00 UTC window, alongside the VM's reboot window. GKE can still push
+urgent security patches and auto-repairs outside it, and those can interrupt
+running jobs without warning. With `runnerBurstSpot true`, a preempted burst
+node gives its pods about 15 seconds, so the jobs on it fail. Re-run them.
 
 **Runner 5.x is tested upstream against current Gitea, not 1.27.** If
 registration or job fetching misbehaves after a runner upgrade, roll
@@ -327,6 +398,9 @@ pulumi config set gitea:runnerReplicas 0 && pulumi config set gitea:runnerJobCap
   && pulumi up                                            # 1. deletes the pods AND their PVC disks
 pulumi config set gitea:runnersEnabled false && pulumi up # 2. deletes the cluster, NAT, subnet, IP
 ```
+
+While the base commitment is active, step 2 stops at the protected commitment
+(*The commitment*): `pulumi state unprotect` it first.
 
 Step 1 matters because deleting a cluster does **not** delete PVC-backed disks.
 Skipping it leaves orphaned PDs that keep billing. To find them:
@@ -403,12 +477,38 @@ itself: `data-root` in `daemon.json`, `dockerDataRoot` in `infra/pkg/runner`.
 
 **`ubuntu-*` jobs stay "Waiting" or their pods stay Pending.** `kubectl -n
 gitea-jobs describe pod <pod>` says why. `Insufficient cpu/memory` with the
-pool already at `runnerMaxNodes` means more jobs are admitted than the nodes
-hold: lower `runnerJobCapacity`, lower the job requests, or raise
-`runnerMaxNodes`. A job pod rejected outright with `violates PodSecurity
+burst pool already at `runnerBurstMaxNodes` means more jobs are admitted than
+the nodes hold: lower `runnerJobCapacity`, lower the job requests, or raise
+`runnerBurstMaxNodes`. `untolerated taint {gitea-runner-pool: burst}` means
+the job pod did not get the toleration from the default `pod_template` in
+`podsConfig` (`infra/pkg/runner`). Check the rendered config in the
+`gitea-runner-pods-config-*` ConfigMap. A job pod rejected outright with `violates PodSecurity
 "baseline"` means the runner built a pod spec baseline does not allow. That
 should not happen; do not relax the namespace label without understanding what
 asked for it.
+
+**A job fails with `exec in pod … ended without an exit status: failed to read
+frame header: EOF`.** The stream from the pod runner to the job pod broke (see
+*Why three node pools*). Re-run the job. If it keeps happening outside the
+maintenance window, check that the tunnel pods are still pinned:
+
+```bash
+kubectl --context=… -n kube-system get deploy konnectivity-agent     # 2 replicas
+kubectl --context=… -n kube-system get pods -l k8s-app=konnectivity-agent -o wide   # on the base node
+kubectl --context=… -n kube-system get configmap konnectivity-agent-autoscaler-config -o yaml
+```
+
+If the ladder is back to GKE's one-per-node list, something reset the
+ConfigMap, most likely a GKE upgrade. `pulumi up --refresh` should see the
+difference and apply the patch again (not yet tested).
+
+**A kube-system pod or a runner stays Pending on the base node.** The base node
+is full by design (*Why three node pools*), so a GKE upgrade that adds or
+enlarges a system pod can push it over. GKE's pods have a higher priority than
+the runners, so it is usually a runner that ends up Pending, evicted to make
+room. `kubectl --context=… describe node <base node>` shows the requests. Lower
+the runner requests in `infra/pkg/runner`, or move `runnerMachineType` to an
+`e2-standard-4`. The commitment does not grow with it (*The commitment*).
 
 **The pod runner cannot create job pods** (timeouts or `connection refused`
 against `10.28.0.1:443` in its log). It must reach the API server, whose

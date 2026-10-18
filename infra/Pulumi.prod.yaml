@@ -46,7 +46,7 @@ config:
   # Pinned. Must be a -dind-rootless tag; validated in infra/pkg/config.
   gitea:runnerImageTag: 5.1.0-dind-rootless
   # `runs-on: ubuntu-*` jobs each run as their own pod, up to runnerJobCapacity
-  # at once across the cluster, and the node pool grows (up to runnerMaxNodes)
+  # at once across the cluster, on burst nodes added (up to runnerBurstMaxNodes)
   # to fit them. Each job pod requests runnerJobCpu / runnerJobMemory; that
   # request is what the autoscaler packs nodes by. 0 removes the pod runner.
   gitea:runnerJobCapacity: "6"
@@ -62,14 +62,21 @@ config:
   gitea:runnerHeavyCpu: "2"
   gitea:runnerHeavyMemory: 8Gi
   # `runs-on: docker` jobs (docker build, Docker actions) run on the
-  # Docker-in-Docker runner: one pod per node (pod anti-affinity), each running
-  # up to runnerCapacity jobs at once.
+  # Docker-in-Docker runner: one pod per base node (pod anti-affinity), each
+  # running up to runnerCapacity jobs at once. The base pool is
+  # max(1, runnerReplicas) on-demand nodes, never autoscaled: both runners and
+  # GKE's own pods live there.
   gitea:runnerReplicas: "1"
   gitea:runnerCapacity: "1"
   # Turning runners off cleanly starts with runnerReplicas AND runnerJobCapacity
   # at 0 -- that deletes the PVC disks. See docs/runners.md.
   gitea:runnerMachineType: e2-standard-2
-  gitea:runnerMaxNodes: "3"
-  # Spot: about a third of the price; a preempted job fails and is re-run.
-  gitea:runnerSpot: "true"
+  # gitea:runnerBaseCommitment (unset): `1y` buys a 1-year committed use
+  # discount for ONE base node (2 vCPU + 8 GB of E2 in the region). A purchase,
+  # not a setting: it cannot be cancelled, and changing or removing the key
+  # later does not undo it. See docs/runners.md. The base pool went live on
+  # 2026-10-18 without one; after a clean week, set it to 1y and `make up`.
+  # Burst nodes, for ubuntu-* job pods only, scaled from zero. On demand.
+  gitea:runnerBurstMaxNodes: "2"
+  gitea:runnerBurstSpot: "false"
 encryptionsalt: v1:pIXPmM64Bzc=:v1:0pkb4B2RVM5LFu2v:ZEPaG4RB9ySlpmaHkaBy8v6FQ3paHg==

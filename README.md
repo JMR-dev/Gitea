@@ -15,7 +15,7 @@ Engine VM, served at `gitea.jasonmross.dev`.
 | Firewall | nftables + fail2ban on the host, VPC firewall outside it |
 | IaC | Pulumi, Go, self-managed GCS state backend |
 | CI/CD | Cloud Build — push triggers plus a weekly rebuild |
-| Gitea Actions | Optional runners on a dedicated GKE Standard cluster (spot): each `ubuntu-*` job is its own autoscaled pod; `runs-on: docker` gets rootless Docker-in-Docker — [docs/runners.md](docs/runners.md) |
+| Gitea Actions | Optional runners on a dedicated GKE Standard cluster: a fixed on-demand base node for the runners, and each `ubuntu-*` job its own pod on autoscaled burst nodes; `runs-on: docker` gets rootless Docker-in-Docker — [docs/runners.md](docs/runners.md) |
 
 ## Layout
 

@@ -1,8 +1,8 @@
 // Package runner deploys the Gitea Actions runners into the GKE cluster from
 // package gke, the NetworkPolicies that keep jobs away from the metadata
-// server, and the plumbing that gets the registration token into the runner
-// pods without Pulumi ever handling it. There are two runners, with disjoint
-// labels:
+// server, the plumbing that gets the registration token into the runner pods
+// without Pulumi ever handling it, and the fixed tunnel-pod count running jobs
+// depend on (tunnel.go). There are two runners, with disjoint labels:
 //
 //   - The pod runner takes `runs-on: ubuntu-*`. It uses the runner's kubernetes
 //     backend: every job is its own unprivileged pod in JobsNamespace, so jobs
@@ -122,6 +122,10 @@ func New(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, deps []pulumi
 	// is not verified; if a replacement leaves objects stuck in state, run once
 	// with PULUMI_K8S_DELETE_UNREACHABLE=true (docs/runners.md).
 	k8sOpts := []pulumi.ResourceOption{opts, pulumi.Provider(k8s), pulumi.DeletedWith(gk.Cluster)}
+
+	if err := pinTunnelAgents(ctx, k8sOpts); err != nil {
+		return nil, err
+	}
 
 	ns, err := corev1.NewNamespace(ctx, "gitea-runner", &corev1.NamespaceArgs{
 		Metadata: &metav1.ObjectMetaArgs{
@@ -460,13 +464,10 @@ cache:
 
 // dindConfig is the DinD runner's config.yaml.
 func dindConfig(cfg *config.Config) string {
-	// Spot nodes get ~15s of notice before preemption, so there is no point in
-	// waiting for jobs to finish: they will not. On on-demand nodes, a drain
-	// (node upgrade, scale-down) waits up to an hour, so let running jobs use it.
+	// The runners live on the on-demand base pool, where a drain for a node
+	// upgrade waits up to an hour, so let running jobs use it. Must stay below
+	// the pod's terminationGracePeriodSeconds.
 	shutdown := "55m"
-	if cfg.RunnerSpot {
-		shutdown = "20s"
-	}
 
 	// One label, disjoint from the pod runner's: a job that needs a Docker
 	// daemon must say so with `runs-on: docker`, or it lands on a job pod that
@@ -494,11 +495,10 @@ container:
 
 // podsConfig is the pod runner's config.yaml.
 func podsConfig(cfg *config.Config) string {
-	// Long even on spot. Preemption cuts it to ~15s whatever is asked for, so
-	// it costs nothing there; on a rollout or a node upgrade it lets every
-	// running job finish, rather than failing all of them at once -- this one
-	// pod is the runner for every ubuntu-* job in the cluster. Must stay below
-	// the pod's terminationGracePeriodSeconds.
+	// On a rollout or a node upgrade this lets every running job finish,
+	// rather than failing all of them at once -- this one pod is the runner for
+	// every ubuntu-* job in the cluster. Must stay below the pod's
+	// terminationGracePeriodSeconds.
 	shutdown := "55m"
 
 	// Pulled by the nodes' containerd, not by a dockerd, so the daemon.json
@@ -514,9 +514,13 @@ func podsConfig(cfg *config.Config) string {
 	capacity := max(1, cfg.RunnerJobCapacity)
 
 	// The job container's requests are what make jobs fan out: the scheduler
-	// places pods by them, and the autoscaler adds a node when a pending pod
-	// fits on none. No CPU limit, so a job can burst into a node's idle CPU.
-	// The memory limit keeps one runaway job from OOMing its neighbours.
+	// places pods by them, and the autoscaler adds a burst node when a pending
+	// pod fits on none. No CPU limit, so a job can burst into a node's idle
+	// CPU. The memory limit keeps one runaway job from OOMing its neighbours.
+	//
+	// Every job pod tolerates the burst pool's taint, and nothing else does,
+	// so that pool runs jobs and nothing a job depends on (package gke). No
+	// nodeSelector: a job still takes room on a base node when there is any.
 	//
 	// `runs-on: heavy` gets the same image on the heavy pool, through a
 	// pod_templates entry keyed by the label: it selects and tolerates the
@@ -544,7 +548,7 @@ func podsConfig(cfg *config.Config) string {
                 memory: %q
               limits:
                 memory: %q
-`, gke.HeavyPoolKey, gke.HeavyPoolValue, gke.HeavyPoolKey, gke.HeavyPoolValue,
+`, gke.PoolKey, gke.HeavyPoolValue, gke.PoolKey, gke.HeavyPoolValue,
 			cfg.RunnerHeavyCPU, cfg.RunnerHeavyMemory, double(cfg.RunnerHeavyMemory))
 	}
 
@@ -562,6 +566,11 @@ kubernetes:
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
+      tolerations:
+        - key: %s
+          operator: Equal
+          value: %s
+          effect: NoSchedule
       containers:
         - name: job
           resources:
@@ -578,7 +587,8 @@ kubernetes:
               memory: 256Mi
             limits:
               memory: 1Gi
-`, metricsPort, JobsNamespace, cfg.RunnerJobCPU, cfg.RunnerJobMemory, double(cfg.RunnerJobMemory)) + heavy
+`, metricsPort, JobsNamespace, gke.PoolKey, gke.BurstPoolValue,
+		cfg.RunnerJobCPU, cfg.RunnerJobMemory, double(cfg.RunnerJobMemory)) + heavy
 }
 
 // double doubles a resource quantity that config.validate has already matched,
@@ -810,13 +820,9 @@ func statefulSet(
 ) (*appsv1.StatefulSet, error) {
 	labels := pulumi.StringMap{"app": pulumi.String(appLabel)}
 
-	// Spot preemption gives pods ~15s regardless of what is asked for, so a
-	// long grace period only slows rollouts. On-demand drains honour up to an
-	// hour; it must stay above runner.shutdown_timeout.
+	// On-demand drains honour up to an hour; it must stay above
+	// runner.shutdown_timeout (dindConfig).
 	grace := 3600
-	if cfg.RunnerSpot {
-		grace = 25
-	}
 
 	return appsv1.NewStatefulSet(ctx, "gitea-runner", &appsv1.StatefulSetArgs{
 		Metadata: &metav1.ObjectMetaArgs{
@@ -955,15 +961,18 @@ func statefulSet(
 								TimeoutSeconds:      pulumi.Int(10),
 								FailureThreshold:    pulumi.Int(3),
 							},
-							// The CPU request is what the scheduler and the
-							// autoscaler reason about. There is deliberately no
-							// memory limit: no other Docker daemon shares the
-							// node (anti-affinity above), and a limit would
-							// only OOM-kill large builds that the node could
-							// have carried.
+							// Requests are what the scheduler places by, not
+							// what a build gets: with no CPU limit, dockerd
+							// uses whatever the base node has idle. Half a CPU
+							// is what lets this pod, the pod runner and GKE's
+							// own pods fit one e2-standard-2 (docs/runners.md).
+							// There is deliberately no memory limit: no other
+							// Docker daemon shares the node (anti-affinity
+							// above), and a limit would only OOM-kill large
+							// builds that the node could have carried.
 							Resources: &corev1.ResourceRequirementsArgs{
 								Requests: pulumi.StringMap{
-									"cpu":               pulumi.String("1"),
+									"cpu":               pulumi.String("500m"),
 									"memory":            pulumi.String("3Gi"),
 									"ephemeral-storage": pulumi.String("2Gi"),
 								},
@@ -1014,9 +1023,9 @@ func podsStatefulSet(
 				Metadata: &metav1.ObjectMetaArgs{
 					Labels: labels,
 					Annotations: pulumi.StringMap{
-						// Every running ubuntu-* job dies with this pod. Without
-						// the annotation the autoscaler would evict it to empty
-						// a node it considers underused while jobs run on others.
+						// Every running ubuntu-* job dies with this pod. The base
+						// pool is not autoscaled, so nothing asks today; this
+						// keeps it that way if the pool ever is.
 						"cluster-autoscaler.kubernetes.io/safe-to-evict": pulumi.String("false"),
 					},
 				},
@@ -1027,29 +1036,14 @@ func podsStatefulSet(
 					// JobsNamespace.
 					AutomountServiceAccountToken: pulumi.Bool(true),
 					EnableServiceLinks:           pulumi.Bool(false),
-					// Above runner.shutdown_timeout (podsConfig), and long even
-					// on spot: see there.
+					// Above runner.shutdown_timeout (podsConfig).
 					TerminationGracePeriodSeconds: pulumi.Int(3600),
 
 					// Required for the Secret Manager add-on on Standard
 					// clusters. Every node in a GKE_METADATA pool carries it.
+					// No toleration: like the DinD runner, this pod can only
+					// land on the base pool.
 					NodeSelector: pulumi.StringMap{"iam.gke.io/gke-metadata-server-enabled": pulumi.String("true")},
-					// Next to a DinD runner if there is room, i.e. on a node the
-					// pool keeps anyway. Otherwise the safe-to-evict annotation
-					// would hold whichever burst node it first landed on.
-					Affinity: &corev1.AffinityArgs{
-						PodAffinity: &corev1.PodAffinityArgs{
-							PreferredDuringSchedulingIgnoredDuringExecution: corev1.WeightedPodAffinityTermArray{
-								&corev1.WeightedPodAffinityTermArgs{
-									Weight: pulumi.Int(100),
-									PodAffinityTerm: &corev1.PodAffinityTermArgs{
-										LabelSelector: &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(appLabel)}},
-										TopologyKey:   pulumi.String("kubernetes.io/hostname"),
-									},
-								},
-							},
-						},
-					},
 
 					// The image is built to run as root and needs none of it.
 					// fsGroup makes the PVC and the token files readable.
@@ -1116,10 +1110,12 @@ func podsStatefulSet(
 								FailureThreshold:    pulumi.Int(3),
 							},
 							// It polls, streams logs and serves the cache; the
-							// jobs' own work happens in their pods.
+							// jobs' own work happens in their pods. Idle it
+							// uses a few millicores. Kept small so the base
+							// node fits (docs/runners.md).
 							Resources: &corev1.ResourceRequirementsArgs{
 								Requests: pulumi.StringMap{
-									"cpu":    pulumi.String("250m"),
+									"cpu":    pulumi.String("200m"),
 									"memory": pulumi.String("512Mi"),
 								},
 							},
