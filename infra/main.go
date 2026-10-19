@@ -10,6 +10,7 @@ package main
 import (
 	"path/filepath"
 
+	"github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"gitea-infra/pkg/build"
@@ -19,6 +20,7 @@ import (
 	"gitea-infra/pkg/gke"
 	"gitea-infra/pkg/iam"
 	"gitea-infra/pkg/network"
+	"gitea-infra/pkg/ops"
 	"gitea-infra/pkg/project"
 	"gitea-infra/pkg/registry"
 	"gitea-infra/pkg/runner"
@@ -114,7 +116,18 @@ func main() {
 		if err != nil {
 			return err
 		}
-		if _, err := runner.New(ctx, cfg, cluster, apis); err != nil {
+		run, err := runner.New(ctx, cfg, cluster, apis)
+		if err != nil {
+			return err
+		}
+		// Where the release engine runs (scripts/ops): a Job on the cluster's
+		// ops pool, so a release never depends on the machine that started it.
+		var k8s *kubernetes.Provider
+		if run != nil {
+			k8s = run.Provider
+		}
+		eng, err := ops.New(ctx, cfg, cluster, k8s, accounts.VM, repo, buckets.Backup, apis)
+		if err != nil {
 			return err
 		}
 
@@ -144,6 +157,10 @@ func main() {
 			ctx.Export("runnerCredentialsCommand", pulumi.Sprintf(
 				"gcloud container clusters get-credentials %s --zone=%s --dns-endpoint --project=%s",
 				cluster.Cluster.Name, cfg.Zone, cfg.Project))
+		}
+		if eng != nil {
+			ctx.Export("opsNamespace", pulumi.String(ops.Namespace))
+			ctx.Export("opsServiceAccount", eng.ServiceAccount.Email)
 		}
 
 		return nil

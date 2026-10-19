@@ -56,6 +56,8 @@ const (
 	PoolKey        = "gitea-runner-pool"
 	BurstPoolValue = "burst"
 	HeavyPoolValue = "heavy"
+	// OpsPoolValue marks the pool release-engine Jobs run on (package ops).
+	OpsPoolValue = "ops"
 )
 
 type Cluster struct {
@@ -66,7 +68,9 @@ type Cluster struct {
 	// gitea:runnerHeavyMaxNodes is.
 	BurstPool *container.NodePool
 	HeavyPool *container.NodePool
-	NodeSA    *serviceaccount.Account
+	// OpsPool holds release-engine Jobs and nothing else (package ops).
+	OpsPool *container.NodePool
+	NodeSA  *serviceaccount.Account
 }
 
 // New returns nil (without error) when gitea:runnersEnabled is not set, the same
@@ -266,7 +270,19 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 		}
 	}
 
-	return &Cluster{Cluster: cluster, NodePool: pool, BurstPool: burst, HeavyPool: heavy, NodeSA: nodeSA}, nil
+	// The release engine's disposable host. On demand for the same reason as
+	// the heavy pool, and more so: a preempted node mid-release could leave
+	// Gitea stopped with its timers paused. One node, because releases are
+	// serialized anyway. The taint keeps CI pods off it, so a compromised CI
+	// node never shares a kubelet -- or the node authorizer's view of tokens
+	// -- with a pod holding the release identity.
+	ops, err := taintedPool(ctx, "gitea-runners-ops-pool", OpsPoolValue,
+		cfg.Zone, cfg.OpsMachineType, false, 1, cluster, nodeSA, opts, nodeRole)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Cluster{Cluster: cluster, NodePool: pool, BurstPool: burst, HeavyPool: heavy, OpsPool: ops, NodeSA: nodeSA}, nil
 }
 
 // baseCommitment buys the committed use discount gitea:runnerBaseCommitment

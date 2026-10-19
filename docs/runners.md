@@ -88,6 +88,14 @@ themselves. A build that peaks well above 2 GiB can push the node into memory
 pressure, and the kubelet then evicts pods rather than OOM-killing the build.
 If a GKE upgrade adds system pods beyond the spare 140m, see *Troubleshooting*.
 
+**A fourth pool, `ops`, is not for CI.** It holds the Gitea release engine's
+Jobs (`infra/pkg/ops`, *Releases* in [runbook.md](runbook.md)): one
+on-demand node (`gitea:opsMachineType`, default `e2-standard-2`), scaled from
+zero, tainted `gitea-runner-pool=ops`. No runner can schedule a job there,
+because the pod runner's template tolerates only the burst taint and the heavy
+one. And no runner identity can create pods in `gitea-ops`. That matters
+because that namespace's identity can stop Gitea and restore its disk.
+
 ### Cost
 
 Roughly **$61/month** idle, or **$43** with the optional base commitment,

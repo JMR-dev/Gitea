@@ -298,8 +298,36 @@ and **never `:prod`**. Moving `:prod` is a release, and only
    logs `GITEA_RELEASE_ROLLBACK_FAILED` and exits 2. That is the case for the
    manual procedure below.
 
-Every run writes `gs://<project>-gitea-backups/config/<stamp>/manifest.json`.
-`--dry-run` prints the plan without changing anything.
+Every run writes `gs://<project>-gitea-backups/config/<stamp>/manifest.json`,
+checkpointed after every step that changes something. `--dry-run` prints the
+plan without changing anything.
+
+**Where it runs.** The rollback is code in the same process as the release.
+So the engine runs as a Kubernetes Job (`gitea-ops/gitea-ops`) on the runner
+cluster's **ops pool**, not on the machine that starts it. That pool is one
+on-demand node, scaled from zero, tainted so no CI pod lands on it, under its
+own `gitea-release@` identity (`infra/pkg/ops`). `make release` and the
+`ops-*` targets create the Job (`scripts/ops/launch_job.py`) and follow its
+log. Closing the terminal stops only the log: `make ops-logs` re-attaches,
+and `make ops-status` says what is running. Only one Job exists at a time.
+It is never retried, and it is killed after 2 hours. It is deliberately not a
+Gitea Actions job: the release stops Gitea, and an Actions job reports to
+Gitea. `RUN_ON=local` runs the engine here instead, as break-glass for when
+the cluster itself is broken. Keep the machine awake, and use tmux.
+
+**If the engine itself dies mid-release** (its node, an OOM, the 2-hour
+deadline):
+
+1. `make ops-status` and `make ops-logs` show the last step. The manifest's
+   `progress` list shows the same in GCS.
+2. Pausing the timers armed a dead man's switch on the VM. Three hours later it
+   re-enables the auto-update and reboot timers and logs `DEADMAN` at crit
+   (`journalctl -t gitea-ops`). It does **not** start Gitea, because that
+   depends on how far a migration got. It leaves the timers paused if a restore
+   disk is still attached.
+3. Finish by hand from the manifest: `make ops-rollback MANIFEST=<url>`, adding
+   `RESTORE_DATA=1` if the progress got past `snapshotted`. Or, if it got to
+   `started` and the checks look good, just re-enable the timers.
 
 A path B rollback loses whatever was written during the soak, and a later push
 can then make the GitHub push mirror force-push those commits away. Pause the

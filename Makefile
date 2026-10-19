@@ -30,7 +30,7 @@ fmt: ## Format Go sources
 check: ## Build and vet the Pulumi program, and syntax-check the shell scripts
 	cd infra && go build -o gitea-infra . && go vet ./...
 	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh
-	python3 -m py_compile scripts/ops/gitea_ops.py
+	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
 	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh || echo "shellcheck not installed -- skipped"
 
 .PHONY: preview
@@ -68,10 +68,23 @@ build: ## Build and push the images via Cloud Build (does not touch :prod)
 		--gcs-source-staging-dir=gs://$(PROJECT)-gitea-build-source/source \
 		--substitutions=_REGION=$(REGION),_PUSH=$(PUSH),SHORT_SHA=$(shell git rev-parse --short=7 HEAD)
 
-# The release engine (scripts/ops/gitea_ops.py). Every target that changes
-# something passes --yes; add OPS_ARGS=--dry-run to see the plan instead, or
-# any other global flag (e.g. OPS_ARGS="--state-bucket <bucket>").
-OPS     = python3 scripts/ops/gitea_ops.py --project $(PROJECT) --region $(REGION) --zone $(ZONE) $(OPS_ARGS)
+# The release engine (scripts/ops/gitea_ops.py). By default every target runs
+# it as a Kubernetes Job on the runner cluster's ops pool (infra/pkg/ops,
+# scripts/ops/launch_job.py), NOT here: its automatic rollback lives in the same
+# process as the release, so a laptop that sleeps mid-release would leave Gitea
+# stopped. Closing this terminal only stops the log; `make ops-logs` re-attaches.
+#
+# RUN_ON=local runs it on this machine instead -- break-glass only, for when
+# the cluster itself is the problem. Keep the machine awake and use tmux.
+#
+# Targets that change something pass --yes; OPS_ARGS=--dry-run shows the plan.
+RUN_ON ?= gke
+ifeq ($(RUN_ON),local)
+OPS = python3 scripts/ops/gitea_ops.py --project $(PROJECT) --region $(REGION) --zone $(ZONE) $(OPS_ARGS)
+else
+OPS = python3 scripts/ops/launch_job.py --project $(PROJECT) --zone $(ZONE) run -- \
+	--region $(REGION) --zone $(ZONE) $(OPS_ARGS)
+endif
 GITEA  ?= $(shell git rev-parse --short=7 HEAD)
 CADDY  ?= $(GITEA)
 
@@ -81,7 +94,7 @@ release: ## Put built images live: backup, checks, automatic rollback (GITEA=<ta
 
 .PHONY: ops-backup
 ops-backup: ## Full backup: gitea dump, config tarball, exports, data-disk snapshot
-	$(OPS) --pulumi-dir infra --yes backup $(BACKUP_ARGS)
+	$(OPS) $(if $(filter local,$(RUN_ON)),--pulumi-dir infra) --yes backup $(BACKUP_ARGS)
 
 .PHONY: ops-verify
 ops-verify: ## Status checks against prod (MANIFEST=gs://.../manifest.json to compare)
@@ -95,34 +108,13 @@ ops-rollback: ## Undo a release from its manifest (MANIFEST=...; RESTORE_DATA=1 
 ops-drill-restore: ## Prove the latest snapshot and dump restore, in isolation (TOOL_IMAGE=... before 28)
 	$(OPS) --yes drill-restore $(if $(TOOL_IMAGE),--tool-image $(TOOL_IMAGE))
 
-.PHONY: rollout
-rollout: ## Pull the latest :prod images onto the VM right now
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
-		--command 'sudo systemctl start podman-auto-update.service && sudo podman ps'
+.PHONY: ops-logs
+ops-logs: ## Re-attach to the running (or last) release-engine Job's log
+	python3 scripts/ops/launch_job.py --project $(PROJECT) --zone $(ZONE) logs
 
-.PHONY: sync
-sync: ## Re-render VM config from the bucket and restart what changed
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
-		--command 'sudo systemctl start gitea-config-sync.service && sudo journalctl -u gitea-config-sync -n 40 --no-pager'
-
-.PHONY: ssh
-ssh: ## Shell on the VM through IAP
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT)
-
-.PHONY: logs
-logs: ## Tail Gitea and Caddy logs
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
-		--command 'sudo journalctl -u gitea -u caddy -f'
-
-.PHONY: status
-status: ## Health summary from the VM
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
-		--command 'sudo systemctl status --no-pager gitea caddy nftables fail2ban; sudo podman ps; sudo systemctl list-timers --no-pager'
-
-.PHONY: backup
-backup: ## Take an on-demand Gitea dump to the backup bucket
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
-		--command 'sudo systemctl start gitea-backup.service && sudo journalctl -u gitea-backup -n 20 --no-pager'
+.PHONY: ops-status
+ops-status: ## One line about the current release-engine Job
+	python3 scripts/ops/launch_job.py --project $(PROJECT) --zone $(ZONE) status
 
 # --dns-endpoint: the runner cluster has no IP endpoint at all; access is IAM
 # only (roles/container.developer or above on the project).

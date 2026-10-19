@@ -134,13 +134,24 @@ class Ops:
         if not (self.a.yes or self.a.dry_run):
             raise Abort("this changes things: pass --yes (or --dry-run to see the plan)")
 
-    def save_manifest(self):
+    def save_manifest(self, *, quiet=False):
         url = f"gs://{self.a.backup_bucket}/config/{self.stamp}/manifest.json"
         body = json.dumps(self.manifest, indent=2, sort_keys=True)
-        print(body)
-        self.run(["gcloud", "storage", "cp", "-", url, f"--project={self.a.project}"],
+        if not quiet:
+            print(body)
+        self.run(["gcloud", "storage", "cp", "-", url, f"--project={self.a.project}", "--quiet"],
                  mutate=True, stdin=body)
-        log(f"manifest: {url}")
+        if not quiet:
+            log(f"manifest: {url}")
+
+    def checkpoint(self, step):
+        """Record progress in the manifest in GCS. If this process dies, the
+        manifest says how far it got -- and holds the previous digests and the
+        restore point a manual `rollback --manifest` needs."""
+        self.manifest.setdefault("progress", []).append(
+            {"step": step, "at": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
+        log(f"checkpoint: {step}")
+        self.save_manifest(quiet=True)
 
     # -- Artifact Registry --------------------------------------------------
 
@@ -458,9 +469,11 @@ def cmd_release(ops, a):
             ops.save_manifest()
             return
 
+        ops.checkpoint("planned")
         ops.backup(snapshot="online" if path == "A" else "none", record=False)
         for img in IMAGES:
             ops.tag(img, prev[img], "previous")
+        ops.checkpoint("backed-up")
 
         since = utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         snap = None
@@ -470,12 +483,15 @@ def cmd_release(ops, a):
             if path == "A":
                 for img, d in new.items():
                     ops.tag(img, d, "prod")
+                ops.checkpoint("promoted")
                 ops.vm("auto-update")
             else:
                 ops.vm("pull", gitea_ref)
                 ops.vm("pause-timers")
                 timers_paused = True
+                ops.checkpoint("timers-paused")
                 ops.vm("stop", "gitea.service")
+                ops.checkpoint("gitea-stopped")
                 # Across a major or an Alpine minor this is the last snapshot
                 # of the old world: keep it, and take the boot disk too
                 # (Caddy's certificates and every rendered config live there).
@@ -484,16 +500,21 @@ def cmd_release(ops, a):
                 m["restore_point"] = snap
                 if gated:
                     ops.snapshot("pre-release", keep=True, disk=a.vm)
+                ops.checkpoint("snapshotted")
                 ops.vm("migrate", gitea_ref)
+                ops.checkpoint("migrated")
                 for img, d in new.items():
                     ops.tag(img, d, "prod")
+                ops.checkpoint("promoted")
                 ops.vm("pull", f"{ops.ar}/gitea:prod")
                 ops.vm("start", "gitea.service")
+                ops.checkpoint("started")
                 if a.drill == "fail-after-migrate":
                     ops.vm("marker", ops.stamp)
                 if "caddy" in new:
                     ops.vm("auto-update")
 
+            ops.checkpoint("verifying")
             failures = ops.verify(expect={"version": new_ver, **new}, soak=a.soak, since=since)
             if failures:
                 raise Abort("status checks failed: " + "; ".join(failures))
@@ -502,6 +523,7 @@ def cmd_release(ops, a):
         except Exception as e:  # anything at all once prod is being changed
             log(f"GITEA_RELEASE_ROLLBACK path={path} reason={e!r}")
             m["failure"] = str(e)
+            ops.checkpoint("rolling-back")
             m["outcome"] = rollback(ops, path, prev, prev_ver, snap, tool_image=gitea_ref)
             if a.drill == "fail-after-migrate":
                 marker = ops.vm("marker-check", ops.stamp, mutate=False)

@@ -135,8 +135,34 @@ step_pull() {
     done
 }
 
-step_pause_timers()  { systemctl stop "${TIMERS[@]}"; }
-step_resume_timers() { systemctl start "${TIMERS[@]}"; }
+# pause-timers [DEADMAN]: stop the timers, and arm a dead man's switch.
+#
+# The engine resumes the timers itself, but only if it is still alive to. If
+# it dies mid-release (its pod, its node, a laptop), the switch re-enables
+# them after DEADMAN (default 3h, longer than the engine Job's 2h deadline)
+# and logs at crit. It does NOT touch gitea.service: whether starting it is
+# safe depends on how far a migration got, which is a decision for a person.
+# And with a restore disk still attached it leaves the timers paused too,
+# because the reboot window would then boot onto a copy (fstab mounts by UUID).
+step_pause_timers() {
+    systemctl stop "${TIMERS[@]}"
+    disarm_deadman
+    systemd-run --quiet --unit=gitea-ops-deadman --on-active="${1:-3h}" \
+        --timer-property=AccuracySec=1min \
+        --description="Re-enable Gitea's timers if the release engine died" \
+        /bin/bash -c '
+            if [ -e /dev/disk/by-id/google-gitea-restore ]; then
+                logger -p user.crit -t gitea-ops "DEADMAN: the release engine never came back and a restore disk is attached; timers left paused"
+            else
+                systemctl start podman-auto-update.timer gitea-reboot-window.timer
+                logger -p user.crit -t gitea-ops "DEADMAN: the release engine never came back; timers re-enabled; gitea.service is $(systemctl is-active gitea.service)"
+            fi'
+}
+step_resume_timers() { systemctl start "${TIMERS[@]}"; disarm_deadman; }
+disarm_deadman() {
+    systemctl stop gitea-ops-deadman.timer gitea-ops-deadman.service 2>/dev/null || true
+    systemctl reset-failed gitea-ops-deadman.service 2>/dev/null || true
+}
 
 # stop UNIT / start UNIT. start blocks until the quadlet's Notify=healthy
 # fires or TimeoutStartSec runs out, so its exit status is the health verdict.

@@ -87,6 +87,11 @@ type Config struct {
 	RunnerHeavyMachineType string
 	RunnerHeavyCPU         string
 	RunnerHeavyMemory      string
+
+	// OpsMachineType sizes the ops pool: the one on-demand node, scaled from
+	// zero, that release-engine Jobs (scripts/ops) run on and nothing else
+	// does. Part of the runner cluster, so it exists only with RunnersEnabled.
+	OpsMachineType string
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -130,6 +135,8 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		RunnerHeavyMachineType: c.Get("runnerHeavyMachineType"),
 		RunnerHeavyCPU:         c.Get("runnerHeavyCpu"),
 		RunnerHeavyMemory:      c.Get("runnerHeavyMemory"),
+
+		OpsMachineType: c.Get("opsMachineType"),
 	}
 
 	// Both meant something else before the node pool was split into base and
@@ -257,6 +264,11 @@ func applyDefaults(c *Config) {
 	if c.RunnerHeavyMemory == "" {
 		c.RunnerHeavyMemory = "12Gi"
 	}
+	if c.OpsMachineType == "" {
+		// The engine itself is gcloud and SSH: the dump, the snapshot and the
+		// restore copy all run on the VM or in Google's APIs, not here.
+		c.OpsMachineType = "e2-standard-2"
+	}
 }
 
 // quantity is a loose match for a Kubernetes resource quantity, enough to make a
@@ -311,6 +323,9 @@ func validate(c *Config) error {
 		}
 		if !quantity.MatchString(c.RunnerJobMemory) {
 			return fmt.Errorf("gitea:runnerJobMemory %q is not a Kubernetes quantity (e.g. 1536Mi, 2Gi)", c.RunnerJobMemory)
+		}
+		if _, _, err := E2Shape(c.OpsMachineType); err != nil {
+			return fmt.Errorf("gitea:opsMachineType: %w", err)
 		}
 		if c.RunnerHeavyMaxNodes < 0 || c.RunnerHeavyMaxNodes > 5 {
 			// A cost guard: these are on-demand 32 GB machines.
