@@ -362,11 +362,12 @@ with prod, and touches nothing live. The dump half rebuilds `gitea.db` from
 `gitea-db.sql`, because the `data/gitea.db` inside a dump was copied while
 Gitea was writing to it.
 
-Until 2026-10-19 **no dump ever reached the bucket**: `gcloud storage cp`
-reads the destination object (`storage.objects.get`) before uploading, and the
-VM had only `objectCreator`. It now has the custom `giteaBackupWriter` role
-(create + get; still no list, overwrite or delete). If the bucket stops
-growing, check that first:
+Until 2026-10-19 **no dump ever reached the bucket**: before uploading,
+`gcloud storage cp` reads the destination object (`storage.objects.get`) and
+lists the bucket (`storage.objects.list`), and the VM had only
+`objectCreator`. It now has the custom `giteaBackupWriter` role (create, get,
+list; still no overwrite or delete). If the bucket stops growing, check that
+first:
 
 ```bash
 gcloud storage ls -l gs://<project>-gitea-backups/dumps/ | tail -3
