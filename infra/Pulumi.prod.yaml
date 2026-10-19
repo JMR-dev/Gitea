@@ -49,7 +49,7 @@ config:
   # at once across the cluster, on burst nodes added (up to runnerBurstMaxNodes)
   # to fit them. Each job pod requests runnerJobCpu / runnerJobMemory; that
   # request is what the autoscaler packs nodes by. 0 removes the pod runner.
-  gitea:runnerJobCapacity: "6"
+  gitea:runnerJobCapacity: "20"
   gitea:runnerJobCpu: 400m
   gitea:runnerJobMemory: 1536Mi
   # `runs-on: heavy` jobs (Pulumi, other memory-hungry builds) are pods on a
