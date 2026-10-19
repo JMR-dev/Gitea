@@ -83,6 +83,11 @@ config:
   # later does not undo it. See docs/runners.md. The base pool went live on
   # 2026-10-18 without one; after a clean week, set it to 1y and `make up`.
   # Burst nodes, for ubuntu-* job pods only, scaled from zero. On demand.
-  gitea:runnerBurstMaxNodes: "2"
+  # 6, so runnerJobCapacity 20 can actually run at once: an e2-standard-2 burst
+  # node fits about 3 of the 400m / 1536Mi job pods. The ceiling, not the
+  # usual size -- idle, the pool is at zero. At 6 that is up to 12 vCPUs and
+  # 180 GB of pd-balanced against the us-east1 quotas (2026-10-19: CPUS 13/200,
+  # SSD_TOTAL_GB 210/500).
+  gitea:runnerBurstMaxNodes: "6"
   gitea:runnerBurstSpot: "false"
 encryptionsalt: v1:pIXPmM64Bzc=:v1:0pkb4B2RVM5LFu2v:ZEPaG4RB9ySlpmaHkaBy8v6FQ3paHg==
