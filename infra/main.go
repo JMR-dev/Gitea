@@ -83,7 +83,7 @@ func main() {
 		if err != nil {
 			return err
 		}
-		if err := iam.GrantBuckets(ctx, accounts, buckets.Config, buckets.Backup); err != nil {
+		if err := iam.GrantBuckets(ctx, cfg, accounts, buckets.Config, buckets.Backup); err != nil {
 			return err
 		}
 		if err := iam.GrantBuildSource(ctx, accounts, buckets.BuildSource); err != nil {

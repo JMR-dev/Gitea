@@ -163,10 +163,18 @@ func GrantBuildSource(ctx *pulumi.Context, a *Accounts, sourceBucket *storage.Bu
 	return err
 }
 
-// GrantBuckets: read-only on config, write-only on backups. The VM can create a
-// backup but cannot read or delete existing ones, which limits what ransomware
-// on the box could do to the backup history.
-func GrantBuckets(ctx *pulumi.Context, a *Accounts, configBucket, backupBucket *storage.Bucket) error {
+// GrantBuckets: read-only on config, create-and-get on backups. The VM can add
+// a backup but cannot list, overwrite or delete existing ones (overwriting
+// needs storage.objects.delete), which limits what ransomware on the box could
+// do to the backup history. The bucket is versioned on top of that.
+//
+// Why not plain roles/storage.objectCreator: `gcloud storage cp` reads the
+// destination object (storage.objects.get) before it uploads, so with create
+// alone every upload is a 403. That is how the nightly gitea dump failed from
+// day one without anyone noticing. objects.get without objects.list means the
+// VM can read only a backup whose exact name it already knows -- and it holds
+// the live data those backups were made from anyway.
+func GrantBuckets(ctx *pulumi.Context, cfg *config.Config, a *Accounts, configBucket, backupBucket *storage.Bucket) error {
 	if _, err := storage.NewBucketIAMMember(ctx, "vm-config-reader", &storage.BucketIAMMemberArgs{
 		Bucket: configBucket.Name,
 		Role:   pulumi.String("roles/storage.objectViewer"),
@@ -174,9 +182,22 @@ func GrantBuckets(ctx *pulumi.Context, a *Accounts, configBucket, backupBucket *
 	}); err != nil {
 		return err
 	}
-	_, err := storage.NewBucketIAMMember(ctx, "vm-backup-creator", &storage.BucketIAMMemberArgs{
+	role, err := projects.NewIAMCustomRole(ctx, "gitea-backup-writer", &projects.IAMCustomRoleArgs{
+		Project:     pulumi.String(cfg.Project),
+		RoleId:      pulumi.String("giteaBackupWriter"),
+		Title:       pulumi.String("Gitea backup writer"),
+		Description: pulumi.String("Add objects to the backup bucket; no list, overwrite or delete"),
+		Permissions: pulumi.ToStringArray([]string{
+			"storage.objects.create",
+			"storage.objects.get",
+		}),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = storage.NewBucketIAMMember(ctx, "vm-backup-writer", &storage.BucketIAMMemberArgs{
 		Bucket: backupBucket.Name,
-		Role:   pulumi.String("roles/storage.objectCreator"),
+		Role:   role.Name,
 		Member: pulumi.Sprintf("serviceAccount:%s", a.VM.Email),
 	})
 	return err
