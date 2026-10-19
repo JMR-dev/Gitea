@@ -107,6 +107,11 @@ CRS will flag some of it.
    sudo journalctl CONTAINER_NAME=caddy | grep '"transaction"' \
      | jq -c 'select(.transaction.is_interrupted) | {ip:.transaction.client_ip, uri:.transaction.request.uri}'
    ```
+   **Gitea 28 replaced Server-Sent Events with a WebSocket** for live updates
+   (notification counts, stopwatches). Caddy proxies the `Upgrade` handshake
+   on its own, but the handshake is an ordinary GET through the WAF. Look for
+   hits on it specifically before switching to `On`. A blocked handshake
+   doesn't break anything visibly; the UI just quietly falls back to polling.
 3. Add exclusions to the `directives` block in `vm/config/Caddyfile.tmpl`, before
    the `Include @owasp_crs/*.conf` line for rule-set config, or after it for
    `SecRuleRemoveById` / `SecRuleUpdateTargetById`. Document each one — which

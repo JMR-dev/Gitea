@@ -15,7 +15,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (*arti
 		RepositoryId: pulumi.String(RepoID),
 		Location:     pulumi.String(cfg.Region),
 		Format:       pulumi.String("DOCKER"),
-		Description:  pulumi.String("Gitea and Caddy images, Debian 13 base"),
+		Description:  pulumi.String("Gitea (Alpine) and Caddy (Debian) images"),
 		CleanupPolicies: artifactregistry.RepositoryCleanupPolicyArray{
 			// Untagged layers accumulate fast with a weekly rebuild.
 			&artifactregistry.RepositoryCleanupPolicyArgs{

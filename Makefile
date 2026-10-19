@@ -29,8 +29,9 @@ fmt: ## Format Go sources
 .PHONY: check
 check: ## Build and vet the Pulumi program, and syntax-check the shell scripts
 	cd infra && go build -o gitea-infra . && go vet ./...
-	bash -n vm/bootstrap.sh scripts/bootstrap.sh
-	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh || echo "shellcheck not installed -- skipped"
+	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh
+	python3 -m py_compile scripts/ops/gitea_ops.py
+	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh || echo "shellcheck not installed -- skipped"
 
 .PHONY: preview
 preview: check ## Show what `pulumi up` would change
@@ -55,13 +56,44 @@ up: check ## Apply the infrastructure
 # SHORT_SHA: Cloud Build fills it in only for triggered builds. For `builds
 #   submit` it is empty, and image.yaml's `--tag <image>:$SHORT_SHA` becomes an
 #   invalid reference that fails the build.
+#
+# This builds and pushes :$SHORT_SHA and the version tags, NOT :prod. Putting
+# an image live is `make release` -- see scripts/ops/gitea_ops.py.
+PUSH ?= true
 .PHONY: build
-build: ## Build and roll out the container images via Cloud Build
+build: ## Build and push the images via Cloud Build (does not touch :prod)
 	gcloud builds submit --config cloudbuild/image.yaml --project $(PROJECT) \
 		--region=$(REGION) \
 		--service-account=projects/$(PROJECT)/serviceAccounts/cb-image@$(PROJECT).iam.gserviceaccount.com \
 		--gcs-source-staging-dir=gs://$(PROJECT)-gitea-build-source/source \
-		--substitutions=_REGION=$(REGION),_ZONE=$(ZONE),SHORT_SHA=$(shell git rev-parse --short=7 HEAD)
+		--substitutions=_REGION=$(REGION),_PUSH=$(PUSH),SHORT_SHA=$(shell git rev-parse --short=7 HEAD)
+
+# The release engine (scripts/ops/gitea_ops.py). Every target that changes
+# something passes --yes; add OPS_ARGS=--dry-run to see the plan instead, or
+# any other global flag (e.g. OPS_ARGS="--state-bucket <bucket>").
+OPS     = python3 scripts/ops/gitea_ops.py --project $(PROJECT) --region $(REGION) --zone $(ZONE) $(OPS_ARGS)
+GITEA  ?= $(shell git rev-parse --short=7 HEAD)
+CADDY  ?= $(GITEA)
+
+.PHONY: release
+release: ## Put built images live: backup, checks, automatic rollback (GITEA=<tag> CADDY=<tag>|none RELEASE_ARGS=...)
+	$(OPS) --yes release --gitea $(GITEA) $(if $(filter-out none,$(CADDY)),--caddy $(CADDY)) $(RELEASE_ARGS)
+
+.PHONY: ops-backup
+ops-backup: ## Full backup: gitea dump, config tarball, exports, data-disk snapshot
+	$(OPS) --pulumi-dir infra --yes backup $(BACKUP_ARGS)
+
+.PHONY: ops-verify
+ops-verify: ## Status checks against prod (MANIFEST=gs://.../manifest.json to compare)
+	$(OPS) verify $(if $(MANIFEST),--manifest $(MANIFEST))
+
+.PHONY: ops-rollback
+ops-rollback: ## Undo a release from its manifest (MANIFEST=...; RESTORE_DATA=1 restores /var/lib/gitea; TOOL_IMAGE= an image with rsync)
+	$(OPS) --yes rollback --manifest $(MANIFEST) $(if $(RESTORE_DATA),--restore-data) $(if $(TOOL_IMAGE),--tool-image $(TOOL_IMAGE))
+
+.PHONY: ops-drill-restore
+ops-drill-restore: ## Prove the latest snapshot and dump restore, in isolation (TOOL_IMAGE=... before 28)
+	$(OPS) --yes drill-restore $(if $(TOOL_IMAGE),--tool-image $(TOOL_IMAGE))
 
 .PHONY: rollout
 rollout: ## Pull the latest :prod images onto the VM right now

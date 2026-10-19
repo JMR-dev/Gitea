@@ -267,20 +267,126 @@ gcloud compute instances reset gitea-vm --zone <zone>
 
 ## Common operations
 
+### Releases: how an image goes live
+
+A build (`make build`, or the pipeline) pushes `:$SHORT_SHA` and a version tag
+and **never `:prod`**. Moving `:prod` is a release, and only
+`scripts/ops/gitea_ops.py release` does it (`make release GITEA=<sha>`):
+
+1. Records state: the `:prod` digests and labels, SSH host keys, and secret
+   version *numbers*. Refuses a Gitea **major** or an Alpine **minor** change
+   unless given `--allow-major` / `--allow-alpine-minor`; those changes arrive
+   only as PRs to `image/gitea.version` / `image/alpine.version`.
+2. Backs up: a `gitea dump`, a config tarball, the instance and IAM exports
+   (below), and tags the current images `:previous`.
+3. Picks a path:
+   - **A**, same Gitea version (an Alpine or Caddy rebuild): an online snapshot,
+     move `:prod`, `podman-auto-update` (podman's own health-gated rollback
+     still applies).
+   - **B**, Gitea version changed: pre-pull, pause the auto-update and reboot
+     timers, stop Gitea, take a **consistent** snapshot, run `gitea migrate` as
+     a one-shot container, then move `:prod` and start the unit. The unit start
+     is never the migration: under `TimeoutStartSec=300` a long migration would
+     be killed and re-run on a half-migrated database.
+4. Status checks: health and version endpoints, the digest each container is
+   *actually* running (catches a silent podman rollback), the SSH host keys,
+   an anonymous clone over HTTPS, then a 5-minute soak (health every 30 s, no
+   unit restarts, no `[F]`/`panic` in the journal).
+5. **On any failure it rolls back by itself**: `:prod` back to `:previous`, and
+   on path B also the data, from the snapshot it took in step 3. It logs
+   `GITEA_RELEASE_ROLLBACK` and exits 1; if the rollback's own checks fail, it
+   logs `GITEA_RELEASE_ROLLBACK_FAILED` and exits 2. That is the case for the
+   manual procedure below.
+
+Every run writes `gs://<project>-gitea-backups/config/<stamp>/manifest.json`.
+`--dry-run` prints the plan without changing anything.
+
+A path B rollback loses whatever was written during the soak, and a later push
+can then make the GitHub push mirror force-push those commits away. Pause the
+mirror before a manual data rollback.
+
 ### Roll back to a previous image
 
-Every build pushes `:$SHORT_SHA` alongside `:prod`. Find the digest in the build
-log, then:
+From a release's manifest:
 
 ```bash
-make ssh
-sudo podman tag <region>-docker.pkg.dev/<project>/gitea/gitea:<sha> \
-                <region>-docker.pkg.dev/<project>/gitea/gitea:prod
-sudo systemctl restart gitea
+make ops-rollback MANIFEST=gs://<project>-gitea-backups/config/<stamp>/manifest.json
+# add RESTORE_DATA=1 if that release changed the Gitea version (path B)
 ```
 
-For a durable rollback, re-point `:prod` in Artifact Registry instead — a host-
-local retag is undone by the next `podman auto-update`.
+By hand, re-point `:prod` in Artifact Registry and let the VM pull it:
+
+```bash
+gcloud artifacts docker tags add <region>-docker.pkg.dev/<project>/gitea/gitea:previous \
+                                 <region>-docker.pkg.dev/<project>/gitea/gitea:prod
+make rollout
+```
+
+Only same-version rollbacks are this simple. **Gitea refuses to start an older
+version on a database a newer one has migrated** ("Your database ... is for a
+newer Gitea"), so going back across a version change needs the data restore
+too.
+
+`gitea:rollback-1.27.2` and `caddy:rollback-2.11.4` pin the last Debian-based
+images, so the cleanup policy never deletes them.
+
+### Restore the data disk from a snapshot
+
+`gitea_ops.py rollback --restore-data` does this; by hand it is:
+
+1. `systemctl stop gitea podman-auto-update.timer gitea-reboot-window.timer`.
+2. Create a disk from the snapshot and attach it with device name
+   `gitea-restore`.
+3. `mount -o nouuid` it. The copy has the **same XFS UUID** as the live disk,
+   which XFS refuses to mount twice without `nouuid`.
+4. Move `/var/lib/gitea/*` aside into `/var/lib/gitea/.pre-restore-<stamp>`,
+   then `rsync -aH` the copy in (inside the gitea image, which carries
+   `rsync`; the host has none), then `restorecon -RF /var/lib/gitea`.
+5. Unmount, then **detach and delete the copy before anything reboots**. fstab
+   mounts `/var/lib/gitea` by UUID and could pick the copy.
+6. Start the timers and gitea.
+
+This keeps the Pulumi-managed `gitea-data` disk, so there is no state drift.
+Delete `.pre-restore-*` once you know what went wrong.
+
+### Backups and the restore drill
+
+```bash
+make ops-backup          # dump + config tarball + exports + online snapshot
+make ops-drill-restore   # newest snapshot AND newest dump each boot a working Gitea
+```
+
+The drill runs the restored copy as a separate container with `--network none`
+(no mirror pushes, webhooks or runner traffic), compares user and repo counts
+with prod, and touches nothing live. The dump half rebuilds `gitea.db` from
+`gitea-db.sql`, because the `data/gitea.db` inside a dump was copied while
+Gitea was writing to it.
+
+Until 2026-10-19 **no dump ever reached the bucket**: `gcloud storage cp`
+reads the destination object (`storage.objects.get`) before uploading, and the
+VM had only `objectCreator`. It now has the custom `giteaBackupWriter` role
+(create + get; still no list, overwrite or delete). If the bucket stops
+growing, check that first:
+
+```bash
+gcloud storage ls -l gs://<project>-gitea-backups/dumps/ | tail -3
+```
+
+### Upgrading across a Gitea major
+
+`image/gitea.version` holds only the major (`28`); patches and minors float.
+To move to the next major:
+
+1. A PR that changes `image/gitea.version`. Check the release notes'
+   breaking changes against `vm/config/app.ini.tmpl` and the hosted repos'
+   workflows.
+2. `make ops-backup`, then `make ops-drill-restore TOOL_IMAGE=<new image>`.
+   That boots the newest snapshot and dump **on the new version**, so it is
+   also a migration rehearsal on a copy of the real data.
+3. `make build`, then `make release GITEA=<sha> RELEASE_ARGS=--allow-major`.
+
+1.27 → 28 (2026-10-19) was also Debian → Alpine, so it needed
+`--allow-major --allow-alpine-minor`.
 
 ### Restore from a dump
 

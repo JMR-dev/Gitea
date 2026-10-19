@@ -1,18 +1,26 @@
-# Build the Gitea and Caddy images, push them, and roll them out.
+# Build the Gitea and Caddy images and push them -- but never to :prod.
 #
-# The rollout works by kicking podman-auto-update on the VM. That is why the
-# quadlets track a floating :prod tag rather than a digest: AutoUpdate=registry
-# compares the local digest against the registry's digest FOR A TAG, so a
-# digest-pinned image would give it nothing to poll.
+# Moving :prod is a release, and releases belong to scripts/ops/gitea_ops.py:
+# it takes the backups, picks the rollout path (a Gitea version change means a
+# stop, a consistent snapshot and an explicit migration), runs the status
+# checks, and rolls back -- data included -- when they fail. A build that moved
+# :prod itself would hand a schema migration to podman auto-update, whose
+# health-gated rollback puts the OLD image back on a database the new one has
+# already migrated, and the old one refuses to start on that.
 #
-# The :$SHORT_SHA and version tags are the audit trail and the rollback targets.
+# The quadlets still track the floating :prod tag (AutoUpdate=registry compares
+# digests FOR A TAG); this file just no longer writes it. :$SHORT_SHA and the
+# version tag are the release inputs and the audit trail.
+#
+# Gitea floats within the major line in image/gitea.version: every build
+# resolves the newest stable release of that major and builds it. The stage-1
+# GPG check in image/gitea/Dockerfile is what authenticates that version.
 
 substitutions:
   _REGION: us-east1
-  _ZONE: us-east1-b
-  _DOMAIN: gitea.jasonmross.dev
   _REPO: gitea
-  _VM: gitea-vm
+  # false: build only (PR previews). Nothing is pushed.
+  _PUSH: "true"
 
 options:
   # A user-specified service account cannot write to the legacy default log
@@ -29,10 +37,31 @@ steps:
       #!/usr/bin/env bash
       set -euo pipefail
       mkdir -p /workspace/vars
-      tr -d '[:space:]' < image/gitea.version > /workspace/vars/gitea_version
-      tr -d '[:space:]' < image/caddy.version > /workspace/vars/caddy_version
+      tr -d '[:space:]' < image/gitea.version  > /workspace/vars/gitea_major
+      tr -d '[:space:]' < image/alpine.version > /workspace/vars/alpine_tag
+      tr -d '[:space:]' < image/caddy.version  > /workspace/vars/caddy_version
       tr -d '[:space:]' < image/coraza.version > /workspace/vars/coraza_version
-      echo "gitea=$(cat /workspace/vars/gitea_version) caddy=$(cat /workspace/vars/caddy_version) coraza=$(cat /workspace/vars/coraza_version)"
+      grep -qxE '[0-9]+' /workspace/vars/gitea_major \
+        || { echo "image/gitea.version must be a bare major (e.g. 28)" >&2; exit 1; }
+      grep -qxE '[0-9]+\.[0-9]+' /workspace/vars/alpine_tag \
+        || { echo "image/alpine.version must be MAJOR.MINOR (e.g. 3.24)" >&2; exit 1; }
+
+  # The newest stable vMAJOR.x.y tag. git ls-remote needs no API token and has
+  # no rate limit, unlike the GitHub REST API from a shared Cloud Build IP.
+  - id: resolve-gitea
+    name: gcr.io/cloud-builders/git
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        M=$(cat /workspace/vars/gitea_major)
+        V=$(git ls-remote --tags --refs https://github.com/go-gitea/gitea "v$${M}.*" \
+              | awk '{print $$2}' | sed 's#^refs/tags/v##' \
+              | grep -xE "$${M}\.[0-9]+\.[0-9]+" | sort -V | tail -1)
+        test -n "$${V}" || { echo "no stable v$${M}.x.y release found" >&2; exit 1; }
+        echo -n "$${V}" > /workspace/vars/gitea_version
+        echo "gitea=$${V} (major $${M}) alpine=$(cat /workspace/vars/alpine_tag) caddy=$(cat /workspace/vars/caddy_version) coraza=$(cat /workspace/vars/coraza_version)"
 
   - id: build-gitea
     name: gcr.io/cloud-builders/docker
@@ -46,9 +75,11 @@ steps:
         set -euo pipefail
         V=$(cat /workspace/vars/gitea_version)
         IMG="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/gitea"
-        docker build \
+        # --pull: the alpine tag floats within the minor, and a cached base
+        # layer would quietly skip the patch releases this rebuild is for.
+        docker build --pull \
           --build-arg "GITEA_VERSION=$${V}" \
-          --tag "$${IMG}:prod" \
+          --build-arg "ALPINE_TAG=$(cat /workspace/vars/alpine_tag)" \
           --tag "$${IMG}:$SHORT_SHA" \
           --tag "$${IMG}:$${V}" \
           image/gitea
@@ -70,10 +101,9 @@ steps:
         # dropped --with fails the build rather than shipping an unprotected
         # server. Caddy and coraza-caddy versions are coupled: coraza-caddy
         # pins a minimum Caddy, and a mismatch fails here at `go get`.
-        docker build \
+        docker build --pull \
           --build-arg "CADDY_VERSION=$${V}" \
           --build-arg "CORAZA_VERSION=$${C}" \
-          --tag "$${IMG}:prod" \
           --tag "$${IMG}:$SHORT_SHA" \
           --tag "$${IMG}:$${V}" \
           image/caddy
@@ -85,48 +115,14 @@ steps:
       - -c
       - |
         set -euo pipefail
+        if [ "${_PUSH}" != "true" ]; then
+          echo "_PUSH=${_PUSH}: build only, nothing pushed"
+          exit 0
+        fi
         BASE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}"
         docker push --all-tags "$${BASE}/gitea"
         docker push --all-tags "$${BASE}/caddy"
-        # Record the digests actually published. Pulumi does not pin these, so
-        # the build log is where you look to find a rollback target.
-        docker image inspect "$${BASE}/gitea:prod" --format '{{index .RepoDigests 0}}'
-        docker image inspect "$${BASE}/caddy:prod" --format '{{index .RepoDigests 0}}'
-
-  - id: rollout
-    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
-    entrypoint: bash
-    env:
-      # gcloud needs a writable HOME to generate the ephemeral SSH key it pushes
-      # through OS Login. The default HOME in this image is not writable.
-      - HOME=/workspace
-    args:
-      - -c
-      - |
-        set -euo pipefail
-        gcloud compute ssh "${_VM}" \
-          --zone="${_ZONE}" \
-          --tunnel-through-iap \
-          --quiet \
-          --command 'sudo systemctl start podman-auto-update.service'
-
-  - id: verify
-    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
-    entrypoint: bash
-    # A build that pushes a broken image and reports success is worse than a
-    # failed build. Gate on the app actually answering.
-    args:
-      - -c
-      - |
-        set -euo pipefail
-        for i in $(seq 1 30); do
-          if curl -fsS --max-time 10 "https://${_DOMAIN}/api/healthz" >/dev/null; then
-            echo "healthz passed after $${i} attempt(s)"
-            exit 0
-          fi
-          echo "waiting for https://${_DOMAIN}/api/healthz ($${i}/30)"
-          sleep 10
-        done
-        echo "healthz never passed -- check 'journalctl -u podman-auto-update' on the VM;" >&2
-        echo "podman should have rolled back automatically if the new image failed to start." >&2
-        exit 1
+        # The release inputs: hand these tags to `gitea_ops.py release`.
+        echo "pushed gitea:$SHORT_SHA $$(docker image inspect "$${BASE}/gitea:$SHORT_SHA" --format '{{index .RepoDigests 0}}')"
+        echo "pushed caddy:$SHORT_SHA $$(docker image inspect "$${BASE}/caddy:$SHORT_SHA" --format '{{index .RepoDigests 0}}')"
+        echo "next: scripts/ops/gitea_ops.py release --gitea $SHORT_SHA --caddy $SHORT_SHA --yes"

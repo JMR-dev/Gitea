@@ -8,7 +8,7 @@ Engine VM, served at `gitea.jasonmross.dev`.
 | Host | AlmaLinux 10 (`almalinux-cloud/almalinux-10`), Shielded VM |
 | Size | `e2-small` (2 shared vCPU, 2 GB RAM) in `us-east1`, 20 GB boot + 30 GB pd-balanced data |
 | Runtime | Podman **quadlets** — systemd `.container`/`.network`/`.volume` units, not compose |
-| Images | Gitea and Caddy, both built on **Debian 13 (trixie)** |
+| Images | Gitea: our own rootless image on **Alpine 3.24**, floating on the newest **Gitea 28.x** (GPG-verified release binary). Caddy: **Debian 13 (trixie)** |
 | TLS | Caddy with ACME **DNS-01** via Google Cloud DNS (custom `xcaddy` build) |
 | WAF | **Coraza** + OWASP CRS compiled into Caddy, feeding fail2ban → nftables |
 | Database | SQLite in WAL mode on a dedicated persistent disk |
@@ -100,9 +100,12 @@ rather than writing a config with empty signing keys.
 ```bash
 make status     # services, containers, timers
 make logs       # tail gitea + caddy
+make build      # build + push :<sha> images (does NOT go live)
+make release GITEA=<sha>   # go live: backup, checks, automatic rollback
+make ops-backup # dump + config tarball + exports + data-disk snapshot
+make ops-verify # the release status checks, against prod
 make rollout    # pull the latest :prod images now
 make sync       # re-render VM config after a vm/ change
-make backup     # on-demand gitea dump to GCS
 make ssh        # shell via IAP
 ```
 
@@ -111,9 +114,10 @@ Application Default Credentials (`gcloud auth application-default login`).
 Without them `pulumi config get` fails quietly and gcloud runs with an empty
 `--project=`; pass `PROJECT=<project-id>` to skip the lookup.
 
-A push to `main` under `image/**` builds, pushes, rolls out, and gates on
-`/api/healthz`. A push under `infra/**` or `vm/**` runs `pulumi up` and then
-re-syncs the VM configuration. Anything else does nothing.
+Only `make release` (`scripts/ops/gitea_ops.py`) moves `:prod`. It takes the
+backups, migrates explicitly when the Gitea version changes, runs the status
+checks, and rolls back, data included, if they fail. See *Releases* in
+[docs/runbook.md](docs/runbook.md).
 
 ## How updates happen
 
@@ -126,12 +130,18 @@ Three independent layers, because no single one covers everything:
    `Notify=healthy` on the quadlets means systemd withholds "started" until the
    healthcheck passes, which is what arms podman's automatic rollback.
 3. **Image contents** — a Cloud Scheduler job re-runs the image build every
-   Sunday, rebuilding from a floating `debian:13-slim` so base-OS and Go
-   security fixes reach the running containers. Without this, `:prod` never
-   changes and layer 2 has nothing to pull.
+   Sunday. It rebuilds Gitea from a floating `alpine:3.24` on the newest
+   Gitea 28.x, and Caddy from a floating `debian:13-slim`, so base-OS, Gitea
+   and Go security fixes reach the running containers. Without this, `:prod`
+   never changes and layer 2 has nothing to pull.
 
-Bumping the Gitea or Caddy version itself stays a deliberate change to
-`image/gitea.version` / `image/caddy.version`.
+`image/gitea.version` holds only the Gitea **major** (`28`) and
+`image/alpine.version` the Alpine **minor** (`3.24`). Patches float; changing
+either file is a deliberate PR, and a release across one needs
+`--allow-major` / `--allow-alpine-minor`. Alpine minors are pinned because
+they are known to break things (3.14's musl `faccessat2` change broke
+containers on older runtimes). The Caddy version stays a deliberate change to
+`image/caddy.version`.
 
 > **Fire the weekly rebuild once by hand after the first deploy.** A broken
 > scheduler request fails silently at 04:00 on a Sunday and stops layer 3
@@ -142,6 +152,12 @@ Bumping the Gitea or Caddy version itself stays a deliberate change to
 
 - **The `:prod` tag is load-bearing.** `AutoUpdate=registry` compares digests
   *for a tag*. Pinning a digest in the quadlet silently disables auto-updates.
+  Only `gitea_ops.py release` moves it. A Gitea version change must never
+  reach the VM through auto-update: its rollback would put the old image back
+  on a database the new one already migrated, and the old one refuses to start.
+- **The Gitea image needs `bash`.** Gitea's server-side git hooks are
+  `#!/usr/bin/env bash`; without it every push is rejected. Its
+  `rsync`/`unzip`/`sqlite3` are the restore toolbox, because the host has none.
 - **`app.ini` is fully managed** and `INSTALL_LOCK=true`. Gitea settings changed
   in the web UI that map to `app.ini` will not survive a config sync. Edit
   `vm/config/app.ini.tmpl` instead.

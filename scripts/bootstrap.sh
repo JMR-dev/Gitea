@@ -140,7 +140,7 @@ for name in "${!GITEA_SECRETS[@]}"; do
     fi
     log "generating ${name}"
     # The upstream image is used only as a throwaway generator here; the
-    # deployed image is our own Debian 13 build.
+    # deployed image is our own Alpine build (image/gitea/Dockerfile).
     "${runner}" run --rm "${GITEA_IMAGE}" gitea generate secret "${GITEA_SECRETS[$name]}" \
         | tr -d '\n' \
         | gcloud secrets versions add "${name}" --project="${PROJECT}" --data-file=-

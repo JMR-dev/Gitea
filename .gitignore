@@ -10,3 +10,6 @@
 
 *.swp
 .DS_Store
+
+# Python bytecode from `make check` (py_compile)
+__pycache__/

@@ -1,9 +1,9 @@
 ; Rendered by vm/bootstrap.sh -> /etc/gitea/app.ini (owner 1000:1000, mode 0400).
 ;
-; This file is FULLY MANAGED. Gitea's GITEA__section__KEY environment support
-; comes from the upstream image's `environment-to-ini` entrypoint helper, which
-; does not exist on our Debian base -- so configuration happens here, on the
-; host, and the file is bind-mounted read-only.
+; This file is FULLY MANAGED. Configuration happens here, on the host, and the
+; file is bind-mounted read-only. Our image deliberately leaves out upstream's
+; entrypoint scripts and their `environment-to-ini` step, which rewrites
+; app.ini from GITEA__section__KEY variables -- and fails on a read-only mount.
 ;
 ; INSTALL_LOCK=true means the web installer is never reachable. Editing Gitea
 ; settings through the UI that map to app.ini will NOT persist; change the
@@ -18,6 +18,9 @@ WORK_PATH = /var/lib/gitea
 PROTOCOL          = http
 HTTP_ADDR         = 0.0.0.0
 HTTP_PORT         = 3000
+; Gitea 28 no longer reads DOMAIN: it takes the domain from ROOT_URL, which
+; names the same host. Kept so that rolling back to 1.27 -- which still reads
+; it -- needs no template change. Drop it once 1.27 is out of reach.
 DOMAIN            = ${DOMAIN}
 ROOT_URL          = https://${DOMAIN}/
 APP_DATA_PATH     = /var/lib/gitea/data
@@ -104,6 +107,10 @@ DEFAULT_ACTIONS_URL = github
 ; 90 days; on this disk that is unbounded growth with a long fuse.
 LOG_RETENTION_DAYS      = 90
 ARTIFACT_RETENTION_DAYS = 30
+; Gitea 28 started deleting completed runs after 400 days by default. Stated
+; here so the retention policy is a decision in this file, not a default that
+; can move. 0 keeps runs forever (1.27 ignores the key).
+RUN_RETENTION_DAYS      = 400
 
 [cron.update_checker]
 ENABLED = false
