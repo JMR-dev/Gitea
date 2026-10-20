@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Tests for the decisions in infra_deploy.py and release_gate.py.
+
+Run: python3 -m unittest discover -s scripts/cicd   (make ci-check runs it)
+"""
+import argparse
+import io
+import os
+import subprocess
+import sys
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import infra_deploy as D  # noqa: E402
+import release_gate as G  # noqa: E402
+
+U = "urn:pulumi:prod::gitea::"
+
+
+def step(op, rtype, name, parent=""):
+    return {"op": op, "urn": f"{U}{parent + '$' if parent else ''}{rtype}::{name}"}
+
+
+class Guard(unittest.TestCase):
+    def test_vm_replace_needs_approval(self):
+        p = {"steps": [step("replace", "gcp:compute/instance:Instance", "gitea-vm"),
+                       step("update", "gcp:storage/bucketObject:BucketObject", "vm/x")]}
+        self.assertEqual(D.destructive_steps(p), [("replace", "gcp:compute/instance:Instance", "gitea-vm")])
+
+    def test_replacement_halves_and_deletes(self):
+        p = {"steps": [step("create-replacement", "gcp:compute/disk:Disk", "gitea-data"),
+                       step("delete-replaced", "gcp:compute/disk:Disk", "gitea-data"),
+                       step("delete", "gcp:storage/bucket:Bucket", "gitea-backups"),
+                       step("replace", "gcp:dns/recordSet:RecordSet", "gitea-a", parent="gcp:dns/managedZone:ManagedZone")]}
+        self.assertEqual(len(D.destructive_steps(p)), 4)
+
+    def test_ordinary_changes_go(self):
+        p = {"steps": [step("update", "gcp:compute/instance:Instance", "gitea-vm"),
+                       step("replace", "gcp:storage/bucketObject:BucketObject", "vm/fail2ban/x"),
+                       step("create", "gcp:storage/bucket:Bucket", "new"),
+                       step("delete", "kubernetes:core/v1:ConfigMap", "old"),
+                       step("same", "gcp:compute/disk:Disk", "gitea-data")]}
+        self.assertEqual(D.destructive_steps(p), [])
+
+    def test_malformed_preview(self):
+        self.assertEqual(D.destructive_steps({}), [])
+        self.assertEqual(D.destructive_steps({"steps": [{"op": "delete", "urn": "nonsense"}]}), [])
+
+
+class Converged(unittest.TestCase):
+    def test_provider_token_is_not_a_change(self):
+        p = {"steps": [{"op": "update", "urn": f"{U}pulumi:providers:kubernetes::gitea-runners"},
+                       step("same", "gcp:compute/instance:Instance", "gitea-vm")]}
+        self.assertEqual(D.leftover_changes(p), [])
+
+    def test_drift_is(self):
+        p = {"steps": [step("update", "gcp:compute/instance:Instance", "gitea-vm")]}
+        self.assertEqual(D.leftover_changes(p), ["update gitea-vm"])
+
+
+class Gate(unittest.TestCase):
+    def test_hash_is_stable_and_covers_the_engine(self):
+        self.assertEqual(G.code_hash("image"), G.code_hash("image"))
+        self.assertIn("scripts/ops/gitea_ops.py", G.FILES["image"])
+        self.assertIn("scripts/ops/gitea_ops.py", G.FILES["infra"])
+        self.assertIn("scripts/cicd/release_gate.py", G.FILES["image"])
+        for files in G.FILES.values():
+            for f in files:
+                self.assertTrue(os.path.exists(os.path.join(G.ROOT, f)), f)
+
+    def test_hash_changes_with_content(self):
+        real = open
+
+        def fake_open(path, mode="r", *a, **k):
+            if path.endswith("vm-steps.sh") and "b" in mode:
+                with real(path, mode, *a, **k) as f:
+                    return io.BytesIO(f.read() + b"\n# edited")
+            return real(path, mode, *a, **k)
+        before = G.code_hash("image")
+        with mock.patch("builtins.open", fake_open):
+            self.assertNotEqual(G.code_hash("image"), before)
+
+    def check(self, listing, approved=False, rc=0):
+        a = argparse.Namespace(pipeline="image", bucket="b", approved=approved)
+        out = subprocess.CompletedProcess([], rc, stdout=listing, stderr="")
+        with mock.patch.object(G, "gcloud", return_value=out), redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()) as err:
+            return G.cmd_check(a), err.getvalue()
+
+    def test_refuses_until_both_image_drills_pass(self):
+        h = G.code_hash("image")
+        p = f"gs://b/drills/image/{h}/"
+        self.assertEqual(self.check("", rc=1)[0], 1)
+        self.assertEqual(self.check(f"{p}fail-verify-b1.json\n")[0], 1)
+        self.assertEqual(self.check(f"{p}fail-verify-b1.json\n{p}fail-after-migrate-b2.json\n")[0], 0)
+
+    def test_approval_overrides_with_a_warning(self):
+        rc, err = self.check("", approved=True, rc=1)
+        self.assertEqual(rc, 0)
+        self.assertIn("WARNING", err)
+
+    def test_a_drill_name_prefix_is_not_a_pass(self):
+        h = G.code_hash("image")
+        p = f"gs://b/drills/image/{h}/"
+        # "fail-verify" must not be satisfied by some other drill's object.
+        self.assertEqual(self.check(f"{p}fail-verifyx.json\n{p}fail-after-migrate-b2.json\n")[0], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

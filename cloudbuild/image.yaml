@@ -1,4 +1,5 @@
-# Build the Gitea and Caddy images and push them -- but never to :prod.
+# Build the Gitea and Caddy images, push them, and -- with _RELEASE=true --
+# release them. The build itself never moves :prod.
 #
 # Moving :prod is a release, and releases belong to scripts/ops/gitea_ops.py:
 # it takes the backups, picks the rollout path (a Gitea version change means a
@@ -12,15 +13,34 @@
 # digests FOR A TAG); this file just no longer writes it. :$SHORT_SHA and the
 # version tag are the release inputs and the audit trail.
 #
+# The release step does not run the engine here either: it launches the same
+# Kubernetes Job a person's `make release` does (scripts/ops/launch_job.py), so
+# a release runs on the ops pool as gitea-release@ whoever starts it, and a
+# build that dies cannot take the rollback down with it. It runs only code that
+# has passed drills D3 and D4 (scripts/cicd/release_gate.py), unless approved.
+#
 # Gitea floats within the major line in image/gitea.version: every build
 # resolves the newest stable release of that major and builds it. The stage-1
 # GPG check in image/gitea/Dockerfile is what authenticates that version.
 
 substitutions:
   _REGION: us-east1
+  _ZONE: us-east1-b
   _REPO: gitea
+  # Where the images go and the release runs. The build itself may run in the
+  # CI project (cicd/) or, by hand, here.
+  _APP_PROJECT: gitea-496920
   # false: build only (PR previews). Nothing is pushed.
   _PUSH: "true"
+  # The rest are set by the CI launcher (cicd/pkg/triggers) or `make ci-drill`.
+  _SHA: ""
+  _RELEASE: "false"
+  # A person approved this build (the gated trigger): the release gate and the
+  # Gitea major / Alpine minor guards step aside.
+  _APPROVED: "false"
+  _DEPLOY_STATE_BUCKET: ""
+  _DRILL: ""
+  _DRILL_OK: ""
 
 options:
   # A user-specified service account cannot write to the legacy default log
@@ -28,7 +48,11 @@ options:
   logging: CLOUD_LOGGING_ONLY
   machineType: E2_HIGHCPU_8
 
-timeout: 2400s
+# The build is about 30 minutes; the release Job may take two hours
+# (launch_job.py's deadline) after waiting for one already running. A build
+# that timed out while following a Job that then succeeded would post a false
+# failure, so the Job's own deadline is the guard and this only bounds it.
+timeout: 18000s
 
 steps:
   - id: read-versions
@@ -74,7 +98,7 @@ steps:
       - |
         set -euo pipefail
         V=$(cat /workspace/vars/gitea_version)
-        IMG="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/gitea"
+        IMG="${_REGION}-docker.pkg.dev/${_APP_PROJECT}/${_REPO}/gitea"
         # --pull: the alpine tag floats within the minor, and a cached base
         # layer would quietly skip the patch releases this rebuild is for.
         docker build --pull \
@@ -96,7 +120,7 @@ steps:
         set -euo pipefail
         V=$(cat /workspace/vars/caddy_version)
         C=$(cat /workspace/vars/coraza_version)
-        IMG="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/caddy"
+        IMG="${_REGION}-docker.pkg.dev/${_APP_PROJECT}/${_REPO}/caddy"
         # The Dockerfile asserts both the DNS and WAF modules are present, so a
         # dropped --with fails the build rather than shipping an unprotected
         # server. Caddy and coraza-caddy versions are coupled: coraza-caddy
@@ -119,10 +143,74 @@ steps:
           echo "_PUSH=${_PUSH}: build only, nothing pushed"
           exit 0
         fi
-        BASE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}"
+        BASE="${_REGION}-docker.pkg.dev/${_APP_PROJECT}/${_REPO}"
         docker push --all-tags "$${BASE}/gitea"
         docker push --all-tags "$${BASE}/caddy"
         # The release inputs: hand these tags to `gitea_ops.py release`.
         echo "pushed gitea:$SHORT_SHA $$(docker image inspect "$${BASE}/gitea:$SHORT_SHA" --format '{{index .RepoDigests 0}}')"
         echo "pushed caddy:$SHORT_SHA $$(docker image inspect "$${BASE}/caddy:$SHORT_SHA" --format '{{index .RepoDigests 0}}')"
-        echo "next: scripts/ops/gitea_ops.py release --gitea $SHORT_SHA --caddy $SHORT_SHA --yes"
+        echo "release with: make release GITEA=$SHORT_SHA CADDY=$SHORT_SHA"
+
+  - id: release
+    name: gcr.io/google.com/cloudsdktool/google-cloud-cli:589.0.0-slim
+    entrypoint: bash
+    env:
+      - HOME=/workspace/.home
+      - COMMIT_SHA=${_SHA}
+      - GITEA_DRILL_OK=${_DRILL_OK}
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if [ "${_RELEASE}" != "true" ]; then
+          echo "_RELEASE=${_RELEASE}: built, not released"
+          exit 0
+        fi
+        [ "${_PUSH}" = "true" ] || { echo "_RELEASE=true needs _PUSH=true" >&2; exit 1; }
+        [ -n "${_DEPLOY_STATE_BUCKET}" ] || { echo "_RELEASE=true needs _DEPLOY_STATE_BUCKET" >&2; exit 1; }
+        L=(python3 scripts/ops/launch_job.py --project "${_APP_PROJECT}" --zone "${_ZONE}")
+        G=(python3 scripts/cicd/release_gate.py)
+        args=(--region "${_REGION}" --zone "${_ZONE}" --yes release --gitea "$SHORT_SHA" --caddy "$SHORT_SHA")
+        if [ "${_APPROVED}" = "true" ]; then
+          # The engine still refuses a major or Alpine-minor change without these.
+          args+=(--allow-major --allow-alpine-minor)
+        fi
+
+        if [ -z "${_DRILL}" ]; then
+          approved=(); [ "${_APPROVED}" = "true" ] && approved=(--approved)
+          "$${G[@]}" check image --bucket "${_DEPLOY_STATE_BUCKET}" "$${approved[@]}"
+        fi
+
+        # One release-engine Job at a time; wait for one already running
+        # (another release, or an infra deploy's backup) rather than fail.
+        for i in $$(seq 1 240); do
+          st=$$("$${L[@]}" status)
+          case "$$st" in active*|pending*) echo "waiting for: $$st"; sleep 30 ;; *) break ;; esac
+        done
+
+        if [ -z "${_DRILL}" ]; then
+          exec "$${L[@]}" run -- "$${args[@]}"
+        fi
+
+        # A drill passes when the engine rolled back cleanly -- exit 1 with the
+        # rollback line and no ROLLBACK_FAILED -- and, for the data drill,
+        # reported its marker gone.
+        set +e
+        "$${L[@]}" run -- "$${args[@]}" --drill "${_DRILL}" 2>&1 | tee /workspace/release.log
+        rc=$${PIPESTATUS[0]}
+        set -e
+        pass=false
+        if [ "$$rc" = 1 ] && grep -q '==> GITEA_RELEASE_ROLLBACK path=' /workspace/release.log \
+            && ! grep -q 'GITEA_RELEASE_ROLLBACK_FAILED' /workspace/release.log; then
+          pass=true
+          if [ "${_DRILL}" = fail-after-migrate ] && ! grep -q 'DRILL fail-after-migrate: PASS' /workspace/release.log; then
+            pass=false
+          fi
+        fi
+        if [ "$$pass" != true ]; then
+          echo "DRILL image ${_DRILL}: FAIL (engine exit $$rc)"
+          exit 1
+        fi
+        echo "DRILL image ${_DRILL}: PASS"
+        "$${G[@]}" attest image --bucket "${_DEPLOY_STATE_BUCKET}" --drill "${_DRILL}" \
+          --build "$BUILD_ID" --sha "$${COMMIT_SHA:-$SHORT_SHA}"

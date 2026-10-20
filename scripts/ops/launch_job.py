@@ -115,7 +115,8 @@ def job_state(job):
 
 
 def manifests(engine_args, project):
-    commit = git("rev-parse", "HEAD")
+    # A Cloud Build source tarball has no .git; the pipeline names the commit.
+    commit = os.environ.get("COMMIT_SHA") or git("rev-parse", "HEAD")
     dirty = bool(git("status", "--porcelain", "--", *SCRIPTS))
     data = {}
     for name in SCRIPTS:
@@ -164,6 +165,10 @@ def manifests(engine_args, project):
                             {"name": "HOME", "value": "/work"},
                             {"name": "COMMIT_SHA", "value": commit},
                             {"name": "CLOUDSDK_CORE_DISABLE_PROMPTS", "value": "1"},
+                            # The engine refuses --drill without it; only
+                            # `make ci-drill` sets it, here and in the build.
+                            *([{"name": "GITEA_DRILL_OK", "value": "1"}]
+                              if os.environ.get("GITEA_DRILL_OK") == "1" else []),
                         ],
                         "resources": {"requests": {"cpu": "500m", "memory": "1Gi"},
                                       "limits": {"memory": "2Gi"}},

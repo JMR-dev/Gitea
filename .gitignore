@@ -1,5 +1,6 @@
 # Compiled Pulumi program (Pulumi.yaml points the go runtime at this binary)
 /infra/gitea-infra
+/cicd/gitea-cicd
 
 # Pulumi local state / plugin cache
 .pulumi/
