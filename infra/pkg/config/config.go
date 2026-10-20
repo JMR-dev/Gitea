@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,6 +39,13 @@ type Config struct {
 	// WAFMode is the Coraza SecRuleEngine setting. It also decides whether the
 	// fail2ban jail that acts on WAF verdicts is enabled at all.
 	WAFMode string
+
+	// Fail2banIgnore is extra addresses or CIDR ranges, space-separated, that
+	// fail2ban never bans: the operator's own, so a mistyped key or password
+	// cannot lock them out. Set it as a secret (`pulumi config set --secret`),
+	// since this repo is mirrored publicly. See package compute for how it
+	// reaches the VM.
+	Fail2banIgnore string
 
 	GitHubOwner          string
 	GitHubRepo           string
@@ -114,6 +122,7 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 
 		RequireSigninView: c.Get("requireSigninView"),
 		WAFMode:           c.Get("wafMode"),
+		Fail2banIgnore:    c.Get("fail2banIgnore"),
 
 		GitHubOwner:          c.Get("githubOwner"),
 		GitHubRepo:           c.Get("githubRepo"),
@@ -291,6 +300,27 @@ func validate(c *Config) error {
 	case "On", "DetectionOnly", "Off":
 	default:
 		return fmt.Errorf("gitea:wafMode %q must be On, DetectionOnly, or Off", c.WAFMode)
+	}
+	for _, f := range strings.Fields(c.Fail2banIgnore) {
+		// Values only, never echoed: this one is a secret. fail2ban would
+		// also take a hostname, but one that stops resolving fails open.
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			a, aerr := netip.ParseAddr(f)
+			if aerr != nil {
+				return errors.New("gitea:fail2banIgnore holds an entry that is not an IP address or CIDR range")
+			}
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		// A typo like /1 would quietly turn fail2ban off for most of the
+		// internet.
+		widest := 32
+		if p.Addr().Is4() {
+			widest = 16
+		}
+		if p.Bits() < widest {
+			return fmt.Errorf("gitea:fail2banIgnore holds a range wider than /%d", widest)
+		}
 	}
 	if c.RunnersEnabled {
 		if c.RunnerBurstMaxNodes < 0 || c.RunnerBurstMaxNodes > 10 {

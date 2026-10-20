@@ -221,7 +221,8 @@ at `maxretry = 5`, a single job retrying a bad token would ban all of CI for
 an hour. It would also take the runners offline, since they poll through the
 same IP. So the VM adds that address to `ignoreip`, using instance metadata
 `runner-egress-ip`. The trade-off is that hostile traffic from a job is never
-banned, which is acceptable under the threat model above.
+banned, which is acceptable under the threat model above. The same metadata
+value also carries the secret `gitea:fail2banIgnore`, the operator's own addresses.
 
 ## Turning it on
 

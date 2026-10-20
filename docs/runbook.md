@@ -73,23 +73,46 @@ rolls over.
 
 ### fail2ban — drill it, do not trust the status output
 
+Two jails read Gitea's log, through the two modes of `vm/fail2ban/filter.d/gitea.conf`:
+
+- `gitea` (5 in 10 min, 1 h ban) counts refused credentials: a web sign-in, or an SSH
+  key or password.
+- `gitea-ssh-probe` (50 in 3 h, 1 day ban, doubling for repeat offenders) counts SSH
+  connections that end without offering one: `ssh-keyscan`, port scanners, bots that
+  enumerate auth methods.
+
+A single `ssh-keyscan` makes five probe connections and bans nobody. Your own addresses
+belong in the secret `gitea:fail2banIgnore` (space-separated), never in the jail file.
+This repo is mirrored publicly.
+
 ```bash
 # 1. Fail a web login, then read the log line. It must show YOUR ip,
 #    not a 10.89.x address. If it shows Caddy, REVERSE_PROXY_TRUSTED_PROXIES is wrong.
 sudo journalctl CONTAINER_NAME=gitea | grep -i 'failed authentication'
 
-# 2. The jail is live.
+# 2. Both jails are live, the ignore list holds what you expect, and each
+#    filter mode matches the real log (counts, not zero).
 sudo fail2ban-client status gitea
+sudo fail2ban-client status gitea-ssh-probe
+sudo fail2ban-client get gitea ignoreip
+sudo fail2ban-regex -m CONTAINER_NAME=gitea systemd-journal 'gitea[mode=auth]'  | grep ^Lines
+sudo fail2ban-regex -m CONTAINER_NAME=gitea systemd-journal 'gitea[mode=probe]' | grep ^Lines
 
-# 3. Ban a throwaway address you control, then verify from that host that
-#    both 443 and 2222 are genuinely unreachable.
-sudo fail2ban-client set gitea banip <ip>
-sudo nft list set inet f2b-prerouting f2b-gitea-v4
-sudo fail2ban-client set gitea unbanip <ip>
+# 3. The action really runs. Ban documentation addresses (TEST-NET-1, and IPv6
+#    2001:db8::/32), see each one land in its set, then unban.
+sudo fail2ban-client set gitea banip 192.0.2.1
+sudo fail2ban-client set gitea banip 2001:db8::1
+sudo nft list table inet f2b-prerouting     # both elements, and a drop rule per set
+sudo fail2ban-client set gitea unbanip 192.0.2.1
+sudo fail2ban-client set gitea unbanip 2001:db8::1
+sudo grep -iE 'error|script' /var/log/fail2ban.log | tail   # nothing new
 ```
 
-A ban that appears in `fail2ban-client status` but still lets traffic through
-means the prerouting action is not in effect — the default INPUT-hook actions
+A ban that appears in `fail2ban-client status` but not in the nft set means the
+action is failing. Check `/var/log/fail2ban.log` for "Script error". Whitespace
+before a `;` anywhere in `nft-prerouting.conf` does exactly that: fail2ban reads
+` ;` as a comment and cuts the line. A ban that is in the set but still lets traffic
+through means the prerouting action is not in effect: the default INPUT-hook actions
 never see DNAT'd container traffic.
 
 ### WAF — git must still work, and blocks must still happen

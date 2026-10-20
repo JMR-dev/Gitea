@@ -4,6 +4,7 @@ package compute
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	gcpcompute "github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/compute"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/serviceaccount"
@@ -133,12 +134,24 @@ func New(
 		// describe` shows which revision of vm/ the box was built against.
 		"config-hash": pulumi.String(configHash),
 	}
-	if net.Runners != nil {
-		// The Cloud NAT address every GKE runner and CI job egresses from.
-		// vm/bootstrap.sh puts it in fail2ban's ignoreip: one misconfigured job
-		// retrying a bad token would otherwise ban all of CI at once. Omitted,
-		// not empty, when runners are off -- meta() already returns "" on 404.
-		metadata["runner-egress-ip"] = net.Runners.EgressIP.Address
+	// vm/bootstrap.sh puts this value in fail2ban's ignoreip, verbatim. It holds
+	// the Cloud NAT address every GKE runner and CI job egresses from: one
+	// misconfigured job retrying a bad token would otherwise ban all of CI at
+	// once. It also carries gitea:fail2banIgnore, which the key's name
+	// predates; renaming it means editing bootstrap.sh, which replaces the VM.
+	// Omitted, not empty, when there is neither -- meta() already returns ""
+	// on 404.
+	if net.Runners != nil || cfg.Fail2banIgnore != "" {
+		var egress pulumi.StringInput = pulumi.String("")
+		if net.Runners != nil {
+			egress = net.Runners.EgressIP.Address
+		}
+		extra := strings.Join(strings.Fields(cfg.Fail2banIgnore), " ")
+		v := pulumi.Sprintf("%s %s", egress, extra).ApplyT(strings.TrimSpace).(pulumi.StringOutput)
+		if extra != "" {
+			v = pulumi.ToSecret(v).(pulumi.StringOutput)
+		}
+		metadata["runner-egress-ip"] = v
 	}
 
 	vm, err := gcpcompute.NewInstance(ctx, "gitea-vm", &gcpcompute.InstanceArgs{
