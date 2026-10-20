@@ -186,9 +186,40 @@ class Ops:
                            f"{self.ar}/{image}:{tag}", "--format=value(image_summary.digest)")
 
     def tag(self, image, digest, tag):
-        self.gcloud("artifacts", "docker", "tags", "add",
-                    f"{self.ar}/{image}@{digest}", f"{self.ar}/{image}:{tag}", "--quiet",
-                    mutate=True)
+        """Point image:tag at digest, through the Artifact Registry API.
+
+        Not `gcloud artifacts docker tags add`: that moves an existing tag by
+        deleting and re-creating it, which needs artifactregistry.tags.delete
+        (not in roles/artifactregistry.writer) and leaves a moment with no
+        :prod at all. tags.patch moves it in one step with tags.update."""
+        pkg = (f"projects/{self.a.project}/locations/{self.a.region}"
+               f"/repositories/{self.a.repo}/packages/{image}")
+        body = {"name": f"{pkg}/tags/{tag}", "version": f"{pkg}/versions/{digest}"}
+        if self.a.dry_run:
+            log(f"DRY-RUN: tag {self.ar}/{image}@{digest} as :{tag}")
+            return
+        print(f"+ tag {self.ar}/{image}@{digest} as :{tag}", file=sys.stderr, flush=True)
+        token = self.run(["gcloud", "auth", "print-access-token"])
+
+        def call(method, url):
+            req = urllib.request.Request(
+                url, method=method, data=json.dumps(body).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+
+        api = "https://artifactregistry.googleapis.com/v1"
+        try:
+            try:
+                got = call("PATCH", f"{api}/{body['name']}?updateMask=version")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                got = call("POST", f"{api}/{pkg}/tags?tagId={tag}")
+        except urllib.error.HTTPError as e:
+            raise Abort(f"tag {image}:{tag}: HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+        if got.get("version") != body["version"]:
+            raise Abort(f"tag {image}:{tag} points at {got.get('version')}, not {digest}")
 
     def labels(self, image, ref):
         """Image config labels, read from the registry API (no pull, no crane)."""
