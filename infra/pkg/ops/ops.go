@@ -27,6 +27,7 @@ import (
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/meta/v1"
 	networkingv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/networking/v1"
 	policyv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/policy/v1"
+	rbacv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/rbac/v1"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"gitea-infra/pkg/config"
@@ -119,6 +120,10 @@ func New(
 		return nil, err
 	}
 
+	if err := launchers(ctx, cfg, inNS); err != nil {
+		return nil, err
+	}
+
 	// Nothing has any business connecting to an engine pod. Egress stays
 	// open: it needs Google APIs, the IAP tunnel, Gitea itself, and the GKE
 	// metadata server for its Workload Identity token.
@@ -154,6 +159,60 @@ func New(
 	}
 
 	return &Ops{ServiceAccount: sa}, nil
+}
+
+// launchers lets gitea:opsLaunchers start engine Jobs the way
+// scripts/ops/launch_job.py does, and nothing else: replace the one ConfigMap
+// and Job, find the Job's pod, follow its log. The operator needs none of
+// this (project-level container.admin covers it).
+//
+// What it amounts to: a Job here runs as gitea-release@, with whatever code
+// its ConfigMap holds, so a launcher can do anything the engine can. That is
+// the point -- CI releasing with the engine's identity rather than holding the
+// engine's rights itself -- and why only cb-image@ is ever listed.
+func launchers(ctx *pulumi.Context, cfg *config.Config, opts []pulumi.ResourceOption) error {
+	if len(cfg.OpsLaunchers) == 0 {
+		return nil
+	}
+	role, err := rbacv1.NewRole(ctx, "ops-launcher", &rbacv1.RoleArgs{
+		Metadata: &metav1.ObjectMetaArgs{Name: pulumi.String("ops-launcher"), Namespace: pulumi.String(Namespace)},
+		Rules: rbacv1.PolicyRuleArray{
+			&rbacv1.PolicyRuleArgs{
+				ApiGroups: pulumi.ToStringArray([]string{""}), Resources: pulumi.ToStringArray([]string{"configmaps"}),
+				Verbs: pulumi.ToStringArray([]string{"get", "create", "delete"}),
+			},
+			&rbacv1.PolicyRuleArgs{
+				ApiGroups: pulumi.ToStringArray([]string{"batch"}), Resources: pulumi.ToStringArray([]string{"jobs"}),
+				Verbs: pulumi.ToStringArray([]string{"get", "create", "delete"}),
+			},
+			&rbacv1.PolicyRuleArgs{
+				ApiGroups: pulumi.ToStringArray([]string{""}), Resources: pulumi.ToStringArray([]string{"pods"}),
+				Verbs: pulumi.ToStringArray([]string{"get", "list"}),
+			},
+			&rbacv1.PolicyRuleArgs{
+				ApiGroups: pulumi.ToStringArray([]string{""}), Resources: pulumi.ToStringArray([]string{"pods/log"}),
+				Verbs: pulumi.ToStringArray([]string{"get"}),
+			},
+		},
+	}, opts...)
+	if err != nil {
+		return err
+	}
+	var subjects rbacv1.SubjectArray
+	for _, email := range cfg.OpsLaunchers {
+		// GKE names a Google identity's Kubernetes user by its email.
+		subjects = append(subjects, &rbacv1.SubjectArgs{
+			Kind: pulumi.String("User"), Name: pulumi.String(email), ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+		})
+	}
+	_, err = rbacv1.NewRoleBinding(ctx, "ops-launcher", &rbacv1.RoleBindingArgs{
+		Metadata: &metav1.ObjectMetaArgs{Name: pulumi.String("ops-launcher"), Namespace: pulumi.String(Namespace)},
+		RoleRef: &rbacv1.RoleRefArgs{
+			ApiGroup: pulumi.String("rbac.authorization.k8s.io"), Kind: pulumi.String("Role"), Name: role.Metadata.Name().Elem(),
+		},
+		Subjects: subjects,
+	}, opts...)
+	return err
 }
 
 // grant gives the engine exactly what gitea_ops.py does, resource by resource

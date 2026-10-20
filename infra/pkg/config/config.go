@@ -100,6 +100,11 @@ type Config struct {
 	// zero, that release-engine Jobs (scripts/ops) run on and nothing else
 	// does. Part of the runner cluster, so it exists only with RunnersEnabled.
 	OpsMachineType string
+
+	// OpsLaunchers are service accounts, besides the operator, that may start
+	// release-engine Jobs: the CI project's cb-image@ (cicd/, the
+	// imageServiceAccount output). Space- or comma-separated emails.
+	OpsLaunchers []string
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -146,6 +151,7 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		RunnerHeavyMemory:      c.Get("runnerHeavyMemory"),
 
 		OpsMachineType: c.Get("opsMachineType"),
+		OpsLaunchers:   strings.Fields(strings.ReplaceAll(c.Get("opsLaunchers"), ",", " ")),
 	}
 
 	// Both meant something else before the node pool was split into base and
@@ -300,6 +306,14 @@ func validate(c *Config) error {
 	case "On", "DetectionOnly", "Off":
 	default:
 		return fmt.Errorf("gitea:wafMode %q must be On, DetectionOnly, or Off", c.WAFMode)
+	}
+	for _, l := range c.OpsLaunchers {
+		if !strings.HasSuffix(l, ".iam.gserviceaccount.com") || strings.Count(l, "@") != 1 {
+			return fmt.Errorf("gitea:opsLaunchers entry %q is not a service account email", l)
+		}
+	}
+	if len(c.OpsLaunchers) > 0 && !c.RunnersEnabled {
+		return fmt.Errorf("gitea:opsLaunchers needs gitea:runnersEnabled: the Jobs run on the runner cluster")
 	}
 	for _, f := range strings.Fields(c.Fail2banIgnore) {
 		// Values only, never echoed: this one is a secret. fail2ban would
