@@ -1,0 +1,15 @@
+{
+  "action": "synchronized",
+  "number": 12,
+  "pull_request": {
+    "id": 31,
+    "number": 12,
+    "user": {"id": 1, "login": "JMR-dev"},
+    "title": "CI/CD for Gitea itself in its own Cloud Build project",
+    "state": "open",
+    "head": {"label": "cicd-cloud-build-project", "ref": "cicd-cloud-build-project", "sha": "1111111111111111111111111111111111111111", "repo_id": 1, "repo": {"id": 1, "full_name": "JMR-dev/Gitea"}},
+    "base": {"label": "main", "ref": "main", "sha": "26de5015d2ded3c765a798d354b8a56abe0a98a7", "repo_id": 1, "repo": {"id": 1, "full_name": "JMR-dev/Gitea"}}
+  },
+  "repository": {"id": 1, "name": "Gitea", "full_name": "JMR-dev/Gitea"},
+  "sender": {"id": 1, "login": "JMR-dev"}
+}

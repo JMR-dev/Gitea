@@ -1,0 +1,25 @@
+{
+  "ref": "refs/heads/main",
+  "before": "fef8a62dc1751572cd52f76c112547b957e800af",
+  "after": "26de5015d2ded3c765a798d354b8a56abe0a98a7",
+  "compare_url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/compare/fef8a62dc1751572cd52f76c112547b957e800af...26de5015d2ded3c765a798d354b8a56abe0a98a7",
+  "commits": [
+    {
+      "id": "26de5015d2ded3c765a798d354b8a56abe0a98a7",
+      "message": "fail2ban: bans that apply, and keyscans that don't count as logins\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/26de5015d2ded3c765a798d354b8a56abe0a98a7",
+      "author": {"name": "JMR-dev", "email": "jmr-dev@noreply.gitea.jasonmross.dev", "username": "JMR-dev"},
+      "committer": {"name": "JMR-dev", "email": "jmr-dev@noreply.gitea.jasonmross.dev", "username": "JMR-dev"},
+      "verification": null,
+      "timestamp": "2026-10-20T12:02:11Z",
+      "added": [],
+      "removed": [],
+      "modified": ["docs/runbook.md", "infra/pkg/config/config.go", "vm/fail2ban/filter.d/gitea.conf"]
+    }
+  ],
+  "total_commits": 1,
+  "head_commit": {"id": "26de5015d2ded3c765a798d354b8a56abe0a98a7", "added": [], "removed": [], "modified": ["docs/runbook.md", "infra/pkg/config/config.go", "vm/fail2ban/filter.d/gitea.conf"]},
+  "repository": {"id": 1, "name": "Gitea", "full_name": "JMR-dev/Gitea", "private": false, "default_branch": "main"},
+  "pusher": {"id": 1, "login": "JMR-dev"},
+  "sender": {"id": 1, "login": "JMR-dev"}
+}

@@ -1,0 +1,304 @@
+package relay
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+// maxBody bounds what a delivery may cost before its signature is checked.
+// A push of PAYLOAD_COMMIT_LIMIT (15) commits is a few tens of KiB.
+const maxBody = 2 << 20
+
+// The modes a delivery can map to. Each is its own Pub/Sub topic and Cloud
+// Build trigger, so the trigger -- not anything in the message -- decides
+// whether approval is needed.
+const (
+	ModePreview = "preview" // a pull request: pulumi preview, image build without push
+	ModeDeploy  = "deploy"  // a push to main: deploy what changed, no approval
+	ModeGated   = "gated"   // a push to main that needs a person's approval first
+)
+
+// Pipelines name the repo's own Cloud Build files (cloudbuild/<name>.yaml).
+// Infra always runs before image when both do.
+const (
+	PipelineInfra = "infra"
+	PipelineImage = "image"
+)
+
+// Message is one Pub/Sub publish: the trigger binds each attribute to a
+// substitution (_SHA, _REF, _PR, _PIPELINES, _MODE). Data carries nothing the
+// build reads.
+type Message struct {
+	Topic      string
+	Attributes map[string]string
+}
+
+// Publisher sends a message; *PubSub in production, a fake in tests.
+type Publisher interface {
+	Publish(r *http.Request, m Message) error
+}
+
+// Webhook turns a Gitea delivery into at most one Pub/Sub message.
+type Webhook struct {
+	Secret  []byte
+	Repo    string   // owner/name; deliveries for any other repo are refused
+	Authors []string // pull requests from anyone else get no preview
+	Topics  map[string]string
+	Pub     Publisher
+	Status  StatusPoster // nil: post no statuses from here
+}
+
+func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	if err != nil || len(body) > maxBody {
+		http.Error(w, "body too large or unreadable", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if !validSignature(h.Secret, body, r.Header) {
+		// Nothing about the delivery is trusted or logged beyond this.
+		http.Error(w, "bad signature", http.StatusUnauthorized)
+		return
+	}
+
+	event := r.Header.Get("X-Gitea-Event")
+	delivery := r.Header.Get("X-Gitea-Delivery")
+	d, err := h.decide(event, body)
+	if err != nil {
+		slog.Warn("delivery refused", "event", event, "delivery", delivery, "error", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if d.msg == nil {
+		slog.Info("delivery ignored", "event", event, "delivery", delivery, "reason", d.reason)
+		if d.status != nil && h.Status != nil {
+			if err := h.Status.Post(r.Context(), *d.status); err != nil {
+				slog.Error("posting status", "error", err)
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	d.msg.Attributes["delivery"] = delivery
+	if err := h.Pub.Publish(r, *d.msg); err != nil {
+		// 5xx, so Gitea marks the delivery failed and it can be redelivered
+		// from the webhook's settings page.
+		slog.Error("publish failed", "topic", d.msg.Topic, "error", err)
+		http.Error(w, "publish failed", http.StatusBadGateway)
+		return
+	}
+	slog.Info("published", "topic", d.msg.Topic, "attributes", d.msg.Attributes)
+	w.WriteHeader(http.StatusAccepted)
+	fmt.Fprintf(w, "%s %s\n", d.msg.Attributes["mode"], d.msg.Attributes["pipelines"])
+}
+
+// validSignature checks X-Gitea-Signature (hex HMAC-SHA256 of the raw body),
+// or the GitHub-style X-Hub-Signature-256 Gitea also sends, in constant time.
+func validSignature(secret, body []byte, hdr http.Header) bool {
+	if len(secret) == 0 {
+		return false // a missing secret must never mean "accept everything"
+	}
+	sig := hdr.Get("X-Gitea-Signature")
+	if sig == "" {
+		sig = strings.TrimPrefix(hdr.Get("X-Hub-Signature-256"), "sha256=")
+	}
+	got, err := hex.DecodeString(sig)
+	if err != nil || len(got) != sha256.Size {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return hmac.Equal(got, mac.Sum(nil))
+}
+
+type decision struct {
+	msg    *Message
+	reason string
+	status *Status // posted when a delivery deliberately runs nothing
+}
+
+func (h *Webhook) decide(event string, body []byte) (decision, error) {
+	switch event {
+	case "push":
+		var p pushPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return decision{}, fmt.Errorf("push payload: %w", err)
+		}
+		if p.Repository.FullName != h.Repo {
+			return decision{}, fmt.Errorf("delivery for %q, not %q", p.Repository.FullName, h.Repo)
+		}
+		return h.decidePush(p), nil
+	case "pull_request":
+		var p prPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return decision{}, fmt.Errorf("pull_request payload: %w", err)
+		}
+		if p.Repository.FullName != h.Repo {
+			return decision{}, fmt.Errorf("delivery for %q, not %q", p.Repository.FullName, h.Repo)
+		}
+		return h.decidePR(p), nil
+	default:
+		// The hook subscribes to push and pull_request only; anything else
+		// (a "ping" from the settings page, say) is acknowledged and dropped.
+		return decision{reason: "event " + event}, nil
+	}
+}
+
+const zeroSHA = "0000000000000000000000000000000000000000"
+
+func (h *Webhook) decidePush(p pushPayload) decision {
+	if p.Ref != "refs/heads/main" {
+		return decision{reason: "push to " + p.Ref}
+	}
+	if p.After == "" || p.After == zeroSHA {
+		return decision{reason: "main deleted"}
+	}
+	paths, complete := p.paths()
+	mode, pipelines, why := Classify(paths, complete)
+	if len(pipelines) == 0 {
+		return decision{
+			reason: why,
+			status: &Status{SHA: p.After, Context: "cloudbuild/" + ModeDeploy, State: "success",
+				Description: "nothing to deploy: " + why},
+		}
+	}
+	return decision{msg: &Message{
+		Topic: h.Topics[mode],
+		Attributes: map[string]string{
+			"sha": p.After, "ref": "main", "pr": "",
+			"mode": mode, "pipelines": strings.Join(pipelines, ","),
+		},
+	}}
+}
+
+func (h *Webhook) decidePR(p prPayload) decision {
+	switch p.Action {
+	case "opened", "synchronized", "reopened":
+	default:
+		return decision{reason: "pull request " + p.Action}
+	}
+	pr := p.PullRequest
+	// Same-repo branches only: a fork's head is code nobody here reviewed,
+	// and even a preview runs it (pulumi executes the program).
+	if pr.Head.Repo.FullName != h.Repo {
+		return decision{reason: "head is in " + pr.Head.Repo.FullName}
+	}
+	if !slices.Contains(h.Authors, pr.User.Login) {
+		return decision{reason: "author " + pr.User.Login + " is not allowed"}
+	}
+	return decision{msg: &Message{
+		Topic: h.Topics[ModePreview],
+		Attributes: map[string]string{
+			"sha": pr.Head.SHA, "ref": pr.Head.Ref, "pr": strconv.Itoa(p.Number),
+			"mode": ModePreview, "pipelines": PipelineInfra + "," + PipelineImage,
+		},
+	}}
+}
+
+// Gated are the files whose change needs a person's approval before it
+// deploys. The two version files are, by definition, a Gitea major or Alpine
+// minor bump. vm/bootstrap.sh is the VM's startup script, so any edit to it
+// replaces the VM (about 15 minutes down and a new Let's Encrypt certificate).
+var Gated = []string{"image/gitea.version", "image/alpine.version", "vm/bootstrap.sh"}
+
+// Classify maps the paths a push to main changed onto a mode and the
+// pipelines to run. complete is false when Gitea truncated the commit list
+// (PAYLOAD_COMMIT_LIMIT): the paths are then a sample, a gated file may be
+// among the missing ones, so everything runs and a person approves it.
+func Classify(paths []string, complete bool) (mode string, pipelines []string, reason string) {
+	if !complete {
+		return ModeGated, []string{PipelineInfra, PipelineImage}, "commit list truncated"
+	}
+	var infra, image, gated bool
+	for _, p := range paths {
+		switch {
+		case slices.Contains(Gated, p):
+			gated = true
+			if strings.HasPrefix(p, "image/") {
+				image = true
+			} else {
+				infra = true
+			}
+		case strings.HasPrefix(p, "infra/"), strings.HasPrefix(p, "vm/"), p == "cloudbuild/infra.yaml":
+			infra = true
+		case strings.HasPrefix(p, "image/"), p == "cloudbuild/image.yaml":
+			image = true
+		}
+	}
+	if infra {
+		pipelines = append(pipelines, PipelineInfra)
+	}
+	if image {
+		pipelines = append(pipelines, PipelineImage)
+	}
+	switch {
+	case len(pipelines) == 0:
+		return ModeDeploy, nil, "no infra/, vm/, image/ or cloudbuild/ change"
+	case gated:
+		return ModeGated, pipelines, "gated file changed"
+	default:
+		return ModeDeploy, pipelines, ""
+	}
+}
+
+// The parts of Gitea's webhook payloads (modules/structs/hook.go) read here.
+type repoRef struct {
+	FullName string `json:"full_name"`
+}
+
+type pushPayload struct {
+	Ref          string   `json:"ref"`
+	After        string   `json:"after"`
+	TotalCommits int      `json:"total_commits"`
+	Commits      []commit `json:"commits"`
+	Repository   repoRef  `json:"repository"`
+	HeadCommit   *commit  `json:"head_commit"`
+}
+
+type commit struct {
+	ID       string   `json:"id"`
+	Added    []string `json:"added"`
+	Removed  []string `json:"removed"`
+	Modified []string `json:"modified"`
+}
+
+// paths is every file the listed commits touched, and whether the list is the
+// whole push.
+func (p pushPayload) paths() ([]string, bool) {
+	var out []string
+	for _, c := range p.Commits {
+		out = append(append(append(out, c.Added...), c.Removed...), c.Modified...)
+	}
+	return out, p.TotalCommits <= len(p.Commits)
+}
+
+type prPayload struct {
+	Action      string `json:"action"`
+	Number      int    `json:"number"`
+	PullRequest struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Head struct {
+			Ref  string  `json:"ref"`
+			SHA  string  `json:"sha"`
+			Repo repoRef `json:"repo"`
+		} `json:"head"`
+	} `json:"pull_request"`
+	Repository repoRef `json:"repository"`
+}
+
+var errNoSecret = errors.New("GITEA_WEBHOOK_SECRET is empty")
