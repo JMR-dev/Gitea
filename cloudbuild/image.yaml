@@ -189,6 +189,15 @@ steps:
         done
 
         if [ -z "${_DRILL}" ]; then
+          # Last, right before the Job: a newer commit on main that also
+          # changes the image releases it, and this one must not put an older
+          # image back. Not for an approved build, which may carry the version
+          # bump a newer, unapproved one cannot release.
+          if [ "${_APPROVED}" != "true" ] && [ -n "${_SHA}" ] \
+              && [ "$$("$${G[@]}" superseded image --sha "${_SHA}")" = yes ]; then
+            echo "not released: superseded by a newer commit on main"
+            exit 0
+          fi
           exec "$${L[@]}" run -- "$${args[@]}"
         fi
 

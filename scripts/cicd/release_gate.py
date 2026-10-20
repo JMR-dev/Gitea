@@ -21,10 +21,17 @@ with a warning: the approval is the person taking that on. The engine itself
   image  D3 fail-verify (image rollback) and D4 fail-after-migrate (data restore)
   infra  D5 fail-verify (re-apply the last good commit)
 
+`superseded image --sha S` answers whether a newer commit on main also
+changes the image, in which case that commit's build releases it and this
+one must not: builds that finish out of order would otherwise put an older
+image back. It asks Gitea's API anonymously (the repo is public) and answers
+"no" when it cannot tell, so a Gitea outage never blocks a release.
+
 Usage:
-  release_gate.py hash   <pipeline>
-  release_gate.py check  <pipeline> --bucket B [--approved]
-  release_gate.py attest <pipeline> --bucket B --drill NAME --build B --sha S
+  release_gate.py hash       <pipeline>
+  release_gate.py check      <pipeline> --bucket B [--approved]
+  release_gate.py attest     <pipeline> --bucket B --drill NAME --build B --sha S
+  release_gate.py superseded image --sha S [--gitea-url U --repo owner/name]
 """
 import argparse
 import datetime
@@ -33,6 +40,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
@@ -119,9 +127,44 @@ def cmd_attest(a):
     return 0
 
 
+# What makes a newer commit's build release the image (cicd/relay Classify).
+IMAGE_PATHS = ("image/", "cloudbuild/image.yaml")
+
+
+def newer_touches(compare, paths):
+    """Whether any commit in a Gitea compare response changes one of paths."""
+    for c in compare.get("commits") or []:
+        for f in c.get("files") or []:
+            name = f.get("filename", "")
+            if any(name == p or (p.endswith("/") and name.startswith(p)) for p in paths):
+                return c.get("sha", "?")
+    return None
+
+
+def cmd_superseded(a):
+    url = f"{a.gitea_url.rstrip('/')}/api/v1/repos/{a.repo}/compare/{a.sha}...main"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            compare = json.load(r)
+    except Exception as e:  # cannot tell: never block a release on it
+        print("no")
+        print(f"superseded: could not ask Gitea ({e}); assuming not", file=sys.stderr)
+        return 0
+    newer = newer_touches(compare, IMAGE_PATHS)
+    print("yes" if newer else "no")
+    if newer:
+        print(f"superseded: {newer[:7]} on main also changes the image; its build releases it", file=sys.stderr)
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("superseded")
+    sp.add_argument("pipeline", choices=["image"])
+    sp.add_argument("--sha", required=True)
+    sp.add_argument("--gitea-url", default="https://gitea.jasonmross.dev")
+    sp.add_argument("--repo", default="JMR-dev/Gitea")
     for name in ("hash", "check", "attest"):
         s = sub.add_parser(name)
         s.add_argument("pipeline", choices=sorted(FILES))
@@ -134,7 +177,8 @@ def main():
             s.add_argument("--build", required=True)
             s.add_argument("--sha", required=True)
     a = p.parse_args()
-    sys.exit({"hash": cmd_hash, "check": cmd_check, "attest": cmd_attest}[a.cmd](a) or 0)
+    sys.exit({"hash": cmd_hash, "check": cmd_check, "attest": cmd_attest,
+              "superseded": cmd_superseded}[a.cmd](a) or 0)
 
 
 if __name__ == "__main__":

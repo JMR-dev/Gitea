@@ -108,6 +108,23 @@ class Gate(unittest.TestCase):
         self.assertEqual(self.check(f"{p}fail-verifyx.json\n{p}fail-after-migrate-b2.json\n")[0], 1)
 
 
+class Superseded(unittest.TestCase):
+    def test_newer_image_change_supersedes(self):
+        c = {"commits": [{"sha": "aaa", "files": [{"filename": "docs/x.md"}]},
+                         {"sha": "bbb", "files": [{"filename": "image/gitea/Dockerfile"}]}]}
+        self.assertEqual(G.newer_touches(c, G.IMAGE_PATHS), "bbb")
+
+    def test_unrelated_or_lookalike_does_not(self):
+        c = {"commits": [{"sha": "aaa", "files": [{"filename": "images/logo.png"}, {"filename": "infra/main.go"},
+                                                  {"filename": "cloudbuild/image.yaml.bak"}]}]}
+        self.assertIsNone(G.newer_touches(c, G.IMAGE_PATHS))
+        self.assertIsNone(G.newer_touches({}, G.IMAGE_PATHS))
+
+    def test_pipeline_file_counts(self):
+        c = {"commits": [{"sha": "ccc", "files": [{"filename": "cloudbuild/image.yaml"}]}]}
+        self.assertEqual(G.newer_touches(c, G.IMAGE_PATHS), "ccc")
+
+
 class RelayAgrees(unittest.TestCase):
     """cicd/relay flags the same files this gate hashes, for the same pipelines."""
 
