@@ -1,4 +1,9 @@
 name: gitea-cicd
+# Its own state bucket (scripts/cicd/bootstrap.py), named here rather than by
+# `pulumi login`, which is global: logging in for this stack would quietly
+# point every later `cd infra && pulumi ...` at the wrong state.
+backend:
+  url: gs://gitea-ci-781388-pulumi-state
 runtime:
   name: go
   options:

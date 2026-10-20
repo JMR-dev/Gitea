@@ -176,9 +176,10 @@ ci-check: ## Build, vet and test the CI program, the relay and the CI scripts
 	python3 -m py_compile scripts/cicd/bootstrap.py scripts/cicd/infra_deploy.py scripts/cicd/release_gate.py
 	python3 -m unittest discover -s scripts/cicd
 
+# No `pulumi login`: cicd/Pulumi.yaml names its own backend, and a login is
+# global -- it would re-point infra/ too.
 .PHONY: ci-init
-ci-init: ## Log in to the CI stack's state bucket and create the stack (once, after bootstrap.py)
-	cd cicd && pulumi login gs://$(CI_PROJECT)-pulumi-state
+ci-init: ## Create the CI stack (once, after bootstrap.py)
 	cd cicd && ( pulumi stack select prod 2>/dev/null || $(CI_PASS) pulumi stack init prod --secrets-provider passphrase )
 
 .PHONY: ci-preview
