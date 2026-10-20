@@ -622,7 +622,7 @@ def cmd_rollback(ops, a):
 
 def parse_inventory(text):
     """The TSV vm-steps.sh `inventory` prints (plus "boot ok" from a restore test)."""
-    inv = {"integrity": None, "users": {}, "repos": {}, "boot": False}
+    inv = {"integrity": None, "users": {}, "repos": {}, "boot": False, "dbsource": None}
     for line in text.splitlines():
         f = line.split("\t")
         if f[0] == "integrity":
@@ -633,6 +633,8 @@ def parse_inventory(text):
             inv["repos"][f[1]] = {"created": int(f[2] or 0), "updated": int(f[3] or 0), "refs": f[4]}
         elif f[0] == "boot":
             inv["boot"] = f[1:] == ["ok"]
+        elif f[0] == "dbsource" and len(f) > 1:
+            inv["dbsource"] = f[1]
     return inv
 
 
@@ -704,19 +706,32 @@ def cmd_drill_restore(ops, a):
     # The copy is attached to the prod VM: no reboot (fstab mounts by UUID, and
     # the copy shares it) and no auto-update while it is there.
     ops.vm("pause-timers")
+    # Each half is judged on its own: one failing must not hide the other.
+    outputs = {}
     try:
-        from_snap = ops.with_restore_disk(snap, "restore-test-snapshot", tool)
-        from_dump = ops.with_restore_disk(snap, "restore-test-dump", dump, tool)
+        for label, step, args in (("snapshot", "restore-test-snapshot", (tool,)),
+                                  ("dump", "restore-test-dump", (dump, tool))):
+            try:
+                outputs[label] = (ops.with_restore_disk(snap, step, *args), None)
+            except subprocess.CalledProcessError as e:
+                if ops.manifest.get("restore_disk_left_attached"):
+                    raise
+                outputs[label] = ("", f"{step} failed (exit {e.returncode})")
     finally:
         if not ops.manifest.get("restore_disk_left_attached"):
             ops.vm("resume-timers")
     results = {}
-    for label, text, taken_at, src in (("snapshot", from_snap, snap_at, snap),
-                                       ("dump", from_dump, dump_at, dump)):
+    for label, taken_at, src in (("snapshot", snap_at, snap), ("dump", dump_at, dump)):
+        text, error = outputs[label]
         inv = parse_inventory(text)
-        problems = judge_restore(prod, inv, taken_at)
+        problems = ([error] if error else []) + judge_restore(prod, inv, taken_at)
         results[label] = {"source": src, "taken_at": taken_at, "users": len(inv["users"]),
                           "repos": len(inv["repos"]), "problems": problems}
+        if inv["dbsource"]:
+            results[label]["dbsource"] = inv["dbsource"]
+            if inv["dbsource"] == "bundled":
+                log(f"NOTE {label}: gitea-db.sql would not import with stock sqlite3; "
+                    "restored from the dump's bundled gitea.db (copied live, crash-consistent at best)")
         for pr in problems:
             log(f"FAIL {label}: {pr}")
     ok = not any(r["problems"] for r in results.values())

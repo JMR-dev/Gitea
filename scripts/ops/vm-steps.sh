@@ -339,8 +339,13 @@ step_restore_test_snapshot() {
 # the attached scratch disk, per Gitea's documented restore, then boot it in
 # isolation. The VM's service account can read a dump by exact name only.
 #
-# The database comes from gitea-db.sql, not from the data/gitea.db the dump
-# also carries: that file was copied while Gitea was writing to it.
+# The database comes from gitea-db.sql when that imports cleanly; the
+# data/gitea.db the dump also carries was copied while Gitea was writing to it.
+# But stock sqlite3 cannot always import Gitea's SQL: big text rows become
+# '...'||char(10)||'...' chains past SQLITE_MAX_EXPR_DEPTH (1000), and without
+# -bail sqlite3 skips those statements and carries on, leaving a database with
+# rows silently missing. So: -bail, and on failure fall back to the bundled
+# copy, saying which one was used ("dbsource" line) so the result is honest.
 step_restore_test_dump() {
     local url="$1" img="$2" root
     mount_restore
@@ -357,9 +362,20 @@ step_restore_test_dump() {
         rm -f /w/root/data/gitea.db /w/root/data/gitea.db-wal /w/root/data/gitea.db-shm
         if [ -d repos ]; then cp -a repos/. /w/root/data/gitea-repositories/; fi
         if [ -d custom ]; then cp -a custom /w/root/; fi
-        sqlite3 /w/root/data/gitea.db < gitea-db.sql
+        if sqlite3 -bail /w/root/data/gitea.db < gitea-db.sql 2>/w/sql-import.err; then
+            echo sql > /w/dbsource
+        else
+            echo "gitea-db.sql does not import: $(head -c 300 /w/sql-import.err)" >&2
+            rm -f /w/root/data/gitea.db /w/root/data/gitea.db-wal /w/root/data/gitea.db-shm
+            cp -a data/gitea.db /w/root/data/
+            for f in data/gitea.db-wal data/gitea.db-shm; do
+                if [ -f "$f" ]; then cp -a "$f" /w/root/data/; fi
+            done
+            echo bundled > /w/dbsource
+        fi
         chown -R 1000:1000 /w/root
     '
+    printf 'dbsource\t%s\n' "$(cat "${root}/dbsource")"
     restore_test_instance "${img}" "${root}/root"
     rm -rf "${root}"
 }
