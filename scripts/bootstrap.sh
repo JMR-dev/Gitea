@@ -53,6 +53,7 @@ gcloud services enable --project="${PROJECT}" \
     cloudscheduler.googleapis.com \
     iamcredentials.googleapis.com \
     oslogin.googleapis.com \
+    cloudresourcemanager.googleapis.com \
     container.googleapis.com
 
 # ---------------------------------------------------------------------------

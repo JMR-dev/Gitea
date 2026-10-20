@@ -21,6 +21,11 @@ var services = []string{
 	"cloudscheduler.googleapis.com",
 	"iamcredentials.googleapis.com",
 	"oslogin.googleapis.com",
+	// gcloud projects get-iam-policy, which scripts/ops/gitea_ops.py runs as
+	// gitea-release@ for every backup's IAM export. Calls made with a service
+	// account's credentials bill quota to the account's own project, so this
+	// API has to be on here even though the operator's own calls never needed it.
+	"cloudresourcemanager.googleapis.com",
 	// Ungated, unlike the runner cluster itself: enabling an API costs nothing,
 	// and scripts/bootstrap.sh enables the same list.
 	"container.googleapis.com",
