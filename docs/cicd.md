@@ -39,18 +39,35 @@ whose permissions have been proven for real.
 
 | Account | Runs | Holds |
 |---|---|---|
-| `cb-launcher` | every trigger's own build | submit builds as the two below, the source bucket |
-| `cb-infra` | `cloudbuild/infra.yaml` | the app project roles Pulumi needs (`cicd/pkg/identity`) |
-| `cb-image` | `cloudbuild/image.yaml` | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`), read and add (never replace) drill passes |
+| `cb-launcher` | the deploy, gated and rebuild triggers' own build | submit builds as `cb-infra` and `cb-image`, the source bucket |
+| `cb-infra` | `cloudbuild/infra.yaml` for main | the app project roles Pulumi needs (`cicd/pkg/identity`) |
+| `cb-image` | `cloudbuild/image.yaml` for main | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`), read and add (never replace) drill passes |
+| `cb-launcher-preview` | the preview trigger's own build | submit builds as the two below **only**, the source bucket |
+| `cb-infra-preview` | a PR's `cloudbuild/infra.yaml` | `roles/viewer` on the app project, read the app stack's state, its passphrase, read drill passes |
+| `cb-image-preview` | a PR's `cloudbuild/image.yaml` | logs and the source bucket; nothing in the app project |
 | `ci-relay`, `ci-status` | the two functions | their topics, the webhook secret and the status token |
 | `ci-status-push` | the push subscription | invoke `build-status`, nothing else |
 
-**PR previews run as `cb-infra` and `cb-image`.** A preview runs the PR's
-code: `pulumi preview` executes the program, and the nested build's YAML comes
-from the branch. So the preview's identity can do whatever that code does. The
-relay therefore previews only same-repo branches by `gitea-cicd:allowedAuthors`,
-who are people who can already push to main, which deploys. **Before you add
-an author who can't push to main, add a read-only preview identity.**
+**A PR preview runs code nobody has reviewed yet**, so it runs as accounts
+that can't change prod:
+- `pulumi preview` executes the branch's program, and the pipeline file comes
+  from the branch too. A branch that edits its pipeline file to run `pulumi up`
+  gets a failed build, not a deploy.
+- The preview trigger's launcher can act only as the two `-preview` accounts.
+  So nothing in the branch, or in the launcher's own script, can start a build
+  as `cb-infra` or `cb-image`.
+- `autoDeploy = false` doesn't pause previews, and doesn't need to.
+
+**Read-only isn't secret-free.** A preview has to decrypt the stack's config,
+so `cb-infra-preview` holds the app stack's passphrase:
+- A branch's preview can read every secret in that stack's config and state.
+  Today that is `gitea:fail2banIgnore`, plus the Kubernetes provider's access
+  token from the last `pulumi up`, which is valid for up to an hour after it.
+- It can also read the app project's configuration (`roles/viewer`), though not
+  object contents, secret values or Kubernetes Secrets.
+
+That is why the relay still previews only same-repo branches by
+`gitea-cicd:allowedAuthors`. Keep that list to people you'd trust with those.
 
 ## What deploys, and when
 
@@ -208,7 +225,12 @@ a brief restart, and a success status on main.
    `gitea-ops`).
 6. `GITEA_TOKEN=... scripts/cicd/bootstrap.py --yes hook`: the repo webhook.
    Send a test delivery from the hook's settings. A ping is answered 204.
-7. Open a PR: the preview's statuses appear on it. Then check from outside:
+7. Open a PR (every PR previews both pipelines): the preview's statuses
+   appear on it. Then check:
+   - both preview builds ran as `cb-infra-preview` and `cb-image-preview`
+     (`gcloud builds list --project=gitea-ci-781388 --format='value(id,serviceAccount)' --limit=3`);
+   - the infra preview got through the runner cluster's objects (the
+     client-side fallback, under Known limits);
    - a delivery with a bad signature gets 401 (`curl -X POST -H 'X-Gitea-Event: push' -d '{}' <webhookUrl>`);
    - `build-status` without a token gets 403.
 8. The drills, then automation (above).
@@ -237,9 +259,12 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 - Cloud Build has no Gitea connector, so the triggers carry an inline launcher.
   The source-less Pub/Sub trigger shape is allowed by gcloud's flag rules but
   is proven only at the first `make ci-up`.
-- A PR preview of runner (Kubernetes) changes does a server-side dry run, so
-  it needs write rights. That's one more reason previews run as the deploy
-  identities (above).
+- A PR preview of runner (Kubernetes) changes can't do the server-side dry
+  run, which needs write rights. The Kubernetes provider falls back to a
+  client-side diff instead (pulumi-kubernetes v4, `Create` and `Update` on a
+  refused preview), so server-defaulted fields don't show. A local
+  `make preview` still does the full dry run. That the fallback covers every
+  object is proven only at the first PR preview.
 - A wrong password or token on Gitea's REST API logs only a 401, so fail2ban
   can't see API guessing.
 

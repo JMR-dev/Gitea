@@ -25,7 +25,11 @@ func unescape(s string, subs map[string]string) string {
 
 func TestScriptsParse(t *testing.T) {
 	subs := map[string]string{"_SHA": "abc", "_PIPELINES": "infra,image", "_MODE": "deploy"}
-	for name, script := range map[string]string{"clone": CloneScript(cfg), "submit": SubmitScript(cfg)} {
+	scripts := map[string]string{"clone": CloneScript(cfg)}
+	for _, m := range Modes {
+		scripts["submit-"+m.Name] = SubmitScript(cfg, m)
+	}
+	for name, script := range scripts {
 		t.Run(name, func(t *testing.T) {
 			f, err := os.CreateTemp(t.TempDir(), "*.sh")
 			if err != nil {
@@ -50,23 +54,53 @@ func TestScriptsParse(t *testing.T) {
 }
 
 func TestSubmitTargetsTheRightProjects(t *testing.T) {
-	s := SubmitScript(cfg)
-	for _, want := range []string{
-		"--project=gitea-ci-123456", "_APP_PROJECT=gitea-496920", "_DEPLOY_STATE_BUCKET=gitea-ci-123456-deploy-state",
-		"serviceAccounts/cb-$$p@gitea-ci-123456.iam.gserviceaccount.com", "gs://gitea-ci-123456-build-source/source",
-		"--tags=\"gitea-pipeline,pipeline-$$p,sha-$$short\"",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("submit script lacks %q", want)
+	for _, m := range Modes {
+		s := SubmitScript(cfg, m)
+		for _, want := range []string{
+			"--project=gitea-ci-123456", "_APP_PROJECT=gitea-496920", "_DEPLOY_STATE_BUCKET=gitea-ci-123456-deploy-state",
+			"serviceAccounts/$$sa@gitea-ci-123456.iam.gserviceaccount.com", "gs://gitea-ci-123456-build-source/source",
+			"--tags=\"gitea-pipeline,pipeline-$$p,sha-$$short\"",
+		} {
+			if !strings.Contains(s, want) {
+				t.Errorf("%s: submit script lacks %q", m.Name, want)
+			}
+		}
+		for _, ph := range []string{"@CI@", "@SUFFIX@", "@APP@"} {
+			if strings.Contains(s, ph) {
+				t.Errorf("%s: placeholder %s left in script", m.Name, ph)
+			}
 		}
 	}
-	if strings.Contains(s, "@") && strings.Contains(s, "@CI@") {
-		t.Error("placeholder left in script")
+}
+
+// A preview runs a branch nobody has reviewed, so it must submit only as the
+// preview accounts, and every other mode only as the deploy accounts.
+func TestPreviewRunsOnlyAsPreviewAccounts(t *testing.T) {
+	var previews int
+	for _, m := range Modes {
+		s := SubmitScript(cfg, m)
+		preview := strings.Contains(s, `sa="cb-$$p-preview"`)
+		deploy := strings.Contains(s, `sa="cb-$$p"`)
+		switch {
+		case m.Preview:
+			previews++
+			if !preview || deploy || m.Automatic || m.Approval || m.Name != "preview" {
+				t.Errorf("%s: preview=%v deploy=%v automatic=%v approval=%v", m.Name, preview, deploy, m.Automatic, m.Approval)
+			}
+		case preview || !deploy:
+			t.Errorf("%s submits as the preview accounts", m.Name)
+		}
+		if strings.Count(s, "--service-account=") != 1 {
+			t.Errorf("%s: expected exactly one --service-account", m.Name)
+		}
+	}
+	if previews != 1 {
+		t.Fatalf("%d preview modes", previews)
 	}
 }
 
 func TestOnlyGatedApprovesAndAllows(t *testing.T) {
-	s := SubmitScript(cfg)
+	s := SubmitScript(cfg, Modes[0])
 	for _, line := range strings.Split(s, "\n") {
 		if strings.Contains(line, "_APPROVED=true") && !strings.Contains(line, ":gated)") {
 			t.Errorf("_APPROVED outside the gated mode: %s", line)

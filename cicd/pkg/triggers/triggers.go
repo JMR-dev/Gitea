@@ -4,10 +4,11 @@
 // Cloud Build has no Gitea connector, so a trigger cannot fetch the repo's
 // own cloudbuild/*.yaml. Each trigger instead carries an inline launcher: it
 // clones the commit from Gitea (anonymously; the repo is public) and submits
-// the repo's pipeline files as builds of their own, as cb-infra or cb-image.
-// The pipelines stay in the repo, so a pull request previews its own pipeline
-// changes, and the launcher -- the part that picks the identity, the mode and
-// the approval -- stays here, applied by hand.
+// the repo's pipeline files as builds of their own, as cb-infra or cb-image --
+// or, for a pull request, cb-infra-preview or cb-image-preview. The pipelines
+// stay in the repo, so a pull request previews its own pipeline changes, and
+// the launcher -- the part that picks the identity, the mode and the approval
+// -- stays here, applied by hand.
 //
 // The trigger decides the mode, never the message: what arrives on ci-deploy
 // runs as a deploy whatever its attributes say, and only ci-gated's trigger
@@ -40,13 +41,16 @@ type Mode struct {
 	Name     string // cicd/relay's Mode* (and "rebuild"): the _MODE substitution and the status context
 	Topic    string
 	Approval bool // the build waits for `make approve`
-	// Gated by autoDeploy: off, the trigger is disabled. A preview changes
-	// nothing in prod, so it is never gated.
+	// Gated by autoDeploy: off, the trigger is disabled. A preview runs as
+	// accounts that cannot change prod, so it is never gated.
 	Automatic bool
+	// Runs a branch nobody has reviewed: launched by cb-launcher-preview, as
+	// the *-preview accounts (cicd/pkg/identity).
+	Preview bool
 }
 
 var Modes = []Mode{
-	{Name: "preview", Topic: relay.TopicPreview},
+	{Name: "preview", Topic: relay.TopicPreview, Preview: true},
 	{Name: "deploy", Topic: relay.TopicDeploy, Automatic: true},
 	{Name: "gated", Topic: relay.TopicGated, Approval: true, Automatic: true},
 	{Name: "rebuild", Topic: relay.TopicRebuild, Automatic: true},
@@ -55,6 +59,10 @@ var Modes = []Mode{
 func New(ctx *pulumi.Context, cfg *config.Config, acc *identity.Accounts, b *cistorage.Buckets,
 	topics map[string]*pubsub.Topic, deps []pulumi.Resource) error {
 	for _, m := range Modes {
+		launcher := acc.Launcher
+		if m.Preview {
+			launcher = acc.PreviewLauncher
+		}
 		args := &cloudbuild.TriggerArgs{
 			Project:     pulumi.String(cfg.Project),
 			Location:    pulumi.String(cfg.Region),
@@ -62,8 +70,8 @@ func New(ctx *pulumi.Context, cfg *config.Config, acc *identity.Accounts, b *cis
 			Description: pulumi.String(fmt.Sprintf("Gitea %s: clone the commit, submit cloudbuild/<pipeline>.yaml", m.Name)),
 			Disabled:    pulumi.Bool(m.Automatic && !cfg.AutoDeploy),
 			// The launcher's identity; the pipelines it submits run as
-			// cb-infra or cb-image (see Script).
-			ServiceAccount: acc.Launcher.Name,
+			// cb-infra or cb-image, or their -preview pair (SubmitScript).
+			ServiceAccount: launcher.Name,
 			PubsubConfig: &cloudbuild.TriggerPubsubConfigArgs{
 				Topic: topics[m.Topic].ID(),
 			},
@@ -89,7 +97,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, acc *identity.Accounts, b *cis
 					&cloudbuild.TriggerBuildStepArgs{
 						Id: pulumi.String("submit"), Name: pulumi.String(gcloudImage),
 						Entrypoint: pulumi.String("bash"),
-						Args:       pulumi.ToStringArray([]string{"-c", SubmitScript(cfg)}),
+						Args:       pulumi.ToStringArray([]string{"-c", SubmitScript(cfg, m)}),
 					},
 				},
 			},
@@ -129,12 +137,17 @@ echo "mode=${_MODE} pipelines=${_PIPELINES} commit=$$sha"
 
 // SubmitScript runs each pipeline the message names, infra before image, as a
 // build of its own, and stops at the first that fails: an image is never
-// released onto infrastructure that just failed to deploy.
-func SubmitScript(cfg *config.Config) string {
+// released onto infrastructure that just failed to deploy. A preview submits
+// as cb-<pipeline>-preview, and its launcher could not act as anything else.
+func SubmitScript(cfg *config.Config, m Mode) string {
+	suffix := ""
+	if m.Preview {
+		suffix = "-preview"
+	}
 	r := strings.NewReplacer(
 		"@CI@", cfg.Project, "@REGION@", cfg.Region, "@APP@", cfg.AppProject, "@ZONE@", cfg.AppZone,
 		"@STATE@", cfg.Project+"-deploy-state", "@SOURCE@", cfg.Project+"-build-source",
-		"@GITEA@", cfg.GiteaURL, "@REPO@", cfg.GiteaRepo,
+		"@GITEA@", cfg.GiteaURL, "@REPO@", cfg.GiteaRepo, "@SUFFIX@", suffix,
 	)
 	return r.Replace(`set -euo pipefail
 sha=$$(cat /workspace/sha)
@@ -152,10 +165,11 @@ for p in infra image; do
     image:gated)   subs="$$subs,SHORT_SHA=$$short,_PUSH=true,_RELEASE=true,_APPROVED=true" ;;
     image:*)       subs="$$subs,SHORT_SHA=$$short,_PUSH=true,_RELEASE=true" ;;
   esac
-  echo "submitting cloudbuild/$$p.yaml as cb-$$p@ ($$subs)"
+  sa="cb-$$p@SUFFIX@"
+  echo "submitting cloudbuild/$$p.yaml as $$sa@ ($$subs)"
   gcloud builds submit /workspace/src --project=@CI@ --region=@REGION@ \
     --config=/workspace/src/cloudbuild/$$p.yaml \
-    --service-account=projects/@CI@/serviceAccounts/cb-$$p@@CI@.iam.gserviceaccount.com \
+    --service-account=projects/@CI@/serviceAccounts/$$sa@@CI@.iam.gserviceaccount.com \
     --gcs-source-staging-dir=gs://@SOURCE@/source \
     --substitutions="$$subs" \
     --tags="gitea-pipeline,pipeline-$$p,sha-$$short"
