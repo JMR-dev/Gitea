@@ -324,3 +324,56 @@ func TestOversizedBodyRefused(t *testing.T) {
 		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
 	}
 }
+
+func TestReleaseCodeNeedsDrills(t *testing.T) {
+	h, pub, st := newHook()
+	body := pushBody(t, func(p map[string]any) {
+		p["commits"] = []any{map[string]any{"id": "x", "modified": []any{"scripts/ops/vm-steps.sh"}}}
+	})
+	if rec := deliver(t, h, "push", body, sign); rec.Code != http.StatusNoContent || len(pub.got) != 0 {
+		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
+	}
+	var contexts []string
+	for _, s := range st.got {
+		contexts = append(contexts, s.Context+"="+s.State)
+	}
+	want := []string{"cloudbuild/deploy=success", "cloudbuild/drill-image-fail-verify=pending",
+		"cloudbuild/drill-image-fail-after-migrate=pending", "cloudbuild/drill-infra-fail-verify=pending"}
+	if !slices.Equal(contexts, want) {
+		t.Fatalf("statuses %v, want %v", contexts, want)
+	}
+}
+
+func TestDrillStatusesByPipeline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		paths    []string
+		complete bool
+		want     int
+	}{
+		{"image pipeline only", []string{"cloudbuild/image.yaml"}, true, 2},
+		{"infra deploy script", []string{"scripts/cicd/infra_deploy.py"}, true, 1},
+		{"shared engine", []string{"scripts/ops/gitea_ops.py"}, true, 3},
+		{"not release code", []string{"infra/main.go", "image/gitea/Dockerfile", "scripts/cicd/bootstrap.py"}, true, 0},
+		{"truncated", nil, false, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DrillStatuses("s", tc.paths, tc.complete); len(got) != tc.want {
+				t.Fatalf("got %d statuses %+v, want %d", len(got), got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeployStillPublishesWithDrillStatuses(t *testing.T) {
+	h, pub, st := newHook()
+	body := pushBody(t, func(p map[string]any) {
+		p["commits"] = []any{map[string]any{"id": "x", "modified": []any{"cloudbuild/infra.yaml"}}}
+	})
+	if rec := deliver(t, h, "push", body, sign); rec.Code != http.StatusAccepted || len(pub.got) != 1 {
+		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
+	}
+	if len(st.got) != 1 || st.got[0].Context != "cloudbuild/drill-infra-fail-verify" {
+		t.Fatalf("statuses %+v", st.got)
+	}
+}

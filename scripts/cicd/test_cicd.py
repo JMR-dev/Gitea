@@ -108,5 +108,23 @@ class Gate(unittest.TestCase):
         self.assertEqual(self.check(f"{p}fail-verifyx.json\n{p}fail-after-migrate-b2.json\n")[0], 1)
 
 
+class RelayAgrees(unittest.TestCase):
+    """cicd/relay flags the same files this gate hashes, for the same pipelines."""
+
+    def test_release_paths_match(self):
+        import re
+        src = open(os.path.join(G.ROOT, "cicd/relay/webhook.go")).read()
+        block = src[src.index("var ReleasePaths"):]
+        block = block[:block.index("\n}\n")]
+        relay = {}
+        for path, pls in re.findall(r'"([^"]+)":\s*\{([^}]*)\}', block):
+            relay[path] = {"image" if "Image" in x else "infra" for x in pls.split(",") if x.strip()}
+        gate = {}
+        for pl, files in G.FILES.items():
+            for f in files:
+                gate.setdefault(f, set()).add(pl)
+        self.assertEqual(relay, gate)
+
+
 if __name__ == "__main__":
     unittest.main()

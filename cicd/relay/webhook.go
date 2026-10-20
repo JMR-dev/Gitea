@@ -84,11 +84,7 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if d.msg == nil {
 		slog.Info("delivery ignored", "event", event, "delivery", delivery, "reason", d.reason)
-		if d.status != nil && h.Status != nil {
-			if err := h.Status.Post(r.Context(), *d.status); err != nil {
-				slog.Error("posting status", "error", err)
-			}
-		}
+		h.post(r, d.statuses)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -101,8 +97,21 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("published", "topic", d.msg.Topic, "attributes", d.msg.Attributes)
+	h.post(r, d.statuses)
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, "%s %s\n", d.msg.Attributes["mode"], d.msg.Attributes["pipelines"])
+}
+
+// post is best effort: a status that fails to post never fails a delivery.
+func (h *Webhook) post(r *http.Request, statuses []Status) {
+	if h.Status == nil {
+		return
+	}
+	for _, st := range statuses {
+		if err := h.Status.Post(r.Context(), st); err != nil {
+			slog.Error("posting status", "context", st.Context, "error", err)
+		}
+	}
 }
 
 // validSignature checks X-Gitea-Signature (hex HMAC-SHA256 of the raw body),
@@ -125,9 +134,9 @@ func validSignature(secret, body []byte, hdr http.Header) bool {
 }
 
 type decision struct {
-	msg    *Message
-	reason string
-	status *Status // posted when a delivery deliberately runs nothing
+	msg      *Message
+	reason   string
+	statuses []Status // posted whether or not anything is published
 }
 
 func (h *Webhook) decide(event string, body []byte) (decision, error) {
@@ -168,14 +177,15 @@ func (h *Webhook) decidePush(p pushPayload) decision {
 	}
 	paths, complete := p.paths()
 	mode, pipelines, why := Classify(paths, complete)
+	drills := DrillStatuses(p.After, paths, complete)
 	if len(pipelines) == 0 {
 		return decision{
 			reason: why,
-			status: &Status{SHA: p.After, Context: "cloudbuild/" + ModeDeploy, State: "success",
-				Description: "nothing to deploy: " + why},
+			statuses: append([]Status{{SHA: p.After, Context: "cloudbuild/" + ModeDeploy, State: "success",
+				Description: "nothing to deploy: " + why}}, drills...),
 		}
 	}
-	return decision{msg: &Message{
+	return decision{statuses: drills, msg: &Message{
 		Topic: h.Topics[mode],
 		Attributes: map[string]string{
 			"sha": p.After, "ref": "main", "pr": "",
@@ -252,6 +262,53 @@ func Classify(paths []string, complete bool) (mode string, pipelines []string, r
 	default:
 		return ModeDeploy, pipelines, ""
 	}
+}
+
+// ReleasePaths are the files whose code decides what a release or a rollback
+// does, by the pipeline that runs them. A change is live at the next release
+// -- the unattended weekly rebuild, once automation is on -- so it must pass
+// that pipeline's drills first, and scripts/cicd/release_gate.py refuses an
+// automatic run until it has. Keep in step with that script's FILES.
+var ReleasePaths = map[string][]string{
+	"cloudbuild/image.yaml":        {PipelineImage},
+	"cloudbuild/infra.yaml":        {PipelineInfra},
+	"scripts/cicd/infra_deploy.py": {PipelineInfra},
+	"scripts/cicd/release_gate.py": {PipelineImage, PipelineInfra},
+	"scripts/ops/gitea_ops.py":     {PipelineImage, PipelineInfra},
+	"scripts/ops/launch_job.py":    {PipelineImage, PipelineInfra},
+	"scripts/ops/vm-steps.sh":      {PipelineImage, PipelineInfra},
+}
+
+// Drills each pipeline's release code must pass (scripts/cicd/release_gate.py).
+var Drills = map[string][]string{
+	PipelineImage: {"fail-verify", "fail-after-migrate"},
+	PipelineInfra: {"fail-verify"},
+}
+
+// DrillStatuses marks a push that changed release code with one pending
+// status per drill it now needs, instead of letting a green "nothing to
+// deploy" suggest it is done. A passing drill build turns its own one green.
+func DrillStatuses(sha string, paths []string, complete bool) []Status {
+	need := map[string]bool{}
+	if !complete {
+		need[PipelineImage], need[PipelineInfra] = true, true
+	}
+	for _, p := range paths {
+		for _, pl := range ReleasePaths[p] {
+			need[pl] = true
+		}
+	}
+	var out []Status
+	for _, pl := range []string{PipelineImage, PipelineInfra} {
+		if !need[pl] {
+			continue
+		}
+		for _, d := range Drills[pl] {
+			out = append(out, Status{SHA: sha, Context: "cloudbuild/drill-" + pl + "-" + d, State: "pending",
+				Description: "release code changed: make ci-drill PIPELINE=" + pl + " NAME=" + d})
+		}
+	}
+	return out
 }
 
 // The parts of Gitea's webhook payloads (modules/structs/hook.go) read here.
