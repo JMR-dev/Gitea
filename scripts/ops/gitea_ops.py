@@ -55,6 +55,8 @@ SECRETS = [
 ]
 
 IMAGES = ("gitea", "caddy")
+# Printed on the VM right before a step runs; see Ops.vm.
+VM_MARK = "__GITEA_VM_STEP_OUTPUT__"
 VERSION_LABEL = "org.opencontainers.image.version"
 ALPINE_LABEL = "dev.jasonmross.alpine.minor"
 
@@ -106,18 +108,32 @@ class Ops:
     def gcloud(self, *args, **kw):
         return self.run(["gcloud", *args, f"--project={self.a.project}"], **kw)
 
+    def ensure_ssh_key(self):
+        """Create gcloud's SSH key up front, quietly. Otherwise the first
+        `gcloud compute ssh` in a fresh HOME (every Job pod has one) runs
+        ssh-keygen itself, and its "Generating public/private..." banner lands
+        on stdout -- where it was once read as a container digest."""
+        key = os.path.expanduser("~/.ssh/google_compute_engine")
+        if not os.path.exists(key):
+            os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+            self.run(["ssh-keygen", "-q", "-t", "rsa", "-b", "3072", "-N", "", "-C", "gitea-ops", "-f", key])
+
     def vm(self, step, *args, mutate=True):
-        """Run one vm-steps.sh step on the VM as root; returns its stdout."""
+        """Run one vm-steps.sh step on the VM as root; returns its stdout.
+
+        Only what the step prints after VM_MARK counts: anything gcloud, ssh
+        or the login shell writes to stdout before it is not the step's."""
         with open(VM_STEPS, "rb") as f:
             payload = base64.b64encode(f.read()).decode()
         remote = (
-            "t=$(mktemp) && echo " + payload + " | base64 -d > \"$t\" && "
+            "t=$(mktemp) && echo " + payload + " | base64 -d > \"$t\" && echo " + VM_MARK + " && "
             "sudo bash \"$t\" " + shlex.join([step, *args]) + "; rc=$?; rm -f \"$t\"; exit $rc"
         )
         if mutate and self.a.dry_run:
             log(f"DRY-RUN: vm-steps {shlex.join([step, *args])}")
             return ""
         log(f"vm: {shlex.join([step, *args])}")
+        self.ensure_ssh_key()
         r = subprocess.run(
             ["gcloud", "compute", "ssh", self.a.vm, f"--zone={self.a.zone}",
              f"--project={self.a.project}", "--tunnel-through-iap", "--quiet",
@@ -128,7 +144,10 @@ class Ops:
         sys.stderr.write(r.stderr)
         if r.returncode != 0:
             raise subprocess.CalledProcessError(r.returncode, ["vm-steps", step, *args], r.stdout, r.stderr)
-        return r.stdout.strip()
+        out = r.stdout
+        if VM_MARK not in out:
+            raise subprocess.CalledProcessError(1, ["vm-steps", step, *args], out, "no output marker from the VM")
+        return out.rsplit(VM_MARK, 1)[1].strip()
 
     def require_yes(self):
         if not (self.a.yes or self.a.dry_run):
