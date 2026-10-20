@@ -1,0 +1,9 @@
+name: gitea-cicd
+runtime:
+  name: go
+  options:
+    binary: ./gitea-cicd
+description: >-
+  CI/CD for Gitea itself, in a GCP project of its own: a Gitea webhook relay,
+  Pub/Sub, and Cloud Build triggers that deploy the app project. Applied
+  locally only -- it is the root of trust for everything that deploys.
