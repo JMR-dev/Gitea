@@ -20,7 +20,9 @@ Subcommands:
 
 Anything that changes something needs --yes; --dry-run prints what would run.
 Every backup and release writes a JSON manifest to
-gs://<backup-bucket>/config/<stamp>/manifest.json.
+gs://<backup-bucket>/config/<stamp>/manifest.json, once, when it finishes.
+A release also leaves progress-NN-<step>.json there after each step; if the
+engine dies, the newest one stands in for the manifest.
 
 Log lines starting GITEA_RELEASE_ROLLBACK, GITEA_RELEASE_ROLLBACK_FAILED and
 GITEA_RESTORE_DISK_LEFT_ATTACHED are alerting hooks; keep them stable.
@@ -153,8 +155,12 @@ class Ops:
         if not (self.a.yes or self.a.dry_run):
             raise Abort("this changes things: pass --yes (or --dry-run to see the plan)")
 
-    def save_manifest(self, *, quiet=False):
-        url = f"gs://{self.a.backup_bucket}/config/{self.stamp}/manifest.json"
+    def save_manifest(self, *, quiet=False, name="manifest.json"):
+        """Every write is a new object: the engine may create objects in the
+        backup bucket but not overwrite them (an overwrite needs
+        storage.objects.delete). So each run writes manifest.json once, with
+        its outcome, and each checkpoint gets a name of its own."""
+        url = f"gs://{self.a.backup_bucket}/config/{self.stamp}/{name}"
         body = json.dumps(self.manifest, indent=2, sort_keys=True)
         if not quiet:
             print(body)
@@ -164,13 +170,14 @@ class Ops:
             log(f"manifest: {url}")
 
     def checkpoint(self, step):
-        """Record progress in the manifest in GCS. If this process dies, the
-        manifest says how far it got -- and holds the previous digests and the
-        restore point a manual `rollback --manifest` needs."""
-        self.manifest.setdefault("progress", []).append(
-            {"step": step, "at": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
+        """Record progress in GCS, as progress-NN-<step>.json next to the
+        manifest. If this process dies, the newest one says how far it got --
+        and holds the previous digests and the restore point a manual
+        `rollback --manifest` needs."""
+        progress = self.manifest.setdefault("progress", [])
+        progress.append({"step": step, "at": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
         log(f"checkpoint: {step}")
-        self.save_manifest(quiet=True)
+        self.save_manifest(quiet=True, name=f"progress-{len(progress):02d}-{step}.json")
 
     # -- Artifact Registry --------------------------------------------------
 
@@ -542,14 +549,21 @@ def cmd_release(ops, a):
         except Exception as e:  # anything at all once prod is being changed
             log(f"GITEA_RELEASE_ROLLBACK path={path} reason={e!r}")
             m["failure"] = str(e)
-            ops.checkpoint("rolling-back")
+            # Bookkeeping must never stand between a failure and the rollback.
+            try:
+                ops.checkpoint("rolling-back")
+            except subprocess.CalledProcessError:
+                log("could not record the rolling-back checkpoint; rolling back anyway")
             m["outcome"] = rollback(ops, path, prev, prev_ver, snap, tool_image=gitea_ref)
             if a.drill == "fail-after-migrate":
                 marker = ops.vm("marker-check", ops.stamp, mutate=False)
                 m["drill"] = {"name": a.drill, "marker_after_restore": marker,
                               "passed": marker == "absent" and m["outcome"] == "rolled-back"}
                 log(f"DRILL {a.drill}: {'PASS' if m['drill']['passed'] else 'FAIL'} (marker {marker})")
-            ops.save_manifest()
+            try:
+                ops.save_manifest()
+            except subprocess.CalledProcessError:
+                log(f"could not write the manifest; outcome={m['outcome']}")
             sys.exit(1 if m["outcome"] == "rolled-back" else 2)
         finally:
             if timers_paused and not m.get("restore_disk_left_attached"):
@@ -790,7 +804,8 @@ def main():
     r.set_defaults(fn=cmd_release)
 
     rb = sub.add_parser("rollback", help="restore images (and optionally data) from a manifest")
-    rb.add_argument("--manifest", help="gs://.../manifest.json of the release to undo")
+    rb.add_argument("--manifest", help="gs://.../manifest.json of the release to undo "
+                    "(or its newest progress-*.json, if the engine died)")
     rb.add_argument("--gitea-digest")
     rb.add_argument("--caddy-digest")
     rb.add_argument("--expect-version")
@@ -802,7 +817,7 @@ def main():
 
     v = sub.add_parser("verify", help="run the status checks")
     v.add_argument("--expect-version")
-    v.add_argument("--manifest", help="gs://.../manifest.json of a release to check against")
+    v.add_argument("--manifest", help="gs://.../manifest.json (or a progress-*.json) of a release to check against")
     v.add_argument("--soak", type=int, default=0)
     v.set_defaults(fn=cmd_verify)
 

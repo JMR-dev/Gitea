@@ -298,9 +298,12 @@ and **never `:prod`**. Moving `:prod` is a release, and only
    logs `GITEA_RELEASE_ROLLBACK_FAILED` and exits 2. That is the case for the
    manual procedure below.
 
-Every run writes `gs://<project>-gitea-backups/config/<stamp>/manifest.json`,
-checkpointed after every step that changes something. `--dry-run` prints the
-plan without changing anything.
+Every run writes `gs://<project>-gitea-backups/config/<stamp>/manifest.json`
+once, when it finishes. A release also writes `progress-NN-<step>.json` there
+after every step that changes something: the engine's identity can create
+objects in the backup bucket but never overwrite or delete them, so each
+checkpoint is a new object. `--dry-run` prints the plan without changing
+anything.
 
 **Where it runs.** The rollback is code in the same process as the release.
 So the engine runs as a Kubernetes Job (`gitea-ops/gitea-ops`) on the runner
@@ -318,14 +321,15 @@ the cluster itself is broken. Keep the machine awake, and use tmux.
 **If the engine itself dies mid-release** (its node, an OOM, the 2-hour
 deadline):
 
-1. `make ops-status` and `make ops-logs` show the last step. The manifest's
-   `progress` list shows the same in GCS.
+1. `make ops-status` and `make ops-logs` show the last step. So does the
+   newest `progress-NN-<step>.json` in the run's `config/<stamp>/` folder, which
+   stands in for the `manifest.json` the run never got to write.
 2. Pausing the timers armed a dead man's switch on the VM. Three hours later it
    re-enables the auto-update and reboot timers and logs `DEADMAN` at crit
    (`journalctl -t gitea-ops`). It does **not** start Gitea, because that
    depends on how far a migration got. It leaves the timers paused if a restore
    disk is still attached.
-3. Finish by hand from the manifest: `make ops-rollback MANIFEST=<url>`, adding
+3. Finish by hand from it: `make ops-rollback MANIFEST=<that progress url>`, adding
    `RESTORE_DATA=1` if the progress got past `snapshotted`. Or, if it got to
    `started` and the checks look good, just re-enable the timers.
 
