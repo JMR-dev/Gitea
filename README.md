@@ -14,7 +14,7 @@ Engine VM, served at `gitea.jasonmross.dev`.
 | Database | SQLite in WAL mode on a dedicated persistent disk |
 | Firewall | nftables + fail2ban on the host, VPC firewall outside it |
 | IaC | Pulumi, Go, self-managed GCS state backend |
-| CI/CD | Cloud Build — push triggers plus a weekly rebuild |
+| CI/CD | Cloud Build in its own project (`cicd/`): Gitea webhook → relay → Pub/Sub triggers, with backups, checks and automatic rollback; off until its drills pass ([cicd.md](docs/cicd.md)) |
 | Gitea Actions | Optional runners on a dedicated GKE Standard cluster: a fixed on-demand base node for the runners, and each `ubuntu-*` job its own pod on autoscaled burst nodes; `runs-on: docker` gets rootless Docker-in-Docker — [docs/runners.md](docs/runners.md) |
 
 ## Layout
@@ -25,9 +25,12 @@ infra/        Pulumi program (Go). One package per slice of infrastructure;
 image/        Dockerfiles for the Gitea and Caddy images, plus pinned versions.
 vm/           Everything that lands on the VM: quadlets, systemd units,
               nftables, fail2ban, config templates, and bootstrap.sh.
+cicd/         CI/CD for this repo, in a GCP project of its own: Pulumi program
+              (Go) and the webhook relay functions (cicd/relay).
 cloudbuild/   The two build pipelines.
-scripts/      One-time project bootstrap.
-docs/         Runbook, WAF tuning guide, Actions runners, migration-to-Gitea-SCM plan.
+scripts/      One-time project bootstrap; ops/ is the release engine, cicd/ the
+              CI project's bootstrap, deploy script and release gate.
+docs/         Runbook, CI/CD, WAF tuning guide, Actions runners, migration-to-Gitea-SCM plan.
 ```
 
 `vm/` is uploaded to a GCS bucket by Pulumi and pulled down by the instance, so

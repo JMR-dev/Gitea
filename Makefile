@@ -27,7 +27,7 @@ fmt: ## Format Go sources
 # -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
 .PHONY: check
-check: ## Build and vet the Pulumi program, and syntax-check the shell scripts
+check: ci-check ## Build and vet both Pulumi programs and the relay, test them, and syntax-check the scripts
 	cd infra && go build -o gitea-infra . && go vet ./...
 	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
@@ -159,3 +159,81 @@ runners: ## Runner and job pods, disks, and recent runner logs (run `make kube` 
 	kubectl --context=$(KUBE_CONTEXT) -n gitea-jobs get pods -o wide
 	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner logs statefulset/gitea-runner --tail=30
 	kubectl --context=$(KUBE_CONTEXT) -n gitea-runner logs statefulset/gitea-runner-pods --tail=30
+
+# --- CI project (cicd/, docs/cicd.md) ------------------------------------------
+# Gitea's own CI/CD runs in a project of its own. Its stack is applied from here
+# only; the targets below never touch the app stack.
+
+CI_PROJECT ?= $(shell awk '/gcp:project:/ {print $$2}' cicd/Pulumi.prod.yaml 2>/dev/null)
+CI_STATE    = $(CI_PROJECT)-deploy-state
+CI_PASS     = PULUMI_CONFIG_PASSPHRASE="$$(gcloud secrets versions access latest \
+	--secret=pulumi-config-passphrase --project=$(CI_PROJECT))"
+
+.PHONY: ci-check
+ci-check: ## Build, vet and test the CI program, the relay and the CI scripts
+	cd cicd && go build -o gitea-cicd . && go vet ./... && go test ./pkg/...
+	cd cicd/relay && go vet ./... && go test ./...
+	python3 -m py_compile scripts/cicd/bootstrap.py scripts/cicd/infra_deploy.py scripts/cicd/release_gate.py
+	python3 -m unittest discover -s scripts/cicd
+
+.PHONY: ci-init
+ci-init: ## Log in to the CI stack's state bucket and create the stack (once, after bootstrap.py)
+	cd cicd && pulumi login gs://$(CI_PROJECT)-pulumi-state
+	cd cicd && ( pulumi stack select prod 2>/dev/null || $(CI_PASS) pulumi stack init prod --secrets-provider passphrase )
+
+.PHONY: ci-preview
+ci-preview: ci-check ## Show what `make ci-up` would change
+	cd cicd && $(CI_PASS) pulumi preview --stack prod --diff
+
+.PHONY: ci-up
+ci-up: ci-check ## Apply the CI stack (asks first)
+	cd cicd && $(CI_PASS) pulumi up --stack prod
+
+.PHONY: approve
+approve: ## List builds awaiting approval; BUILD=<id> approves one
+ifeq ($(BUILD),)
+	gcloud builds list --project=$(CI_PROJECT) --region=$(REGION) --filter='status=PENDING' \
+		--format='table(id,createTime.date(),substitutions._SHA,substitutions._PIPELINES,tags)'
+else
+	gcloud beta builds approve $(BUILD) --project=$(CI_PROJECT) --location=$(REGION)
+endif
+
+.PHONY: ci-rebuild
+ci-rebuild: ## Run the weekly rebuild now (does nothing while autoDeploy is off: the trigger is disabled)
+	gcloud scheduler jobs run weekly-rebuild --location=$(REGION) --project=$(CI_PROJECT)
+
+# Submits this checkout's pipeline as CI's own identity, as an approved build:
+# for the first deploy (there is no last-good yet) and for break-glass. The
+# tree must be clean, so what runs is exactly a commit.
+.PHONY: ci-infra-up
+ci-infra-up: ci-clean ## Deploy infra/ through the CI pipeline from this commit (approved)
+	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/infra.yaml \
+		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-infra@$(CI_PROJECT).iam.gserviceaccount.com \
+		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
+		--substitutions=_MODE=up,_APPROVED=true,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE) \
+		--tags=gitea-pipeline,pipeline-infra,sha-$$(git rev-parse --short=7 HEAD)
+
+# The greenlight drills (docs/cicd.md). Each runs the pipeline from this
+# checkout with a failure injected after a passing check; it passes only if
+# the rollback put prod back, and then records the release code's hash
+# (scripts/cicd/release_gate.py), which is what lets automation run that code.
+#   PIPELINE=image NAME=fail-verify         D3: image rollback (about 15 min)
+#   PIPELINE=image NAME=fail-after-migrate  D4: data restore (10-15 min DOWN; run it in a window)
+#   PIPELINE=infra NAME=fail-verify         D5: re-apply the last good commit
+PIPELINE ?= image
+NAME     ?= fail-verify
+.PHONY: ci-drill
+ci-drill: ci-clean ## Run drill NAME of PIPELINE through CI (see the comment above)
+	@case "$(PIPELINE):$(NAME)" in image:fail-verify|image:fail-after-migrate|infra:fail-verify) ;; \
+	  *) echo "no drill $(NAME) for $(PIPELINE)" >&2; exit 1 ;; esac
+	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/$(PIPELINE).yaml \
+		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-$(PIPELINE)@$(CI_PROJECT).iam.gserviceaccount.com \
+		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
+		--substitutions=_DRILL=$(NAME),_DRILL_OK=1,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE)$(if $(filter image,$(PIPELINE)),$(COMMA)_RELEASE=true$(COMMA)SHORT_SHA=$$(git rev-parse --short=7 HEAD),$(COMMA)_MODE=up) \
+		--tags=gitea-pipeline,pipeline-drill-$(PIPELINE)-$(NAME),sha-$$(git rev-parse --short=7 HEAD)
+
+COMMA := ,
+.PHONY: ci-clean
+ci-clean:
+	@git diff --quiet HEAD && test -z "$$(git status --porcelain --untracked-files=no)" \
+		|| { echo "commit (and push) first: CI runs exactly a commit" >&2; exit 1; }

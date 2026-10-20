@@ -1,0 +1,8 @@
+# What `gcloud builds submit` uploads -- make build, make ci-drill, make
+# ci-infra-up, and the CI launcher -- is the repo's content and nothing else.
+# Without this file gcloud would fall back to .gitignore alone, and a local
+# checkout's untracked files (editor and agent settings) would be uploaded.
+.gcloudignore
+.git/
+.claude/
+#!include:.gitignore
