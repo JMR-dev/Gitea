@@ -41,7 +41,7 @@ whose permissions have been proven for real.
 |---|---|---|
 | `cb-launcher` | every trigger's own build | submit builds as the two below, the source bucket |
 | `cb-infra` | `cloudbuild/infra.yaml` | the app project roles Pulumi needs (`cicd/pkg/identity`) |
-| `cb-image` | `cloudbuild/image.yaml` | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`) |
+| `cb-image` | `cloudbuild/image.yaml` | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`), read and add (never replace) drill passes |
 | `ci-relay`, `ci-status` | the two functions | their topics, the webhook secret and the status token |
 | `ci-status-push` | the push subscription | invoke `build-status`, nothing else |
 
@@ -187,9 +187,14 @@ a brief restart, and a success status on main.
    ```bash
    cd cicd && pulumi config set --secret gitea-cicd:operatorEmail <you>
    ```
-3. Put a Gitea token with `write:repository` into the status-token secret,
-   straight from the password manager. The functions won't deploy without a
-   version.
+3. Put a token into the status-token secret, straight from the password
+   manager. The functions won't deploy without a version.
+   - **Make it a bot user's token, not yours.** A Gitea 28 token's
+     `write:repository` scope covers every repo its user can write, and never
+     expires.
+   - So create a bot user (say `ci-status`), add it to `JMR-dev/Gitea` only,
+     as a collaborator with write access, and give its token
+     `write:repository` alone.
    ```bash
    gopass show -o <path> | gcloud secrets versions add gitea-ci-status-token \
      --project=gitea-ci-781388 --data-file=-

@@ -168,6 +168,18 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 	if err := bucketRole("infra-deploy-state", b.DeployState, "roles/storage.objectAdmin", member(a.Infra)); err != nil {
 		return nil, err
 	}
+	// The release gate: read which drills have passed, record a new pass.
+	// Create, not admin -- each pass is a new object (release_gate.py), so it
+	// can never overwrite or delete one, nor touch the infra lock. Viewer as
+	// well, because gcloud storage reads before it writes.
+	for name, role := range map[string]string{
+		"image-drills-reader": "roles/storage.objectViewer",
+		"image-drills-writer": "roles/storage.objectCreator",
+	} {
+		if err := bucketRole(name, b.DeployState, role, member(a.Image)); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := projectRole("fn-build-builder", cfg.Project, "roles/cloudbuild.builds.builder", member(a.FnBuild)); err != nil {
 		return nil, err

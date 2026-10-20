@@ -74,7 +74,9 @@ const FailureMarker = "GITEA_PIPELINE_FAILED"
 // for a build that is not ours or carries no commit.
 func StatusFor(b build) (Status, bool) {
 	sha := b.Substitutions["_SHA"]
-	if sha == "" {
+	if !isSHA(sha) {
+		// Also the weekly rebuild's launcher, whose _SHA is "main" until it
+		// clones; the builds it submits carry the real commit.
 		return Status{}, false
 	}
 	var ctxName string
@@ -125,6 +127,18 @@ func StatusFor(b build) (Status, bool) {
 	// "running" be told apart from a newer build (see BuildStatus.ServeHTTP).
 	s.Description = truncate(s.Description, 120) + " (build " + short + ")"
 	return s, true
+}
+
+func isSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
 }
 
 func rejected(b build) bool {

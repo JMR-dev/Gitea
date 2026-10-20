@@ -196,7 +196,7 @@ ifeq ($(BUILD),)
 	gcloud builds list --project=$(CI_PROJECT) --region=$(REGION) --filter='status=PENDING' \
 		--format='table(id,createTime.date(),substitutions._SHA,substitutions._PIPELINES,tags)'
 else
-	gcloud beta builds approve $(BUILD) --project=$(CI_PROJECT) --location=$(REGION)
+	gcloud beta builds approve projects/$(CI_PROJECT)/locations/$(REGION)/builds/$(BUILD)
 endif
 
 .PHONY: ci-rebuild

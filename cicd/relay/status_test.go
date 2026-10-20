@@ -10,6 +10,8 @@ import (
 	"testing"
 )
 
+const testSHA = "26de5015d2ded3c765a798d354b8a56abe0a98a7"
+
 func buildJSON(t *testing.T, b map[string]any) []byte {
 	t.Helper()
 	data, _ := json.Marshal(b)
@@ -49,12 +51,12 @@ func TestStatusFor(t *testing.T) {
 
 func TestStatusForLauncherAndApproval(t *testing.T) {
 	b := build{ID: "abc", Status: "PENDING",
-		Substitutions: map[string]string{"_SHA": "s", "_MODE": "gated"}, Tags: []string{TagLaunch}}
+		Substitutions: map[string]string{"_SHA": testSHA, "_MODE": "gated"}, Tags: []string{TagLaunch}}
 	s, ok := StatusFor(b)
 	if !ok || s.Context != "cloudbuild/gated" || s.State != "pending" || !strings.Contains(s.Description, "awaiting approval") {
 		t.Fatalf("got %+v", s)
 	}
-	raw := []byte(`{"id":"abc","status":"CANCELLED","substitutions":{"_SHA":"s","_MODE":"gated"},"tags":["gitea-launch"],
+	raw := []byte(`{"id":"abc","status":"CANCELLED","substitutions":{"_SHA":"` + testSHA + `","_MODE":"gated"},"tags":["gitea-launch"],
 		"approval":{"state":"REJECTED","result":{"decision":"REJECTED"}}}`)
 	_ = json.Unmarshal(raw, &b)
 	if s, _ := StatusFor(b); s.State != "error" || !strings.Contains(s.Description, "rejected") {
@@ -64,10 +66,12 @@ func TestStatusForLauncherAndApproval(t *testing.T) {
 
 func TestStatusForIgnoresForeignBuilds(t *testing.T) {
 	for name, b := range map[string]build{
-		"untagged":   {ID: "x", Status: "SUCCESS", Substitutions: map[string]string{"_SHA": "s"}},
-		"no sha":     {ID: "x", Status: "SUCCESS", Tags: []string{TagPipeline, "pipeline-image"}},
-		"functions":  {ID: "x", Status: "SUCCESS", Tags: []string{"gcp-cloud-functions"}},
-		"unknown st": {ID: "x", Status: "STATUS_UNKNOWN", Substitutions: map[string]string{"_SHA": "s"}, Tags: []string{TagLaunch}},
+		"untagged":            {ID: "x", Status: "SUCCESS", Substitutions: map[string]string{"_SHA": "s"}},
+		"no sha":              {ID: "x", Status: "SUCCESS", Tags: []string{TagPipeline, "pipeline-image"}},
+		"functions":           {ID: "x", Status: "SUCCESS", Tags: []string{"gcp-cloud-functions"}},
+		"unknown st":          {ID: "x", Status: "STATUS_UNKNOWN", Substitutions: map[string]string{"_SHA": testSHA}, Tags: []string{TagLaunch}},
+		"rebuild placeholder": {ID: "x", Status: "WORKING", Substitutions: map[string]string{"_SHA": "main", "_MODE": "rebuild"}, Tags: []string{TagLaunch}},
+		"short sha":           {ID: "x", Status: "SUCCESS", Substitutions: map[string]string{"_SHA": "26de501"}, Tags: []string{TagLaunch}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, ok := StatusFor(b); ok {
