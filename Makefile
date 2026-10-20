@@ -108,6 +108,35 @@ ops-rollback: ## Undo a release from its manifest (MANIFEST=...; RESTORE_DATA=1 
 ops-drill-restore: ## Prove the latest snapshot and dump restore, in isolation (TOOL_IMAGE=... before 28)
 	$(OPS) --yes drill-restore $(if $(TOOL_IMAGE),--tool-image $(TOOL_IMAGE))
 
+.PHONY: rollout
+rollout: ## Pull the latest :prod images onto the VM right now
+	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
+		--command 'sudo systemctl start podman-auto-update.service && sudo podman ps'
+
+.PHONY: sync
+sync: ## Re-render VM config from the bucket and restart what changed
+	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
+		--command 'sudo systemctl start gitea-config-sync.service && sudo journalctl -u gitea-config-sync -n 40 --no-pager'
+
+.PHONY: ssh
+ssh: ## Shell on the VM through IAP
+	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT)
+
+.PHONY: logs
+logs: ## Tail Gitea and Caddy logs
+	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
+		--command 'sudo journalctl -u gitea -u caddy -f'
+
+.PHONY: status
+status: ## Health summary from the VM
+	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
+		--command 'sudo systemctl status --no-pager gitea caddy nftables fail2ban; sudo podman ps; sudo systemctl list-timers --no-pager'
+
+.PHONY: backup
+backup: ## Take an on-demand Gitea dump to the backup bucket
+	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
+		--command 'sudo systemctl start gitea-backup.service && sudo journalctl -u gitea-backup -n 20 --no-pager'
+
 .PHONY: ops-logs
 ops-logs: ## Re-attach to the running (or last) release-engine Job's log
 	python3 scripts/ops/launch_job.py --project $(PROJECT) --zone $(ZONE) logs
