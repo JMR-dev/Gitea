@@ -1,4 +1,4 @@
-module gitea-cicd-relay
+module gitea.jasonmross.dev/cicd-relay
 
 go 1.26.0
 
