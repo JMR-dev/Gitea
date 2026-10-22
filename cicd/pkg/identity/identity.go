@@ -93,13 +93,25 @@ var infraRoles = []string{
 	"roles/logging.logWriter",
 }
 
-// InfraPreviewRoles is all cb-infra-preview gets on the app project. Viewer
-// covers what `pulumi preview` reads: the DNS zone and project lookups, the
-// cluster's endpoint and the objects in it (the Kubernetes provider falls back
-// to a client-side diff when its dry-run is refused). It excludes object
-// contents, secret values and Kubernetes Secrets. The two things a preview
-// also needs, the state and its passphrase, are granted on those alone.
-var InfraPreviewRoles = []string{"roles/viewer"}
+// InfraPreviewRoles is all cb-infra-preview gets project-wide on the app
+// project. `pulumi preview` on the infra stack runs with no --refresh
+// (scripts/cicd/infra_deploy.py), so it never live-reads the compute, cluster,
+// registry or secret resources -- it compares the program against the stack
+// state, which it reads from the state bucket (granted below). The only live
+// calls the program makes are two data-source lookups:
+//   - dns.LookupManagedZone  -> roles/dns.reader
+//   - organizations.LookupProject -> resourcemanager.projects.get, in roles/browser
+//
+// The Kubernetes provider connects as cb-infra-preview (which has no container
+// role), so its cluster calls are refused and it falls back to a client-side
+// diff; minting the exec-plugin token needs no cluster permission.
+//
+// Deliberately NOT roles/viewer: viewer makes the holder a `projectViewer:`
+// member, and every bucket carries an IAM binding granting projectViewer read
+// of its objects -- which would let a preview read the backups bucket (the
+// Gitea database and server secrets) and so, in effect, deploy. These two
+// read roles grant no object, secret or Kubernetes-Secret access.
+var InfraPreviewRoles = []string{"roles/dns.reader", "roles/browser"}
 
 // The app stack's state bucket and passphrase (scripts/bootstrap.sh).
 func appStateBucket(cfg *config.Config) string { return cfg.AppProject + "-pulumi-state" }
@@ -276,8 +288,11 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 		return nil, err
 	}
 
-	// A preview reads the state and decrypts its config; it never writes
-	// either. Pulumi's file backend takes no lock for a preview.
+	// Project-wide read for the two data-source lookups a preview makes (see
+	// InfraPreviewRoles). The state and passphrase it also needs are granted on
+	// those resources alone, just below -- they are load-bearing now that the
+	// project role is no longer roles/viewer. Pulumi's file backend takes no
+	// lock for a preview, and a preview never writes.
 	for _, role := range InfraPreviewRoles {
 		if err := projectRole("app-infra-preview-"+role, cfg.AppProject, role, member(a.InfraPreview)); err != nil {
 			return nil, err

@@ -206,8 +206,16 @@ func (h *Webhook) decidePR(p prPayload) decision {
 	if pr.Head.Repo.FullName != h.Repo {
 		return decision{reason: "head is in " + pr.Head.Repo.FullName}
 	}
+	// Both the author and the pusher must be allowed. A preview runs the head
+	// commit's code and pipeline file; on a synchronize the head is whatever
+	// the pusher (p.Sender) just pushed, which need not be the PR's author, so
+	// checking the author alone would let any repo writer preview their code on
+	// someone else's PR branch.
 	if !slices.Contains(h.Authors, pr.User.Login) {
 		return decision{reason: "author " + pr.User.Login + " is not allowed"}
+	}
+	if !slices.Contains(h.Authors, p.Sender.Login) {
+		return decision{reason: "pusher " + p.Sender.Login + " is not allowed"}
 	}
 	return decision{msg: &Message{
 		Topic: h.Topics[ModePreview],
@@ -356,6 +364,10 @@ type prPayload struct {
 		} `json:"head"`
 	} `json:"pull_request"`
 	Repository repoRef `json:"repository"`
+	// Sender is who delivered this event -- for a synchronize, the pusher.
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
 }
 
 var errNoSecret = errors.New("GITEA_WEBHOOK_SECRET is empty")

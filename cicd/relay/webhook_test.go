@@ -284,6 +284,10 @@ func TestPullRequestNoPreview(t *testing.T) {
 		"stranger": func(p map[string]any) {
 			p["pull_request"].(map[string]any)["user"] = map[string]any{"login": "mallory"}
 		},
+		// Allowed author, but a different (disallowed) account pushed the head.
+		"stranger-pusher": func(p map[string]any) {
+			p["sender"] = map[string]any{"login": "mallory"}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h, pub, _ := newHook()

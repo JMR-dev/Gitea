@@ -39,6 +39,18 @@ import time
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# The infra stack's Kubernetes provider authenticates to the runner cluster with
+# the gke-gcloud-auth-plugin exec plugin (infra/pkg/runner/runner.go), so both
+# `pulumi preview` and `pulumi up` must find it on PATH. The pinned pulumi image
+# ships it under the Cloud SDK's bin dir but does not put that dir on PATH, and
+# it lives in a different place on a workstation; prepend whichever exists.
+# Done here, not in cloudbuild/infra.yaml's step env, because a PATH set there
+# would replace the image's PATH wholesale.
+def ensure_auth_plugin_on_path():
+    for d in ("/usr/lib/google-cloud-sdk/bin", "/usr/lib64/google-cloud-sdk/bin"):
+        if os.path.isdir(d) and d not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
 # Replacing or deleting one of these is an outage or a data loss: approval.
 PROTECTED_TYPES = {
     "gcp:compute/instance:Instance",
@@ -338,6 +350,7 @@ def main():
     a = p.parse_args()
     if a.mode == "up" and not (a.sha and a.state_bucket):
         p.error("up needs --sha and --state-bucket (_SHA, _DEPLOY_STATE_BUCKET)")
+    ensure_auth_plugin_on_path()
     d = Deploy(a)
     try:
         sys.exit(d.preview() if a.mode == "preview" else d.up())

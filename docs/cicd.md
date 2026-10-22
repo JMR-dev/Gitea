@@ -43,7 +43,7 @@ whose permissions have been proven for real.
 | `cb-infra` | `cloudbuild/infra.yaml` for main | the app project roles Pulumi needs (`cicd/pkg/identity`) |
 | `cb-image` | `cloudbuild/image.yaml` for main | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`), read and add (never replace) drill passes |
 | `cb-launcher-preview` | the preview trigger's own build | submit builds as the two below **only**, the source bucket |
-| `cb-infra-preview` | a PR's `cloudbuild/infra.yaml` | `roles/viewer` on the app project, read the app stack's state, its passphrase, read drill passes |
+| `cb-infra-preview` | a PR's `cloudbuild/infra.yaml` | `roles/dns.reader` + `roles/browser` on the app project, read the app stack's state, its passphrase, read drill passes |
 | `cb-image-preview` | a PR's `cloudbuild/image.yaml` | logs and the source bucket; nothing in the app project |
 | `ci-relay`, `ci-status` | the two functions | their topics, the webhook secret and the status token |
 | `ci-status-push` | the push subscription | invoke `build-status`, nothing else |
@@ -58,16 +58,26 @@ that can't change prod:
   as `cb-infra` or `cb-image`.
 - `autoDeploy = false` doesn't pause previews, and doesn't need to.
 
-**Read-only isn't secret-free.** A preview has to decrypt the stack's config,
-so `cb-infra-preview` holds the app stack's passphrase:
-- A branch's preview can read every secret in that stack's config and state.
-  Today that is `gitea:fail2banIgnore`, plus the Kubernetes provider's access
-  token from the last `pulumi up`, which is valid for up to an hour after it.
-- It can also read the app project's configuration (`roles/viewer`), though not
-  object contents, secret values or Kubernetes Secrets.
+**Read-only isn't secret-free.** A preview has to decrypt the stack's config to
+diff it, so `cb-infra-preview` holds the app stack's passphrase and can read the
+state bucket:
+- It can read the stack's secrets. Today that is `gitea:fail2banIgnore` (the
+  operator's home IP, which also appears as the VM's `runner-egress-ip`
+  metadata in state). The Kubernetes provider no longer stores a credential:
+  its kubeconfig runs the `gke-gcloud-auth-plugin` exec plugin, which mints a
+  token from the *caller's* own credentials at connect time
+  (`infra/pkg/runner/runner.go`), so a reader of the state has no deployer token
+  to replay.
+- Project-wide it has only `roles/dns.reader` and `roles/browser`: the DNS zone,
+  and project and IAM metadata (role and member names). It can read no bucket
+  object, no secret value, no VM metadata and no Kubernetes Secret -- in
+  particular not the backups bucket, which holds the Gitea database and the
+  server secrets. (`roles/viewer` would have granted bucket-object read through
+  the `projectViewer:` convenience member, hence the narrower roles.)
 
-That is why the relay still previews only same-repo branches by
-`gitea-cicd:allowedAuthors`. Keep that list to people you'd trust with those.
+That is why the relay still previews only same-repo branches whose **author and
+pusher** are both in `gitea-cicd:allowedAuthors`. Keep that list to people you'd
+trust with the home IP.
 
 ## What deploys, and when
 
@@ -75,7 +85,7 @@ The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
 
 | Event | Runs | Approval |
 |---|---|---|
-| PR opened, synchronized or reopened (same repo, allowed author) | `pulumi preview`; image build without push | no |
+| PR opened, synchronized or reopened (same repo, allowed author **and** pusher) | `pulumi preview`; image build without push | no |
 | push to main touching `infra/`, `vm/`, `cloudbuild/infra.yaml` | infra deploy | no |
 | push to main touching `image/`, `cloudbuild/image.yaml` | image build and release | no |
 | push to main touching `image/gitea.version`, `image/alpine.version` or `vm/bootstrap.sh` | as above | **yes** (`make approve`) |
@@ -198,6 +208,13 @@ a brief restart, and a success status on main.
 
 ## First-time setup
 
+**Precondition.** The app stack must already carry the exec-plugin kubeconfig
+(`infra/pkg/runner/runner.go`, branch `fix-runner-kubeconfig-exec`), merged and
+applied with a `pulumi up`, *before* `make ci-up`. Until then the stack state
+holds a deployer access token, and `cb-infra-preview` — which reads the state
+and its passphrase — could replay it as a deployer. Confirm the applied state is
+token-free before creating the preview accounts.
+
 1. `scripts/cicd/bootstrap.py --yes`: project, billing link, state bucket,
    secrets. Done 2026-10-20 (`gitea-ci-781388`).
 2. Set the operator's address, as a secret:
@@ -211,7 +228,9 @@ a brief restart, and a success status on main.
      expires.
    - So create a bot user (say `ci-status`), add it to `JMR-dev/Gitea` only,
      as a collaborator with write access, and give its token
-     `write:repository` alone.
+     `write:repository` alone. The bot's write access can't be turned into a
+     preview of unreviewed code: the relay previews a PR only when both its
+     author and its pusher are in `allowedAuthors`, and the bot is neither.
    ```bash
    gopass show -o <path> | gcloud secrets versions add gitea-ci-status-token \
      --project=gitea-ci-781388 --data-file=-
@@ -260,11 +279,12 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   The source-less Pub/Sub trigger shape is allowed by gcloud's flag rules but
   is proven only at the first `make ci-up`.
 - A PR preview of runner (Kubernetes) changes can't do the server-side dry
-  run, which needs write rights. The Kubernetes provider falls back to a
-  client-side diff instead (pulumi-kubernetes v4, `Create` and `Update` on a
-  refused preview), so server-defaulted fields don't show. A local
-  `make preview` still does the full dry run. That the fallback covers every
-  object is proven only at the first PR preview.
+  run: the exec-plugin kubeconfig connects as `cb-infra-preview`, which holds no
+  `container` role, so the cluster refuses it. The Kubernetes provider falls
+  back to a client-side diff instead (pulumi-kubernetes v4, `Create` and
+  `Update` on a refused preview), so server-defaulted fields don't show. A local
+  `make preview` (run as you) still does the full dry run. That the fallback
+  covers every object is proven only at the first PR preview.
 - A wrong password or token on Gitea's REST API logs only a 401, so fail2ban
   can't see API guessing.
 
