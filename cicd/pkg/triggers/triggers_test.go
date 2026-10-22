@@ -59,7 +59,6 @@ func TestSubmitTargetsTheRightProjects(t *testing.T) {
 		for _, want := range []string{
 			"--project=gitea-ci-123456", "_APP_PROJECT=gitea-496920", "_DEPLOY_STATE_BUCKET=gitea-ci-123456-deploy-state",
 			"serviceAccounts/$$sa@gitea-ci-123456.iam.gserviceaccount.com", "gs://gitea-ci-123456-build-source/source",
-			"--tags=\"gitea-pipeline,pipeline-$$p,sha-$$short\"",
 		} {
 			if !strings.Contains(s, want) {
 				t.Errorf("%s: submit script lacks %q", m.Name, want)

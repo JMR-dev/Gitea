@@ -13,10 +13,11 @@ import (
 	"time"
 )
 
-// Tags the pipeline puts on its builds (package triggers in cicd/, and the
-// launcher's `gcloud builds submit --tags`). Builds without one are not ours
-// -- a Cloud Run functions deploy builds in this project too -- and are
-// ignored.
+// Tags the pipeline puts on its builds: the trigger's own build is tagged by
+// the trigger (package triggers in cicd/), and each submitted pipeline build by
+// its cloudbuild/<pipeline>.yaml `tags:` field (gcloud builds submit has no tag
+// flag). Builds without one are not ours -- a Cloud Run functions deploy builds
+// in this project too -- and are ignored.
 const (
 	TagLaunch   = "gitea-launch"   // the trigger's own build: clones and submits
 	TagPipeline = "gitea-pipeline" // a cloudbuild/<pipeline>.yaml build it submitted

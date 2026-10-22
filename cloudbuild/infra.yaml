@@ -10,6 +10,11 @@
 # _MODE=preview (pull requests) builds and previews and changes nothing.
 # _MODE=up deploys; the CI launcher (cicd/pkg/triggers) sets it for main.
 
+# build-status (cicd/relay) keys the Gitea commit status's context on these:
+# pipeline-infra -> "cloudbuild/infra". gcloud builds submit has no tag flag, so
+# they live here, not on the launcher's submit command (cicd/pkg/triggers).
+tags: [gitea-pipeline, pipeline-infra]
+
 substitutions:
   _REGION: us-east1
   _ZONE: us-east1-b

@@ -167,12 +167,14 @@ for p in infra image; do
   esac
   sa="cb-$$p@SUFFIX@"
   echo "submitting cloudbuild/$$p.yaml as $$sa@ ($$subs)"
+  # The build's tags (gitea-pipeline, pipeline-<p>) come from the config file
+  # itself -- gcloud builds submit has no flag for them -- and build-status
+  # keys the commit status's context on them (cicd/relay/status.go).
   gcloud builds submit /workspace/src --project=@CI@ --region=@REGION@ \
     --config=/workspace/src/cloudbuild/$$p.yaml \
     --service-account=projects/@CI@/serviceAccounts/$$sa@@CI@.iam.gserviceaccount.com \
     --gcs-source-staging-dir=gs://@SOURCE@/source \
-    --substitutions="$$subs" \
-    --tags="gitea-pipeline,pipeline-$$p,sha-$$short"
+    --substitutions="$$subs"
   ran=$$((ran + 1))
 done
 [ "$$ran" -gt 0 ] || { echo "no known pipeline in _PIPELINES=${_PIPELINES}" >&2; exit 1; }

@@ -23,6 +23,11 @@
 # resolves the newest stable release of that major and builds it. The stage-1
 # GPG check in image/gitea/Dockerfile is what authenticates that version.
 
+# build-status (cicd/relay) keys the Gitea commit status's context on these:
+# pipeline-image -> "cloudbuild/image". gcloud builds submit has no tag flag, so
+# they live here, not on the launcher's submit command (cicd/pkg/triggers).
+tags: [gitea-pipeline, pipeline-image]
+
 substitutions:
   _REGION: us-east1
   _ZONE: us-east1-b
