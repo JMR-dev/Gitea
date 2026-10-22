@@ -290,6 +290,23 @@ gcloud compute instances reset gitea-vm --zone <zone>
 
 ## Common operations
 
+### Local Pulumi needs the GKE auth plugin
+
+The app stack's runner cluster is reached through a `gke-gcloud-auth-plugin`
+exec stanza in its kubeconfig (`infra/pkg/runner/runner.go`), so `make preview`
+and `make up` fail to build the Kubernetes provider unless that plugin is on
+PATH. Install it once:
+
+```bash
+sudo dnf install google-cloud-cli-gke-gcloud-auth-plugin
+command -v gke-gcloud-auth-plugin   # confirm it is on PATH
+```
+
+In Cloud Build the pinned `pulumi/pulumi` image already ships it, and
+`scripts/cicd/infra_deploy.py` puts the SDK bin dir on PATH. The plugin mints a
+token from the caller's own credentials at connect time; no token is stored in
+the stack state.
+
 ### Releases: how an image goes live
 
 A build (`make build`, or the pipeline) pushes `:$SHORT_SHA` and a version tag
