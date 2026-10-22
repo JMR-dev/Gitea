@@ -39,12 +39,17 @@ options:
   # A user-specified service account cannot write to the legacy default log
   # bucket.
   logging: CLOUD_LOGGING_ONLY
-  # Compiling the program against pulumi-gcp needs the memory; the default
-  # pool has no high-memory types.
-  machineType: E2_HIGHCPU_32
+  # Compiling the program against pulumi-gcp is memory-hungry. The public
+  # (default) build pool caps a build at 10 concurrent CPUs and offers no
+  # high-memory types, so E2_HIGHCPU_8 (8 vCPU / 8 GB) is the most RAM available
+  # here without a quota increase or a private pool.
+  machineType: E2_HIGHCPU_8
   # Every substitution is also an environment variable, which is how
   # infra_deploy.py reads them.
   automapSubstitutions: true
+  # gcloud builds submit is strict: the declared substitutions reach
+  # infra_deploy.py via env (automap), not ${} refs, so allow the loose match.
+  substitutionOption: ALLOW_LOOSE
 
 # Waiting for the lock (45 min), a deploy that creates the runner cluster
 # (about 20 min), and a rollback that re-applies.
@@ -66,3 +71,9 @@ steps:
     env:
       - GITEA_DRILL_OK=${_DRILL_OK}
       - COMMIT_SHA=${_SHA}
+      # Compiling pulumi-gcp from a cold cache is memory-heavy. The public build
+      # pool caps a build at 10 CPUs, so the most RAM here is E2_HIGHCPU_8's
+      # 8 GB. Compile one package at a time (-p=1) and GC aggressively (GOGC=30)
+      # to keep the peak under 8 GB instead of thrashing into swap.
+      - GOFLAGS=-p=1
+      - GOGC=30
