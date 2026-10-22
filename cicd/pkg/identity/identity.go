@@ -298,10 +298,18 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 			return nil, err
 		}
 	}
-	if _, err := storage.NewBucketIAMMember(ctx, "app-infra-preview-state-reader", &storage.BucketIAMMemberArgs{
-		Bucket: pulumi.String(appStateBucket(cfg)), Role: pulumi.String("roles/storage.objectViewer"), Member: member(a.InfraPreview),
-	}, opts); err != nil {
-		return nil, err
+	// objectViewer reads the state object; legacyBucketReader adds the
+	// storage.buckets.get that `pulumi login gs://...` makes when it validates
+	// the backend bucket. Bucket metadata only -- no object contents, no IAM
+	// policy. Granted explicitly to this account: the GCS default that used to
+	// supply it (projectViewer: legacyBucketReader) was removed from this bucket
+	// as a hardening, and cb-infra-preview no longer holds roles/viewer.
+	for _, r := range []string{"roles/storage.objectViewer", "roles/storage.legacyBucketReader"} {
+		if _, err := storage.NewBucketIAMMember(ctx, "app-infra-preview-"+r, &storage.BucketIAMMemberArgs{
+			Bucket: pulumi.String(appStateBucket(cfg)), Role: pulumi.String(r), Member: member(a.InfraPreview),
+		}, opts); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := secretmanager.NewSecretIamMember(ctx, "app-infra-preview-passphrase", &secretmanager.SecretIamMemberArgs{
 		Project: pulumi.String(cfg.AppProject), SecretId: pulumi.String(appPassphrase),

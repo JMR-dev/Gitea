@@ -212,8 +212,14 @@ a brief restart, and a success status on main.
 (`infra/pkg/runner/runner.go`, branch `fix-runner-kubeconfig-exec`), merged and
 applied with a `pulumi up`, *before* `make ci-up`. Until then the stack state
 holds a deployer access token, and `cb-infra-preview` — which reads the state
-and its passphrase — could replay it as a deployer. Confirm the applied state is
-token-free before creating the preview accounts.
+and its passphrase — could replay it as a deployer. (That branch also needs the
+`gke-gcloud-auth-plugin` on PATH wherever `make preview`/`make up` runs: install
+`google-cloud-cli-gke-gcloud-auth-plugin` on the workstation **before merging**,
+or local deploys break.) Confirm the applied state is token-free before creating
+the preview accounts: after the `up`, `make preview` shows **no changes** (the
+exec kubeconfig ends the per-run token drift that previously showed one update),
+and the state's `pulumi:providers:kubernetes gitea-runners` no longer has a
+secret `inputs.kubeconfig`.
 
 1. `scripts/cicd/bootstrap.py --yes`: project, billing link, state bucket,
    secrets. Done 2026-10-20 (`gitea-ci-781388`).
