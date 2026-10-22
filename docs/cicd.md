@@ -287,6 +287,14 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   covers every object is proven only at the first PR preview.
 - A wrong password or token on Gitea's REST API logs only a 401, so fail2ban
   can't see API guessing.
+- The `gitea-backups`, `gitea-config` and `gitea-496920-pulumi-state` buckets had
+  GCS's default `projectViewer:` read bindings (`storage.legacyObjectReader` /
+  `legacyBucketReader`), which would let anyone with project Viewer read their
+  objects. Removed by hand on 2026-10-21 so a project-Viewer grant can't become
+  a path to the backups (the Gitea database and server secrets); legitimate
+  access is per-service-account. GCS may re-add them if a bucket is recreated,
+  so re-check after any bucket replacement. To reverse:
+  `gcloud storage buckets add-iam-policy-binding gs://<b> --member=projectViewer:gitea-496920 --role=roles/storage.legacyObjectReader`.
 
 ## Drill log
 
