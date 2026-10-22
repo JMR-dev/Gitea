@@ -349,43 +349,47 @@ func rule(resource string, verbs ...string) *rbacv1.PolicyRuleArgs {
 	}
 }
 
-// provider builds a Kubernetes provider for the cluster from a bearer token,
-// because the pulumi/pulumi-go image Cloud Build runs `pulumi up` in has no
-// gcloud and no gke-gcloud-auth-plugin to exec.
+// provider builds a Kubernetes provider for the cluster. The kubeconfig carries
+// no credential: it names the gke-gcloud-auth-plugin exec plugin, which mints a
+// short-lived token from the caller's own application-default credentials each
+// time Pulumi connects. So the acting identity is whoever runs Pulumi -- cb-infra
+// on a deploy, cb-infra-preview on a pull-request preview -- and no token sits in
+// state for a reader of the state to replay as a deployer. The pinned
+// pulumi/pulumi image ships the plugin, and scripts/cicd/infra_deploy.py puts the
+// SDK bin dir on PATH; a workstation needs google-cloud-cli-gke-gcloud-auth-plugin.
 func provider(ctx *pulumi.Context, gk *gke.Cluster) (*kubernetes.Provider, error) {
-	// The output form, with a dependency on the cluster, so the token is
-	// fetched after the cluster exists -- a token fetched at program start can
-	// be within minutes of expiry by the time a ten-minute cluster create
-	// finishes. Deliberately NOT on the node pool: a pool replacement would make
-	// the kubeconfig unknown at preview, which replaces the provider and with it
-	// every object in the cluster.
-	token := organizations.GetClientConfigOutput(ctx, pulumi.DependsOn([]pulumi.Resource{gk.Cluster})).AccessToken()
+	// Only the cluster's endpoint is needed, read from its own output (from
+	// state at preview). No token is fetched, so the provider no longer depends
+	// on a live GetClientConfig call; the plugin resolves the identity at
+	// connect time instead.
 	endpoint := gk.Cluster.ControlPlaneEndpointsConfig.DnsEndpointConfig().Endpoint()
 
-	kubeconfig := pulumi.All(endpoint, token).ApplyT(func(args []interface{}) (string, error) {
-		ep, _ := args[0].(*string)
+	kubeconfig := endpoint.ApplyT(func(ep *string) (string, error) {
 		if ep == nil || *ep == "" {
 			return "", errors.New("cluster has no DNS endpoint -- check controlPlaneEndpointsConfig")
 		}
-		tok, _ := args[1].(string)
-		return kubeconfigJSON(*ep, tok)
+		return kubeconfigJSON(*ep)
 	}).(pulumi.StringOutput)
 
 	return kubernetes.NewProvider(ctx, "gitea-runners", &kubernetes.ProviderArgs{
-		// ToSecret: the provider schema does not mark kubeconfig as secret, so
-		// without this the token would sit in state in plain text.
-		Kubeconfig: pulumi.ToSecret(kubeconfig).(pulumi.StringOutput),
+		// No ToSecret: the kubeconfig holds only the public endpoint and an exec
+		// plugin name, no credential. Relative to the token-based kubeconfig
+		// stored before, only the users[0].user block differs (an exec stanza in
+		// place of the bearer token), so Pulumi treats the switch as an update,
+		// not a replacement of the provider and every object under it.
+		Kubeconfig: kubeconfig,
 		// DeleteUnreachable is deliberately left unset. With it on, a refresh
-		// against a stale token in state reads as "cluster unreachable" and
+		// that cannot reach the cluster reads as "cluster unreachable" and
 		// silently drops every object from state; the next `up` then fails
 		// with "already exists". DeletedWith covers the legitimate case.
 	})
 }
 
-// kubeconfigJSON renders a kubeconfig. JSON is valid YAML, so no YAML library is
-// needed. There is no certificate-authority-data: the DNS endpoint presents a
-// certificate from a public CA.
-func kubeconfigJSON(endpoint, token string) (string, error) {
+// kubeconfigJSON renders a kubeconfig whose user authenticates by running the
+// gke-gcloud-auth-plugin exec plugin at connect time. JSON is valid YAML, so no
+// YAML library is needed. There is no certificate-authority-data: the DNS
+// endpoint presents a certificate from a public CA.
+func kubeconfigJSON(endpoint string) (string, error) {
 	server := "https://" + strings.TrimPrefix(endpoint, "https://")
 	kc := map[string]interface{}{
 		"apiVersion":      "v1",
@@ -401,7 +405,18 @@ func kubeconfigJSON(endpoint, token string) (string, error) {
 		}},
 		"users": []map[string]interface{}{{
 			"name": "pulumi",
-			"user": map[string]interface{}{"token": token},
+			// The plugin returns a bearer token derived from the caller's ADC
+			// and makes no GKE API call, so minting one needs no cluster
+			// permission. A bare command name, not an absolute path: the plugin
+			// lives in a different directory in the image and on a workstation.
+			"user": map[string]interface{}{
+				"exec": map[string]interface{}{
+					"apiVersion":         "client.authentication.k8s.io/v1beta1",
+					"command":            "gke-gcloud-auth-plugin",
+					"provideClusterInfo": false,
+					"interactiveMode":    "Never",
+				},
+			},
 		}},
 	}
 	b, err := json.Marshal(kc)
