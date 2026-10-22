@@ -205,14 +205,16 @@ ci-rebuild: ## Run the weekly rebuild now (does nothing while autoDeploy is off:
 
 # Submits this checkout's pipeline as CI's own identity, as an approved build:
 # for the first deploy (there is no last-good yet) and for break-glass. The
-# tree must be clean, so what runs is exactly a commit.
+# tree must be clean, so what runs is exactly a commit. The build's tags
+# (gitea-pipeline, pipeline-infra) come from cloudbuild/infra.yaml itself:
+# `gcloud builds submit --config` has no build-tags flag, and build-status
+# keys the commit status off them (cicd/relay/status.go). _SHA is the commit.
 .PHONY: ci-infra-up
 ci-infra-up: ci-clean ## Deploy infra/ through the CI pipeline from this commit (approved)
 	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/infra.yaml \
 		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-infra@$(CI_PROJECT).iam.gserviceaccount.com \
 		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
-		--substitutions=_MODE=up,_APPROVED=true,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE) \
-		--tags=gitea-pipeline,pipeline-infra,sha-$$(git rev-parse --short=7 HEAD)
+		--substitutions=_MODE=up,_APPROVED=true,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE)
 
 # The greenlight drills (docs/cicd.md). Each runs the pipeline from this
 # checkout with a failure injected after a passing check; it passes only if
@@ -230,8 +232,7 @@ ci-drill: ci-clean ## Run drill NAME of PIPELINE through CI (see the comment abo
 	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/$(PIPELINE).yaml \
 		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-$(PIPELINE)@$(CI_PROJECT).iam.gserviceaccount.com \
 		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
-		--substitutions=_DRILL=$(NAME),_DRILL_OK=1,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE)$(if $(filter image,$(PIPELINE)),$(COMMA)_RELEASE=true$(COMMA)SHORT_SHA=$$(git rev-parse --short=7 HEAD),$(COMMA)_MODE=up) \
-		--tags=gitea-pipeline,pipeline-drill-$(PIPELINE)-$(NAME),sha-$$(git rev-parse --short=7 HEAD)
+		--substitutions=_DRILL=$(NAME),_DRILL_OK=1,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE)$(if $(filter image,$(PIPELINE)),$(COMMA)_RELEASE=true$(COMMA)SHORT_SHA=$$(git rev-parse --short=7 HEAD),$(COMMA)_MODE=up)
 
 COMMA := ,
 .PHONY: ci-clean
