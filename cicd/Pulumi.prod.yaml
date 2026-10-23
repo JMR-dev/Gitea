@@ -2,4 +2,5 @@ config:
   gcp:project: gitea-ci-781388
   gitea-cicd:operatorEmail:
     secure: v1:besKx2rc6+y/sl8H:Gw246eSEXqZhskpw4oVUdutwBq4NW6eO5pOrBBNtruYzqjAS7Kdv
+  gitea-cicd:autoDeploy: "true"
 encryptionsalt: v1:Zo+Jp87wgqg=:v1:EQH4T8jJqY4LDtc5:FJNdXjUE8hfQogim2WHhjRXtYHrnNg==
