@@ -301,9 +301,26 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   access is per-service-account. GCS may re-add them if a bucket is recreated,
   so re-check after any bucket replacement. To reverse:
   `gcloud storage buckets add-iam-policy-binding gs://<b> --member=projectViewer:gitea-496920 --role=roles/storage.legacyObjectReader`.
+- Cold builds are slow on the public pool, which has no build cache: each infra
+  build recompiles the program against pulumi-gcp (about 10 min, and the pool
+  caps a build at 10 CPUs with no high-memory type -- hence `E2_HIGHCPU_8` and
+  the constrained Go compile in `cloudbuild/infra.yaml`), and each image build
+  re-pulls the bases and rebuilds Caddy with xcaddy. Follow-up, not yet done:
+  seed a cache -- BuildKit inline cache plus `--cache-from` on the image builds,
+  so an unchanged weekly rebuild reuses the Caddy/apk layers, and a prebuilt
+  builder image (or a GCS-backed Go module/build cache) for the infra compile.
+  Left to its own PR: it changes the deploy-critical build path and needs real
+  build-timing validation before it ships.
 
 ## Drill log
 
 | Date | Drill | Commit | Build | Result |
 |---|---|---|---|---|
 | 2026-10-20 | D2 (by hand, pre-28) | 4a30834 | Job `gitea-ops` | PASS: 1 user / 96 repos from snapshot and dump |
+| 2026-10-23 | First CI infra deploy (`make ci-infra-up`) | cbb9f7f | `145921a9` | SUCCESS: backup Job as cb-infra, no-op `pulumi up` (128 unchanged), verify; `infra-last-good` set |
+| 2026-10-23 | D1 backup | cbb9f7f | `145921a9` | PASS: dump + snapshot READY + manifest/exports present (part of the deploy above) |
+| 2026-10-23 | D5 infra fail-verify | cbb9f7f | `90ed3e4f` | PASS: injected failure after verify, re-applied last-good, rolled back clean |
+| 2026-10-23 | D3 image fail-verify (Path A) | cbb9f7f | `3386449e` | PASS: built+promoted, rolled back to `:previous` |
+| 2026-10-23 | D4 image fail-after-migrate (Path B) | cbb9f7f | `51c9bbbc` | PASS: consistent snapshot, data restored, drill marker absent |
+| 2026-10-23 | D6 alerting | cbb9f7f | D3–D5 | PASS: three "rolled back automatically" e-mails delivered to the operator |
+| 2026-10-23 | Weekly rebuild (real, go-live validation) | cbb9f7f | `cdd26dc5` | SUCCESS: automated Path A release, prod on gitea `sha256:4b25d9c0…`, `:last-good` moved |

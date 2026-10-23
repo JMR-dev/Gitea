@@ -85,9 +85,12 @@ steps:
       - _DRILL=${_DRILL}
       # launch_job.py annotates the engine Job with the commit (the engine
       # reads COMMIT_SHA); GITEA_DRILL_OK is the flag the engine refuses to run
-      # a --drill without, set only by `make ci-drill` (_DRILL_OK=1).
+      # a --drill without, set only by `make ci-drill` (_DRILL_OK=1). BUILD_ID
+      # is a Cloud Build built-in that infra_deploy.py records in the manifest
+      # and the drill attestation; without it the attestation name is "-local".
       - COMMIT_SHA=${_SHA}
       - GITEA_DRILL_OK=${_DRILL_OK}
+      - BUILD_ID=${BUILD_ID}
       # Compiling pulumi-gcp from a cold cache is memory-heavy. The public build
       # pool caps a build at 10 CPUs, so the most RAM here is E2_HIGHCPU_8's
       # 8 GB. Compile one package at a time (-p=1) and GC aggressively (GOGC=30)

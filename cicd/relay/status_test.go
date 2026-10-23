@@ -64,6 +64,35 @@ func TestStatusForLauncherAndApproval(t *testing.T) {
 	}
 }
 
+// A drill build must report under the same context the relay's reminder
+// (DrillStatuses) uses, so a passing drill clears its own pending status
+// instead of leaving the commit yellow forever.
+func TestStatusForDrillMatchesReminder(t *testing.T) {
+	for _, tc := range []struct{ pipeline, drill string }{
+		{PipelineInfra, "fail-verify"},
+		{PipelineImage, "fail-verify"},
+		{PipelineImage, "fail-after-migrate"},
+	} {
+		b := build{ID: "abc", Status: "SUCCESS", Tags: []string{TagPipeline, PipelineTagPrefix + tc.pipeline},
+			Substitutions: map[string]string{"_SHA": testSHA, "_DRILL": tc.drill}}
+		s, ok := StatusFor(b)
+		want := "cloudbuild/drill-" + tc.pipeline + "-" + tc.drill
+		if !ok || s.Context != want || s.State != "success" {
+			t.Fatalf("%s/%s: got %+v, want context %q success", tc.pipeline, tc.drill, s, want)
+		}
+		// The reminder the relay posts for this pipeline must include that context.
+		found := false
+		for _, r := range DrillStatuses(testSHA, []string{"cloudbuild/" + tc.pipeline + ".yaml"}, true) {
+			if r.Context == s.Context {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s/%s: drill context %q matches no DrillStatuses reminder", tc.pipeline, tc.drill, s.Context)
+		}
+	}
+}
+
 func TestStatusForIgnoresForeignBuilds(t *testing.T) {
 	for name, b := range map[string]build{
 		"untagged":            {ID: "x", Status: "SUCCESS", Substitutions: map[string]string{"_SHA": "s"}},

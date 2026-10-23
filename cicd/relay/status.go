@@ -80,7 +80,7 @@ func StatusFor(b build) (Status, bool) {
 		// clones; the builds it submits carry the real commit.
 		return Status{}, false
 	}
-	var ctxName string
+	var ctxName, pipeline string
 	for _, t := range b.Tags {
 		switch {
 		case t == TagLaunch:
@@ -88,8 +88,18 @@ func StatusFor(b build) (Status, bool) {
 				ctxName = "cloudbuild/" + b.Substitutions["_MODE"]
 			}
 		case strings.HasPrefix(t, PipelineTagPrefix):
-			ctxName = "cloudbuild/" + strings.TrimPrefix(t, PipelineTagPrefix)
+			pipeline = strings.TrimPrefix(t, PipelineTagPrefix)
+			ctxName = "cloudbuild/" + pipeline
 		}
+	}
+	// A drill build (`make ci-drill` sets _DRILL) reports under the drill's own
+	// context, cloudbuild/drill-<pipeline>-<drill>, so a passing drill clears
+	// the pending reminder the relay posted for it (DrillStatuses) rather than
+	// masquerading as a real pipeline pass on the commit. The pipeline build
+	// carries the same `tags:` whether or not it is a drill; _DRILL is what
+	// tells them apart (gcloud builds submit cannot set a per-run tag).
+	if drill := b.Substitutions["_DRILL"]; drill != "" && pipeline != "" {
+		ctxName = "cloudbuild/drill-" + pipeline + "-" + drill
 	}
 	if ctxName == "" || ctxName == "cloudbuild/" {
 		return Status{}, false
