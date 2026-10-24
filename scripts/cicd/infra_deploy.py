@@ -67,6 +67,7 @@ DESTRUCTIVE_OPS = {"replace", "create-replacement", "delete-replaced", "delete",
 LOCK_WAIT = 45 * 60
 LOCK_STALE = 4 * 3600
 GO_CACHE_PREFIX = "infra-go-cache-"
+SSH_KEY_TTL = "1h"  # as scripts/ops/gitea_ops.py: the sync's OS Login key
 
 
 def log(msg):
@@ -157,6 +158,7 @@ class Deploy:
         self.go_cache_hit = False    # restored exactly that object
         self.go_cache_saved = False
         self.ops_warm = None         # (kube, pod path) while the warm-up pod exists
+        self.ssh_pruned = False
 
     # --- Pulumi ---------------------------------------------------------------
 
@@ -413,9 +415,32 @@ class Deploy:
             raise Failed(f"gitea_ops.py {engine_args[-1] if engine_args else ''} failed (exit {r.returncode})")
 
     def sync(self):
+        self.prune_ssh_keys()
         run(["gcloud", "compute", "ssh", self.a.vm, f"--zone={self.a.zone}", f"--project={self.a.app_project}",
-             "--tunnel-through-iap", "--quiet", "--command",
+             "--tunnel-through-iap", "--quiet", f"--ssh-key-expire-after={SSH_KEY_TTL}", "--command",
              "sudo systemctl start gitea-config-sync.service && sudo journalctl -u gitea-config-sync -n 40 --no-pager"])
+
+    def prune_ssh_keys(self):
+        """Every build has a fresh HOME, so the sync's SSH registers a new OS
+        Login key each run; before SSH_KEY_TTL they never expired and piled up
+        on cb-infra's profile until the VM would refuse them. Clear the stale
+        ones once a run, by the engine's rule (gitea_ops.stale_ssh_keys). Only
+        one infra deploy runs at a time (the lock). Best-effort, like the cache."""
+        if self.ssh_pruned:
+            return
+        self.ssh_pruned = True
+        try:
+            if os.path.join(ROOT, "scripts", "ops") not in sys.path:
+                sys.path.insert(0, os.path.join(ROOT, "scripts", "ops"))
+            import gitea_ops
+            r = run(["gcloud", "compute", "os-login", "ssh-keys", "list", "--format=json"], check=False, capture=True)
+            keys = json.loads(r.stdout or "[]") if r.returncode == 0 else []
+            stale = gitea_ops.stale_ssh_keys(keys, time.time() * 1e6)
+            for fp in stale:
+                run(["gcloud", "compute", "os-login", "ssh-keys", "remove", f"--key={fp}"], check=False, capture=True)
+            log(f"ssh: removed {len(stale)} stale OS Login key(s) of {len(keys)}")
+        except Exception as e:  # SSH still gets to try
+            log(f"ssh: could not prune OS Login keys ({e!r}); trying SSH anyway")
 
     def apply(self, src, label):
         infra = self.prepare(src)

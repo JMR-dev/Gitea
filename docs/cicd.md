@@ -326,6 +326,14 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   is in the discarded builder stages (Caddy's xcaddy compile, gitea's
   GPG-verified download), which BuildKit inline cache does not reach -- caching
   those needs buildx `--cache-to mode=max`, a heavier change left to its own PR.
+- SSH to the VM goes through OS Login, which caps each account's profile at
+  32 KiB of keys. Every engine Job pod and every infra build has a fresh HOME,
+  so each registered a new key that never expired; on 2026-10-24 the VM began
+  refusing the backup Job's SSH (`Permission denied (publickey)`) and two infra
+  deploys failed before changing anything. Keys now expire after an hour
+  (`--ssh-key-expire-after=1h` in `scripts/ops/gitea_ops.py` and the config
+  sync in `scripts/cicd/infra_deploy.py`), and each Job / infra run first
+  removes its account's keys that never expire or already have.
 
 ## Drill log
 

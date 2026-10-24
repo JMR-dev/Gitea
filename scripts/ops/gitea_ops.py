@@ -59,6 +59,19 @@ SECRETS = [
 IMAGES = ("gitea", "caddy")
 # Printed on the VM right before a step runs; see Ops.vm.
 VM_MARK = "__GITEA_VM_STEP_OUTPUT__"
+# How long the OS Login key each Job registers stays valid. Every Job pod makes
+# a key of its own, and without an expiry they piled up on the account's OS
+# Login profile until the VM refused them. `gcloud compute ssh` re-registers
+# an expired key, so a Job that outlives it is unaffected.
+SSH_KEY_TTL = "1h"
+
+
+def stale_ssh_keys(listing, now_usec):
+    """Fingerprints to remove from `gcloud compute os-login ssh-keys list
+    --format=json` output: keys that never expire (left by Jobs before
+    SSH_KEY_TTL) or already have. A live expiring key is kept."""
+    return [k["key"] for k in listing
+            if int((k.get("value") or {}).get("expirationTimeUsec") or 0) < now_usec]
 VERSION_LABEL = "org.opencontainers.image.version"
 ALPINE_LABEL = "dev.jasonmross.alpine.minor"
 
@@ -119,6 +132,23 @@ class Ops:
         if not os.path.exists(key):
             os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
             self.run(["ssh-keygen", "-q", "-t", "rsa", "-b", "3072", "-N", "", "-C", "gitea-ops", "-f", key])
+            self.prune_ssh_keys()
+
+    def prune_ssh_keys(self):
+        """Clear the stale OS Login keys earlier Jobs left on this account, once
+        per Job, before its first SSH (stale_ssh_keys says which). Only one
+        engine Job runs at a time (launch_job.py refuses a second), so none of
+        them is in use. Account housekeeping that SSH depends on, so it runs
+        under --dry-run too. Best-effort: whatever fails, SSH still tries."""
+        try:
+            keys = json.loads(self.run(["gcloud", "compute", "os-login", "ssh-keys", "list",
+                                        "--format=json"]) or "[]")
+            stale = stale_ssh_keys(keys, time.time() * 1e6)
+            for fp in stale:
+                self.run(["gcloud", "compute", "os-login", "ssh-keys", "remove", f"--key={fp}"], check=False)
+            log(f"ssh: removed {len(stale)} stale OS Login key(s) of {len(keys)}")
+        except (subprocess.CalledProcessError, ValueError, KeyError, TypeError) as e:
+            log(f"ssh: could not prune OS Login keys ({e}); trying SSH anyway")
 
     def vm(self, step, *args, mutate=True):
         """Run one vm-steps.sh step on the VM as root; returns its stdout.
@@ -139,6 +169,7 @@ class Ops:
         r = subprocess.run(
             ["gcloud", "compute", "ssh", self.a.vm, f"--zone={self.a.zone}",
              f"--project={self.a.project}", "--tunnel-through-iap", "--quiet",
+             f"--ssh-key-expire-after={SSH_KEY_TTL}",
              "--ssh-flag=-oServerAliveInterval=30", f"--command={remote}"],
             capture_output=True, text=True,
         )
