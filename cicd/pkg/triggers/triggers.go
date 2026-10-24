@@ -139,6 +139,8 @@ echo "mode=${_MODE} pipelines=${_PIPELINES} commit=$$sha"
 // build of its own, and stops at the first that fails: an image is never
 // released onto infrastructure that just failed to deploy. A preview submits
 // as cb-<pipeline>-preview, and its launcher could not act as anything else.
+// Each pipeline build runs in one of cfg.PipelineRegions, never the launchers'
+// own region (config.Config.PipelineRegions says why).
 func SubmitScript(cfg *config.Config, m Mode) string {
 	suffix := ""
 	if m.Preview {
@@ -148,10 +150,23 @@ func SubmitScript(cfg *config.Config, m Mode) string {
 		"@CI@", cfg.Project, "@REGION@", cfg.Region, "@APP@", cfg.AppProject, "@ZONE@", cfg.AppZone,
 		"@STATE@", cfg.Project+"-deploy-state", "@SOURCE@", cfg.Project+"-build-source",
 		"@GITEA@", cfg.GiteaURL, "@REPO@", cfg.GiteaRepo, "@SUFFIX@", suffix,
+		"@PIPELINE_REGIONS@", strings.Join(cfg.PipelineRegions, " "),
 	)
 	return r.Replace(`set -euo pipefail
 sha=$$(cat /workspace/sha)
 short=$${sha:0:7}
+# The listed region with the fewest builds in flight -- each fits one pipeline
+# build -- ties at random, so launchers that start together spread out. A
+# region that cannot be listed counts as empty: picking must never stop a launch.
+pick_region() {
+  local best="" best_n=1000000 r n
+  for r in $$(printf '%s\n' @PIPELINE_REGIONS@ | shuf); do
+    n=$$( { gcloud builds list --project=@CI@ --region="$$r" \
+            --filter='status=WORKING OR status=QUEUED' --format='value(id)' 2>/dev/null || true; } | wc -l)
+    if [ "$$n" -lt "$$best_n" ]; then best=$$r; best_n=$$n; fi
+  done
+  echo "$$best"
+}
 ran=0
 for p in infra image; do
   case ",${_PIPELINES}," in *",$$p,"*) ;; *) continue ;; esac
@@ -166,11 +181,13 @@ for p in infra image; do
     image:*)       subs="$$subs,SHORT_SHA=$$short,_PUSH=true,_RELEASE=true" ;;
   esac
   sa="cb-$$p@SUFFIX@"
-  echo "submitting cloudbuild/$$p.yaml as $$sa@ ($$subs)"
+  region=$$(pick_region)
+  echo "submitting cloudbuild/$$p.yaml as $$sa@ in $$region ($$subs)"
   # The build's tags (gitea-pipeline, pipeline-<p>) come from the config file
   # itself -- gcloud builds submit has no flag for them -- and build-status
-  # keys the commit status's context on them (cicd/relay/status.go).
-  gcloud builds submit /workspace/src --project=@CI@ --region=@REGION@ \
+  # keys the commit status's context on them (cicd/relay/status.go). Its
+  # _REGION stays @REGION@: that is the app's region, not where it runs.
+  gcloud builds submit /workspace/src --project=@CI@ --region="$$region" \
     --config=/workspace/src/cloudbuild/$$p.yaml \
     --service-account=projects/@CI@/serviceAccounts/$$sa@@CI@.iam.gserviceaccount.com \
     --gcs-source-staging-dir=gs://@SOURCE@/source \
