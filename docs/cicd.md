@@ -86,14 +86,20 @@ The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
 | Event | Runs | Approval |
 |---|---|---|
 | PR opened, synchronized or reopened (same repo, allowed author **and** pusher) | `pulumi preview`; image build without push | no |
-| push to main touching `infra/`, `vm/`, `cloudbuild/infra.yaml` | infra deploy | no |
-| push to main touching `image/`, `cloudbuild/image.yaml` | image build and release | no |
+| push to main touching `infra/`, `vm/`, `cloudbuild/infra.yaml` or `scripts/cicd/infra_deploy.py` | infra deploy | no |
+| push to main touching `image/` or `cloudbuild/image.yaml` | image build and release | no |
+| push to main touching `scripts/cicd/release_gate.py` (the gate both pipelines run) | infra deploy **and** image build and release | no |
 | push to main touching `image/gitea.version`, `image/alpine.version` or `vm/bootstrap.sh` | as above | **yes** (`make approve`) |
 | push whose commit list Gitea truncated (more than 15 commits) | everything | **yes** |
-| anything else (docs, `cicd/`, scripts) | nothing; status "nothing to deploy" | n/a |
+| anything else (docs, `cicd/`, `scripts/ops/`, `scripts/cicd/bootstrap.py` and tests) | nothing; status "nothing to deploy" | n/a |
 | Sunday 04:00 UTC | image rebuild from main and release | no |
 
 - The version files are what make a Gitea major or Alpine minor change.
+- A `scripts/cicd/` change that drives a deploy (`infra_deploy.py`,
+  `release_gate.py`) deploys through that file's pipeline on merge. Because it
+  is release code, re-run its drill from the branch first (so the merge's
+  deploy passes the gate); the merge's pending `cloudbuild/drill-*` status
+  marks it due. `bootstrap.py` and the tests drive no deploy.
 - `vm/bootstrap.sh` is the VM's startup script, so any edit replaces the VM
   (about 15 min down and a new Let's Encrypt certificate).
 - Even without approval, the infra pipeline refuses to replace or delete the
@@ -301,16 +307,16 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   access is per-service-account. GCS may re-add them if a bucket is recreated,
   so re-check after any bucket replacement. To reverse:
   `gcloud storage buckets add-iam-policy-binding gs://<b> --member=projectViewer:gitea-496920 --role=roles/storage.legacyObjectReader`.
-- Cold builds are slow on the public pool, which has no build cache: each infra
-  build recompiles the program against pulumi-gcp (about 10 min, and the pool
-  caps a build at 10 CPUs with no high-memory type -- hence `E2_HIGHCPU_8` and
-  the constrained Go compile in `cloudbuild/infra.yaml`), and each image build
-  re-pulls the bases and rebuilds Caddy with xcaddy. Follow-up, not yet done:
-  seed a cache -- BuildKit inline cache plus `--cache-from` on the image builds,
-  so an unchanged weekly rebuild reuses the Caddy/apk layers, and a prebuilt
-  builder image (or a GCS-backed Go module/build cache) for the infra compile.
-  Left to its own PR: it changes the deploy-critical build path and needs real
-  build-timing validation before it ships.
+- Builds run on the public pool, which caps a build at 10 CPUs with no
+  high-memory type (hence `E2_HIGHCPU_8` and the constrained Go compile in
+  `cloudbuild/infra.yaml`). The infra build's Go compile against pulumi-gcp is
+  cached across deploys in a GCS `<ci>-build-cache` bucket, which
+  `scripts/cicd/infra_deploy.py` restores before `go build` and saves after --
+  best-effort: a miss or error just builds cold, and previews can't read it.
+  The image build is still cold: both Dockerfiles are multi-stage and the cost
+  is in the discarded builder stages (Caddy's xcaddy compile, gitea's
+  GPG-verified download), which BuildKit inline cache does not reach -- caching
+  those needs buildx `--cache-to mode=max`, a heavier change left to its own PR.
 
 ## Drill log
 

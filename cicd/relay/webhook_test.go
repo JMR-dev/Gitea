@@ -219,6 +219,10 @@ func TestClassify(t *testing.T) {
 		{"docs only", []string{"docs/runbook.md", "README.md"}, true, ModeDeploy, nil},
 		{"engine only", []string{"scripts/ops/gitea_ops.py"}, true, ModeDeploy, nil},
 		{"ci program only", []string{"cicd/pkg/relay/relay.go", "cicd/relay/webhook.go"}, true, ModeDeploy, nil},
+		{"infra deploy driver", []string{"scripts/cicd/infra_deploy.py"}, true, ModeDeploy, []string{"infra"}},
+		{"shared release gate", []string{"scripts/cicd/release_gate.py"}, true, ModeDeploy, []string{"infra", "image"}},
+		{"cicd bootstrap deploys nothing", []string{"scripts/cicd/bootstrap.py"}, true, ModeDeploy, nil},
+		{"cicd tests deploy nothing", []string{"scripts/cicd/test_cicd.py"}, true, ModeDeploy, nil},
 		{"lookalike prefix", []string{"infrastructure.md", "images/logo.png", "vmware.txt"}, true, ModeDeploy, nil},
 		{"truncated", []string{"docs/x.md"}, false, ModeGated, []string{"infra", "image"}},
 	} {
@@ -378,6 +382,25 @@ func TestDeployStillPublishesWithDrillStatuses(t *testing.T) {
 		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
 	}
 	if len(st.got) != 1 || st.got[0].Context != "cloudbuild/drill-infra-fail-verify" {
+		t.Fatalf("statuses %+v", st.got)
+	}
+}
+
+// A change to the infra deploy driver under scripts/cicd/ now triggers the
+// infra pipeline (not "nothing to deploy"), and still re-posts its drill
+// reminder so the gate holds the deploy until that drill is re-run.
+func TestCicdScriptTriggersDeploy(t *testing.T) {
+	h, pub, st := newHook()
+	body := pushBody(t, func(p map[string]any) {
+		p["commits"] = []any{map[string]any{"id": "x", "modified": []any{"scripts/cicd/infra_deploy.py"}}}
+	})
+	if rec := deliver(t, h, "push", body, sign); rec.Code != http.StatusAccepted || len(pub.got) != 1 {
+		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
+	}
+	if m := pub.got[0]; m.Attributes["mode"] != ModeDeploy || m.Attributes["pipelines"] != PipelineInfra {
+		t.Fatalf("attrs %+v", m.Attributes)
+	}
+	if len(st.got) != 1 || st.got[0].Context != "cloudbuild/drill-infra-fail-verify" || st.got[0].State != "pending" {
 		t.Fatalf("statuses %+v", st.got)
 	}
 }
