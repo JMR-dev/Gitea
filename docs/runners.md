@@ -288,7 +288,7 @@ jobs:
     runs-on: heavy
     steps:
       - run: free -g && nproc                 # about 31 GB and 4 CPUs: an e2-highmem-4
-      - run: cat /sys/fs/cgroup/memory.max     # 25769803776: the 24Gi limit
+      - run: cat /sys/fs/cgroup/memory.max     # 25769803776: the 24Gi limit (== request)
 
   docker:
     runs-on: docker
@@ -358,12 +358,18 @@ the path is spot.
 pulumi-cloudflare v6 Go SDK is a single package, and its one `compile` process
 peaks at about 14.4 GB. `-p=1` and `GOGC` cannot split it, and an
 `e2-standard-4` has only about 13 GiB allocatable, so a `heavy` job compiling
-it was OOM-killed (exit 137) every time. The job pod requests 12 Gi, so its limit is 24 Gi.
-**The CPU request, not the memory one, keeps it to one heavy job per node.**
-An `e2-highmem-4` has 3920m of allocatable CPU, and GKE's per-node pods take
-about 630m of it. Two 12 Gi pods would fit in the memory, but two 2-CPU pods do
-not fit in the ~3.3 CPUs left, so a second heavy job waits for a second node.
-At a `runnerHeavyCpu` of about 1.6 or less, two would share a node.
+it was OOM-killed (exit 137) every time. The job pod requests 24 Gi, and its
+memory limit equals that request, so one job owns ~all the node's usable
+memory; there is no CPU limit, so it also bursts into all the cores.
+**One heavy job per node, held by both requests.** An `e2-highmem-4` has 3920m
+of allocatable CPU and about 28 GiB of memory, and GKE's per-node pods take
+about 630m / 1.3 GiB of it. Two 24 Gi pods do not fit the memory and two 3-CPU
+pods do not fit the ~3.3 CPUs left, so a second heavy job takes a second node.
+**The pool scales from zero to six nodes**, so a fan-out of heavy jobs (a
+matrix, say) runs in parallel instead of two-at-a-time. A per-node pre-pull
+DaemonSet (`gitea-runner-heavy-prepull`) keeps the job image resident, so a
+node reused within a burst starts without re-pulling it; a brand-new node
+(scaled from zero) still pulls once, shared with the first job.
 
 **The base pool is a fixed `max(1, runnerReplicas)` nodes.** Pod anti-affinity
 gives each DinD runner a node of its own, and there is always at least one node
