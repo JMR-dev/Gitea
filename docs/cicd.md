@@ -350,3 +350,6 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-10-24 | D5 infra fail-verify (infra.yaml step env) | 6b03c7e | `6e1a58b6` | PASS: infra code `bea3e5b` attested |
 | 2026-10-24 | D5 infra fail-verify (Go build cache) | 1a04ebf | `f2dcd208` | PASS: infra code `7f2ef3b` attested; 29.4 min |
 | 2026-10-24 | D5 infra fail-verify (-trimpath cache, ops warm-up) | 6207e77 | `51208ae7` | PASS: infra code `d70ce51` attested; 17.9 min with a cold cache, no ops-pool waits, last-good re-apply compiled in 13 s |
+| 2026-10-24 | D5 infra fail-verify (SSH key expiry) | 550d155 | `d53fd2fa` | PASS: infra code `4d6036d` attested; cleared 22 stale OS Login keys (gitea-release) and 8 (cb-infra), and SSH worked again; 10.5 min |
+| 2026-10-24 | D3 image fail-verify (Path A) | 550d155 | `46984fca` | PASS: image code `515c803` attested; promoted, rolled back to `:previous` |
+| 2026-10-24 | D4 image fail-after-migrate (Path B) | 550d155 | `0d7cd5a0` | PASS: image code `515c803`; restored from `gitea-data-pre-release-20261024t225431z`, drill marker absent; down ~22:54–23:09 UTC |
