@@ -20,6 +20,11 @@ type Buckets struct {
 	// DeployState holds the infra deploy lock and the last-good markers the
 	// infra pipeline rolls back to. Versioned, so a bad marker is recoverable.
 	DeployState *storage.Bucket
+	// BuildCache holds the infra build's Go module/compile cache, which
+	// scripts/cicd/infra_deploy.py restores before and saves after `go build`.
+	// Not versioned (it is rewritten every deploy) and pruned, since it is a
+	// rebuildable convenience, never a source of truth.
+	BuildCache *storage.Bucket
 }
 
 func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (*Buckets, error) {
@@ -53,5 +58,9 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (*Buck
 	if err != nil {
 		return nil, err
 	}
-	return &Buckets{BuildSource: src, RelaySource: relay, DeployState: state}, nil
+	cache, err := bucket("build-cache", false, 30)
+	if err != nil {
+		return nil, err
+	}
+	return &Buckets{BuildSource: src, RelaySource: relay, DeployState: state, BuildCache: cache}, nil
 }

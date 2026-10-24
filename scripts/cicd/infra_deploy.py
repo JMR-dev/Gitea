@@ -135,9 +135,65 @@ class Deploy:
 
     def prepare(self, src):
         infra = os.path.join(src, "infra")
-        run(["go", "build", "-o", "gitea-infra", "."], cwd=infra)
+        # Persist Go's module and compile caches across deploys: compiling
+        # against pulumi-gcp from cold is the slow part of an infra build. This
+        # is best-effort -- a missing, broken, or unreachable cache (a preview's
+        # account cannot read it) just means a cold build, never a failed
+        # deploy -- so only bother on a real `up`.
+        build_env = None
+        if self.a.mode == "up":
+            build_env = self.go_cache_env()
+            self.restore_go_cache()
+        run(["go", "build", "-o", "gitea-infra", "."], cwd=infra, env=build_env)
+        if build_env is not None:
+            self.save_go_cache()
         run(["pulumi", "login", f"gs://{self.a.app_project}-pulumi-state"], cwd=infra)
         return infra
+
+    # --- Go build cache (best-effort; a cache error never fails the deploy) ---
+
+    def cache_bucket(self):
+        """The CI project's build-cache bucket, derived from the deploy-state
+        bucket (both are <ci-project>-<name>). None without a state bucket."""
+        sb, suffix = self.a.state_bucket, "-deploy-state"
+        return sb[: -len(suffix)] + "-build-cache" if sb and sb.endswith(suffix) else None
+
+    def go_cache_dir(self):
+        return os.path.join(self.tmp, "gocache")
+
+    def go_cache_env(self):
+        base = self.go_cache_dir()
+        env = dict(os.environ)
+        env["GOCACHE"], env["GOMODCACHE"] = os.path.join(base, "build"), os.path.join(base, "mod")
+        for d in (env["GOCACHE"], env["GOMODCACHE"]):
+            os.makedirs(d, exist_ok=True)
+        return env
+
+    def restore_go_cache(self):
+        bucket = self.cache_bucket()
+        if not bucket:
+            return
+        url, tar = f"gs://{bucket}/infra-go-cache.tar.gz", os.path.join(self.tmp, "go-cache-in.tgz")
+        try:
+            if run(["gcloud", "storage", "cp", url, tar], check=False, capture=True).returncode != 0:
+                log("go cache: nothing to restore (cold build)")
+                return
+            run(["tar", "-xzf", tar, "-C", self.go_cache_dir()], check=False)
+            log(f"go cache: restored from {url}")
+        except Exception as e:  # caching must never fail the deploy
+            log(f"go cache: restore skipped ({e!r})")
+
+    def save_go_cache(self):
+        bucket = self.cache_bucket()
+        if not bucket:
+            return
+        url, tar = f"gs://{bucket}/infra-go-cache.tar.gz", os.path.join(self.tmp, "go-cache-out.tgz")
+        try:
+            run(["tar", "-czf", tar, "-C", self.go_cache_dir(), "build", "mod"], check=False)
+            run(["gcloud", "storage", "cp", tar, url], check=False)
+            log(f"go cache: saved to {url}")
+        except Exception as e:  # caching must never fail the deploy
+            log(f"go cache: save skipped ({e!r})")
 
     def preview_json(self, infra):
         r = self.pulumi("preview", "--json", cwd=infra, capture=True)

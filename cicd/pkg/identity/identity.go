@@ -221,6 +221,12 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 	if err := bucketRole("infra-deploy-state", b.DeployState, "roles/storage.objectAdmin", member(a.Infra)); err != nil {
 		return nil, err
 	}
+	// The infra build's Go module/compile cache (scripts/cicd/infra_deploy.py),
+	// restored before and rewritten after `go build`. Only cb-infra touches it;
+	// a preview account has no access and so builds cold.
+	if err := bucketRole("infra-build-cache", b.BuildCache, "roles/storage.objectAdmin", member(a.Infra)); err != nil {
+		return nil, err
+	}
 	// The release gate: read which drills have passed, record a new pass.
 	// Create, not admin -- each pass is a new object (release_gate.py), so it
 	// can never overwrite or delete one, nor touch the infra lock. Viewer as
