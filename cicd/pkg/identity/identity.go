@@ -233,6 +233,15 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 	if err := bucketRole("infra-preview-build-cache", b.BuildCache, "roles/storage.objectViewer", member(a.InfraPreview)); err != nil {
 		return nil, err
 	}
+	// storage.buckets.get on the same bucket: `gcloud storage cp` reads the
+	// bucket's settings before a large upload may go up in parallel pieces, and
+	// without this falls back to one stream behind a misleading "ERROR:" line.
+	// The pieces are then composed and deleted, which objectAdmin above allows.
+	// Every other permission in legacyBucketReader, objectAdmin already grants.
+	// (Never give it to an account that must not delete -- the backup writers.)
+	if err := bucketRole("infra-build-cache-bucket", b.BuildCache, "roles/storage.legacyBucketReader", member(a.Infra)); err != nil {
+		return nil, err
+	}
 	// The release gate: read which drills have passed, record a new pass.
 	// Create, not admin -- each pass is a new object (release_gate.py), so it
 	// can never overwrite or delete one, nor touch the infra lock. Viewer as
