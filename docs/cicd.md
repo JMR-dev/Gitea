@@ -314,7 +314,9 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   `infra/go.mod` + `go.sum` + Go version: `scripts/cicd/infra_deploy.py`
   restores it before `go build` (deploys and previews) and a deploy writes it
   only when its go.sum has none yet, so an ordinary deploy uploads nothing. A
-  dependency bump starts from the newest object. The build uses `-trimpath`:
+  dependency bump starts from the newest object, and that upload goes up in
+  parallel pieces (cb-infra can read the bucket's settings, which gcloud
+  checks first). The build uses `-trimpath`:
   without it Go keys every compiled package by its directory, which differs
   each run, and the cache never hits. Best-effort: a miss or error just builds
   cold. Infra deploys also hold the ops pool's node with a placeholder pod
