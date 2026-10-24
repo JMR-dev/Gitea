@@ -310,9 +310,16 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 - Builds run on the public pool, which caps a build at 10 CPUs with no
   high-memory type (hence `E2_HIGHCPU_8` and the constrained Go compile in
   `cloudbuild/infra.yaml`). The infra build's Go compile against pulumi-gcp is
-  cached across deploys in a GCS `<ci>-build-cache` bucket, which
-  `scripts/cicd/infra_deploy.py` restores before `go build` and saves after --
-  best-effort: a miss or error just builds cold, and previews can't read it.
+  cached across runs in a GCS `<ci>-build-cache` bucket, one object per
+  `infra/go.mod` + `go.sum` + Go version: `scripts/cicd/infra_deploy.py`
+  restores it before `go build` (deploys and previews) and a deploy writes it
+  only when its go.sum has none yet, so an ordinary deploy uploads nothing. A
+  dependency bump starts from the newest object. The build uses `-trimpath`:
+  without it Go keys every compiled package by its directory, which differs
+  each run, and the cache never hits. Best-effort: a miss or error just builds
+  cold. Infra deploys also hold the ops pool's node with a placeholder pod
+  from the build on, so the backup and verify Jobs never wait for it to scale
+  up from zero.
   The image build is still cold: both Dockerfiles are multi-stage and the cost
   is in the discarded builder stages (Caddy's xcaddy compile, gitea's
   GPG-verified download), which BuildKit inline cache does not reach -- caching
@@ -330,3 +337,6 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-10-23 | D4 image fail-after-migrate (Path B) | cbb9f7f | `51c9bbbc` | PASS: consistent snapshot, data restored, drill marker absent |
 | 2026-10-23 | D6 alerting | cbb9f7f | D3–D5 | PASS: three "rolled back automatically" e-mails delivered to the operator |
 | 2026-10-23 | Weekly rebuild (real, go-live validation) | cbb9f7f | `cdd26dc5` | SUCCESS: automated Path A release, prod on gitea `sha256:4b25d9c0…`, `:last-good` moved |
+| 2026-10-24 | D5 infra fail-verify (infra.yaml step env) | 6b03c7e | `6e1a58b6` | PASS: infra code `bea3e5b` attested |
+| 2026-10-24 | D5 infra fail-verify (Go build cache) | 1a04ebf | `f2dcd208` | PASS: infra code `7f2ef3b` attested; 29.4 min |
+| 2026-10-24 | D5 infra fail-verify (-trimpath cache, ops warm-up) | 6207e77 | `51208ae7` | PASS: infra code `d70ce51` attested; 17.9 min with a cold cache, no ops-pool waits, last-good re-apply compiled in 13 s |

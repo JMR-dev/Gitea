@@ -60,6 +60,41 @@ class Converged(unittest.TestCase):
         self.assertEqual(D.leftover_changes(p), ["update gitea-vm"])
 
 
+class GoCache(unittest.TestCase):
+    def test_name_is_stable_and_keyed_on_deps_and_toolchain(self):
+        n = D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.26.9")
+        self.assertEqual(n, D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.26.9"))
+        self.assertTrue(n.startswith(D.GO_CACHE_PREFIX) and n.endswith(".tar"))
+        for other in (D.go_cache_name(b"module x\n", b"a v2 h1:y\n", "go1.26.9"),
+                      D.go_cache_name(b"module x\ntoolchain go1.27.0\n", b"a v1 h1:x\n", "go1.26.9"),
+                      D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.27.0")):
+            self.assertNotEqual(n, other)
+
+    def test_newest_object_ignores_the_total_line(self):
+        ls = ("  10  2026-10-20T01:00:00Z  gs://b/infra-go-cache-aaaa.tar\n"
+              "  20  2026-10-24T01:00:00Z  gs://b/infra-go-cache-bbbb.tar\n"
+              "  30  2026-10-22T01:00:00Z  gs://b/infra-go-cache-cccc.tar\n"
+              "TOTAL: 3 objects, 60 bytes (60B)\n")
+        self.assertEqual(D.newest_object(ls), "gs://b/infra-go-cache-bbbb.tar")
+        self.assertIsNone(D.newest_object(""))
+        self.assertIsNone(D.newest_object("TOTAL: 0 objects, 0 bytes (0B)\n"))
+
+    def saves(self, mode, hit):
+        d = D.Deploy(argparse.Namespace(mode=mode, state_bucket="ci-deploy-state"))
+        d.go_cache, d.go_cache_hit = "infra-go-cache-abcd.tar", hit
+        ok = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(D, "run", return_value=ok) as run, redirect_stdout(io.StringIO()):
+            d.save_go_cache()
+            d.save_go_cache()  # a second prepare in the same run
+        return [c.args[0][:3] for c in run.call_args_list]
+
+    def test_save_only_from_a_deploy_without_an_exact_hit_and_only_once(self):
+        self.assertEqual(self.saves("preview", hit=False), [])
+        self.assertEqual(self.saves("up", hit=True), [])
+        self.assertEqual(self.saves("up", hit=False),
+                         [["tar", "-cf", mock.ANY], ["gcloud", "storage", "cp"]])
+
+
 class Gate(unittest.TestCase):
     def test_hash_is_stable_and_covers_the_engine(self):
         self.assertEqual(G.code_hash("image"), G.code_hash("image"))

@@ -20,10 +20,11 @@ type Buckets struct {
 	// DeployState holds the infra deploy lock and the last-good markers the
 	// infra pipeline rolls back to. Versioned, so a bad marker is recoverable.
 	DeployState *storage.Bucket
-	// BuildCache holds the infra build's Go module/compile cache, which
-	// scripts/cicd/infra_deploy.py restores before and saves after `go build`.
-	// Not versioned (it is rewritten every deploy) and pruned, since it is a
-	// rebuildable convenience, never a source of truth.
+	// BuildCache holds the infra build's Go module/compile cache, one object per
+	// infra/go.sum, which scripts/cicd/infra_deploy.py restores before `go
+	// build` (deploys and previews) and writes when a deploy finds none for its
+	// go.sum. Not versioned and pruned, since it is a rebuildable convenience,
+	// never a source of truth.
 	BuildCache *storage.Bucket
 }
 

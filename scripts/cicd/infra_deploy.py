@@ -11,7 +11,9 @@
   4. guard: a replacement or deletion of the VM, a disk, a bucket, the
      cluster, an address or a DNS record needs approval; anything else goes
   5. backup: the release engine's backup Job (dump, config tarball, online
-     snapshot) plus a `pulumi stack export`
+     snapshot) plus a `pulumi stack export`. From step 3 to the end, a
+     placeholder pod holds the ops pool's node, so this Job and step 7's both
+     start on a warm node with the engine image already pulled
   6. pulumi up, then the VM config sync
   7. verify: the release engine's status checks, then a preview that must show
      nothing left to change
@@ -28,6 +30,7 @@ see cloudbuild/infra.yaml.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -63,6 +66,7 @@ PROTECTED_TYPES = {
 DESTRUCTIVE_OPS = {"replace", "create-replacement", "delete-replaced", "delete", "discard"}
 LOCK_WAIT = 45 * 60
 LOCK_STALE = 4 * 3600
+GO_CACHE_PREFIX = "infra-go-cache-"
 
 
 def log(msg):
@@ -117,6 +121,29 @@ def leftover_changes(preview):
     return out
 
 
+def go_cache_name(go_mod, go_sum, go_version):
+    """The build-cache object for one dependency set and Go toolchain: infra's
+    go.mod and go.sum, and the image's own Go. Those three fix the toolchain the
+    build runs with too (go.mod can make Go download a newer one). The build
+    runs with -trimpath, so the compile cache records no paths and still hits
+    after being restored under a different temp dir; without it every cache key
+    named the random dir, and nothing ever hit."""
+    h = hashlib.sha256(b"trimpath-1\0" + go_version.encode())
+    for part in (go_mod, go_sum):
+        h.update(b"\0" + part)
+    return f"{GO_CACHE_PREFIX}{h.hexdigest()[:16]}.tar"
+
+
+def newest_object(ls_long):
+    """The newest gs:// URL in `gcloud storage ls -l` output, or None."""
+    best = None
+    for line in ls_long.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2].startswith("gs://") and (best is None or parts[1] > best[0]):
+            best = (parts[1], parts[2])
+    return best[1] if best else None
+
+
 class Deploy:
     def __init__(self, a):
         self.a = a
@@ -126,6 +153,10 @@ class Deploy:
         self.applied = False  # pulumi up has started: from here a failure rolls back
         # Outside the source tree, which is what gets archived as last-good.
         self.tmp = tempfile.mkdtemp(prefix="infra-deploy-")
+        self.go_cache = None         # this go.sum's cache object, once restore has run
+        self.go_cache_hit = False    # restored exactly that object
+        self.go_cache_saved = False
+        self.ops_warm = None         # (kube, pod path) while the warm-up pod exists
 
     # --- Pulumi ---------------------------------------------------------------
 
@@ -135,18 +166,17 @@ class Deploy:
 
     def prepare(self, src):
         infra = os.path.join(src, "infra")
-        # Persist Go's module and compile caches across deploys: compiling
-        # against pulumi-gcp from cold is the slow part of an infra build. This
-        # is best-effort -- a missing, broken, or unreachable cache (a preview's
-        # account cannot read it) just means a cold build, never a failed
-        # deploy -- so only bother on a real `up`.
-        build_env = None
-        if self.a.mode == "up":
-            build_env = self.go_cache_env()
-            self.restore_go_cache()
-        run(["go", "build", "-o", "gitea-infra", "."], cwd=infra, env=build_env)
-        if build_env is not None:
-            self.save_go_cache()
+        # Go's module and compile caches persist across deploys in the
+        # build-cache bucket: compiling against pulumi-gcp from cold is the slow
+        # part of an infra build. Restored once per run (a second prepare, or a
+        # rollback's, builds against the same directory) and saved at most once.
+        # Best-effort: a missing, broken or unreadable cache just means a cold
+        # build, never a failed deploy. -trimpath is what lets the compile cache
+        # hit at all, since the directory differs every run (go_cache_name).
+        env = self.go_cache_env()
+        self.restore_go_cache(infra)
+        run(["go", "build", "-trimpath", "-o", "gitea-infra", "."], cwd=infra, env=env)
+        self.save_go_cache()
         run(["pulumi", "login", f"gs://{self.a.app_project}-pulumi-state"], cwd=infra)
         return infra
 
@@ -169,31 +199,121 @@ class Deploy:
             os.makedirs(d, exist_ok=True)
         return env
 
-    def restore_go_cache(self):
+    def restore_go_cache(self, infra):
+        if self.go_cache is not None:  # once per run
+            return
+        self.go_cache = ""
         bucket = self.cache_bucket()
         if not bucket:
             return
-        url, tar = f"gs://{bucket}/infra-go-cache.tar.gz", os.path.join(self.tmp, "go-cache-in.tgz")
         try:
-            if run(["gcloud", "storage", "cp", url, tar], check=False, capture=True).returncode != 0:
+            # GOTOOLCHAIN=local: the image's Go, without downloading the one
+            # go.mod may ask for (that download belongs in the cache dir).
+            gov = run(["go", "env", "GOVERSION"], cwd=infra, check=False, capture=True,
+                      env=dict(os.environ, GOTOOLCHAIN="local")).stdout.strip()
+            with open(os.path.join(infra, "go.mod"), "rb") as fm, open(os.path.join(infra, "go.sum"), "rb") as fs:
+                self.go_cache = go_cache_name(fm.read(), fs.read(), gov)
+            exact = f"gs://{bucket}/{self.go_cache}"
+            if run(["gcloud", "storage", "ls", exact], check=False, capture=True).returncode == 0:
+                src, self.go_cache_hit = exact, True
+            else:
+                # None for this go.sum yet (a dependency bump): start from the
+                # newest one, which still holds every module that did not change.
+                ls = run(["gcloud", "storage", "ls", "-l", f"gs://{bucket}/{GO_CACHE_PREFIX}*.tar"],
+                         check=False, capture=True)
+                src = newest_object(ls.stdout) if ls.returncode == 0 else None
+            if not src:
                 log("go cache: nothing to restore (cold build)")
                 return
-            run(["tar", "-xzf", tar, "-C", self.go_cache_dir()], check=False)
-            log(f"go cache: restored from {url}")
+            tar = os.path.join(self.tmp, "go-cache-in.tar")
+            if run(["gcloud", "storage", "cp", src, tar], check=False, capture=True).returncode != 0 \
+                    or run(["tar", "-xf", tar, "-C", self.go_cache_dir()], check=False).returncode != 0:
+                self.go_cache_hit = False
+                log("go cache: restore failed (cold build)")
+                return
+            os.remove(tar)
+            log(f"go cache: restored ({'exact' if self.go_cache_hit else 'partial'}) from {src}")
         except Exception as e:  # caching must never fail the deploy
+            self.go_cache_hit = False
             log(f"go cache: restore skipped ({e!r})")
 
     def save_go_cache(self):
+        # Only a deploy writes it (a preview's account can only read), at most
+        # once a run, and only when this go.sum had no object of its own: after
+        # an exact hit there is nothing new worth the upload. Not compressed --
+        # gzip of the cache took minutes, and the bucket is in the build's region.
+        if self.a.mode != "up" or self.go_cache_saved or self.go_cache_hit or not self.go_cache:
+            return
+        self.go_cache_saved = True
         bucket = self.cache_bucket()
         if not bucket:
             return
-        url, tar = f"gs://{bucket}/infra-go-cache.tar.gz", os.path.join(self.tmp, "go-cache-out.tgz")
+        url, tar = f"gs://{bucket}/{self.go_cache}", os.path.join(self.tmp, "go-cache-out.tar")
         try:
-            run(["tar", "-czf", tar, "-C", self.go_cache_dir(), "build", "mod"], check=False)
-            run(["gcloud", "storage", "cp", tar, url], check=False)
-            log(f"go cache: saved to {url}")
+            if run(["tar", "-cf", tar, "-C", self.go_cache_dir(), "build", "mod"], check=False).returncode == 0 \
+                    and run(["gcloud", "storage", "cp", tar, url], check=False).returncode == 0:
+                log(f"go cache: saved to {url}")
+            if os.path.exists(tar):
+                os.remove(tar)
         except Exception as e:  # caching must never fail the deploy
             log(f"go cache: save skipped ({e!r})")
+
+    # --- ops pool warm-up (best-effort, like the cache) -------------------------
+
+    def warm_ops(self):
+        """Hold a placeholder pod on the ops pool for the rest of the deploy.
+        Scaling that pool up from zero (a node, then the engine image) took ~3
+        minutes and happened twice a deploy: before the backup Job, and again
+        before the verify Job because the node scaled back down during `pulumi
+        up`. The placeholder runs the engine's own image on the engine Job's
+        placement, so both Jobs start on a warm node with the image pulled. It
+        is deleted at the end and expires by itself if the deploy dies first. A
+        failure here only means the Jobs wait for the pool, as before."""
+        try:
+            if os.path.join(ROOT, "scripts", "ops") not in sys.path:
+                sys.path.insert(0, os.path.join(ROOT, "scripts", "ops"))
+            import launch_job as lj  # the engine Job's client, image and placement
+            kube = lj.Kube(self.a.app_project, self.a.zone, "gitea-runners")
+            pods = f"/api/v1/namespaces/{lj.NAMESPACE}/pods"
+            made = kube.request("POST", pods, {
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "generateName": "gitea-ops-warm-", "namespace": lj.NAMESPACE,
+                    "labels": {"app": "gitea-ops-warm"},
+                    # Keeps the node up while it runs, which is the point.
+                    "annotations": {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"},
+                },
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "restartPolicy": "Never",
+                    "activeDeadlineSeconds": lj.DEADLINE_SECONDS,
+                    "terminationGracePeriodSeconds": 0,
+                    # Exactly where launch_job.manifests puts the engine Job.
+                    "nodeSelector": {lj.POOL_KEY: lj.POOL, "iam.gke.io/gke-metadata-server-enabled": "true"},
+                    "tolerations": [{"key": lj.POOL_KEY, "operator": "Equal", "value": lj.POOL,
+                                     "effect": "NoSchedule"}],
+                    "containers": [{
+                        "name": "warm", "image": lj.IMAGE, "command": ["sleep", "infinity"],
+                        "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "64Mi"}},
+                    }],
+                },
+            })
+            name = made["metadata"]["name"]
+            self.ops_warm = (kube, f"{pods}/{name}")
+            log(f"ops pool: warming it with pod {lj.NAMESPACE}/{name}")
+        except (Exception, SystemExit) as e:  # launch_job exits on API errors
+            log(f"ops pool: warm-up skipped ({e!r})")
+
+    def unwarm_ops(self):
+        if not self.ops_warm:
+            return
+        kube, path = self.ops_warm
+        self.ops_warm = None
+        try:
+            kube.request("DELETE", path, ok404=True)
+            log("ops pool: warm-up pod deleted")
+        except (Exception, SystemExit) as e:
+            log(f"ops pool: warm-up pod not deleted ({e!r}); it expires by itself")
 
     def preview_json(self, infra):
         r = self.pulumi("preview", "--json", cwd=infra, capture=True)
@@ -353,6 +473,8 @@ class Deploy:
             if self.superseded():
                 log(f"{self.a.sha} is older than the last deployed commit; nothing to do")
                 return 0
+            # Before the build, so the pool scales up while it compiles.
+            self.warm_ops()
             infra = self.prepare(ROOT)
             risky = destructive_steps(self.preview_json(infra))
             if risky:
@@ -384,6 +506,7 @@ class Deploy:
             self.save_last_good()
             return 0
         finally:
+            self.unwarm_ops()
             self.unlock()
 
 
