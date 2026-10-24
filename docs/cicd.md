@@ -337,3 +337,6 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-10-23 | D4 image fail-after-migrate (Path B) | cbb9f7f | `51c9bbbc` | PASS: consistent snapshot, data restored, drill marker absent |
 | 2026-10-23 | D6 alerting | cbb9f7f | D3–D5 | PASS: three "rolled back automatically" e-mails delivered to the operator |
 | 2026-10-23 | Weekly rebuild (real, go-live validation) | cbb9f7f | `cdd26dc5` | SUCCESS: automated Path A release, prod on gitea `sha256:4b25d9c0…`, `:last-good` moved |
+| 2026-10-24 | D5 infra fail-verify (infra.yaml step env) | 6b03c7e | `6e1a58b6` | PASS: infra code `bea3e5b` attested |
+| 2026-10-24 | D5 infra fail-verify (Go build cache) | 1a04ebf | `f2dcd208` | PASS: infra code `7f2ef3b` attested; 29.4 min |
+| 2026-10-24 | D5 infra fail-verify (-trimpath cache, ops warm-up) | 6207e77 | `51208ae7` | PASS: infra code `d70ce51` attested; 17.9 min with a cold cache, no ops-pool waits, last-good re-apply compiled in 13 s |
