@@ -290,6 +290,19 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 - Cloud Build has no Gitea connector, so the triggers carry an inline launcher.
   The source-less Pub/Sub trigger shape is allowed by gcloud's flag rules but
   is proven only at the first `make ci-up`.
+- Cloud Build's default pool caps this project at **10 build vCPUs per region**
+  and **10 builds at once** project-wide. Google refused an increase on
+  2026-10-24, and its docs say neither is raised on request (a private pool
+  would be, but this project's private-pool CPUs are capped at 4). A launcher
+  (2 vCPUs, us-east1) holds its slot while it waits on its pipeline, so on
+  2026-10-24 four launchers starved their own 8-vCPU pipelines until the
+  queued builds would have expired (1 h). Pipeline builds therefore never run
+  in us-east1: each goes to the least-busy region in
+  `gitea-cicd:pipelineRegions` (default us-east4, us-east5, us-central1,
+  us-south1, us-west1, all probed for `E2_HIGHCPU_8` and for publishing to
+  `cloud-builds`). Five launchers plus five pipelines is the 10-build cap.
+  `_REGION` stays the app's region; commit-status links point at each build's
+  own region. `make ci-drill` / `ci-infra-up` still submit to us-east1.
 - A PR preview of runner (Kubernetes) changes can't do the server-side dry
   run: the exec-plugin kubeconfig connects as `cb-infra-preview`, which holds no
   `container` role, so the cluster refuses it. The Kubernetes provider falls

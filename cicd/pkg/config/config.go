@@ -6,11 +6,15 @@ package config
 import (
 	"fmt"
 	"net/mail"
+	"regexp"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
 )
+
+// region is a GCP region name, e.g. us-east4 or europe-west1.
+var region = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9]+$`)
 
 type Config struct {
 	// Project is this CI project (gcp:project), created by
@@ -18,6 +22,16 @@ type Config struct {
 	// grants it makes into the app project.
 	Project string
 	Region  string
+
+	// PipelineRegions are where the launchers' pipeline builds run -- never
+	// Region, where the launchers themselves run. The default pool caps build
+	// vCPUs per region (10 for this project, and Google will not raise it),
+	// and a launcher holds its region's vCPUs while it waits on its pipeline,
+	// so a pipeline queued behind launchers in their own region could wait on
+	// them forever. Each region fits one 8-vCPU pipeline build at a time; five
+	// match the project's cap of 10 builds at once (five launcher+pipeline
+	// pairs).
+	PipelineRegions []string
 
 	// The app project and what in it the pipelines touch. Defaults match
 	// infra/ (gitea-496920, the VM, the runner cluster).
@@ -51,17 +65,18 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 	c := config.New(ctx, "gitea-cicd")
 
 	cfg := &Config{
-		Project:       gcp.Require("project"),
-		Region:        gcp.Get("region"),
-		AppProject:    c.Get("appProject"),
-		AppZone:       c.Get("appZone"),
-		AppVM:         c.Get("appVm"),
-		RunnerCluster: c.Get("runnerCluster"),
-		GiteaURL:      c.Get("giteaUrl"),
-		GiteaRepo:     c.Get("giteaRepo"),
-		Authors:       strings.Fields(strings.ReplaceAll(c.Get("allowedAuthors"), ",", " ")),
-		OperatorEmail: c.Get("operatorEmail"),
-		AutoDeploy:    c.GetBool("autoDeploy"),
+		Project:         gcp.Require("project"),
+		Region:          gcp.Get("region"),
+		PipelineRegions: strings.Fields(strings.ReplaceAll(c.Get("pipelineRegions"), ",", " ")),
+		AppProject:      c.Get("appProject"),
+		AppZone:         c.Get("appZone"),
+		AppVM:           c.Get("appVm"),
+		RunnerCluster:   c.Get("runnerCluster"),
+		GiteaURL:        c.Get("giteaUrl"),
+		GiteaRepo:       c.Get("giteaRepo"),
+		Authors:         strings.Fields(strings.ReplaceAll(c.Get("allowedAuthors"), ",", " ")),
+		OperatorEmail:   c.Get("operatorEmail"),
+		AutoDeploy:      c.GetBool("autoDeploy"),
 	}
 	applyDefaults(cfg)
 	return cfg, validate(cfg, ctx.IsConfigSecret("gitea-cicd:operatorEmail"))
@@ -70,6 +85,11 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 func applyDefaults(c *Config) {
 	if c.Region == "" {
 		c.Region = "us-east1"
+	}
+	if len(c.PipelineRegions) == 0 {
+		// US regions whose default pool runs E2_HIGHCPU_8 and publishes to
+		// this project's cloud-builds topic (probed 2026-10-24).
+		c.PipelineRegions = []string{"us-east4", "us-east5", "us-central1", "us-south1", "us-west1"}
 	}
 	if c.AppProject == "" {
 		c.AppProject = "gitea-496920"
@@ -101,6 +121,18 @@ func validate(c *Config, emailIsSecret bool) error {
 	}
 	if !strings.HasPrefix(c.AppZone, c.Region) {
 		return fmt.Errorf("gitea-cicd:appZone %q is not in gcp:region %q", c.AppZone, c.Region)
+	}
+	seen := map[string]bool{}
+	for _, r := range c.PipelineRegions {
+		switch {
+		case r == c.Region:
+			return fmt.Errorf("gitea-cicd:pipelineRegions must not include gcp:region %q, where the launchers run", r)
+		case !region.MatchString(r):
+			return fmt.Errorf("gitea-cicd:pipelineRegions: %q is not a region name", r)
+		case seen[r]:
+			return fmt.Errorf("gitea-cicd:pipelineRegions lists %q twice", r)
+		}
+		seen[r] = true
 	}
 	if !strings.HasPrefix(c.GiteaURL, "https://") {
 		return fmt.Errorf("gitea-cicd:giteaUrl %q must be https", c.GiteaURL)
