@@ -13,6 +13,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ops"))
+import gitea_ops as O  # noqa: E402
 import infra_deploy as D  # noqa: E402
 import release_gate as G  # noqa: E402
 
@@ -93,6 +95,31 @@ class GoCache(unittest.TestCase):
         self.assertEqual(self.saves("up", hit=True), [])
         self.assertEqual(self.saves("up", hit=False),
                          [["tar", "-cf", mock.ANY], ["gcloud", "storage", "cp"]])
+
+
+class SshKeys(unittest.TestCase):
+    NOW = 2_000_000_000 * 1_000_000  # usec
+    LISTING = [
+        {"key": "never", "value": {"key": "ssh-rsa A", "fingerprint": "never"}},
+        {"key": "expired", "value": {"expirationTimeUsec": str(NOW - 1)}},
+        {"key": "live", "value": {"expirationTimeUsec": str(NOW + 3_600_000_000)}},
+        {"key": "bare"},
+    ]
+
+    def test_stale_are_the_never_expiring_and_the_expired(self):
+        self.assertEqual(O.stale_ssh_keys(self.LISTING, self.NOW), ["never", "expired", "bare"])
+        self.assertEqual(O.stale_ssh_keys([], self.NOW), [])
+
+    def test_infra_deploy_prunes_once_and_spares_a_live_key(self):
+        import json
+        d = D.Deploy(argparse.Namespace(mode="up", state_bucket="ci-deploy-state"))
+        listing = subprocess.CompletedProcess([], 0, stdout=json.dumps(self.LISTING))
+        with mock.patch.object(D, "run", return_value=listing) as run, \
+                mock.patch.object(D.time, "time", return_value=self.NOW / 1e6), redirect_stdout(io.StringIO()):
+            d.prune_ssh_keys()
+            d.prune_ssh_keys()  # a rollback's second sync
+        removed = [c.args[0][-1] for c in run.call_args_list if "remove" in c.args[0]]
+        self.assertEqual(removed, ["--key=never", "--key=expired", "--key=bare"])
 
 
 class Gate(unittest.TestCase):
