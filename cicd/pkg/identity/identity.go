@@ -221,10 +221,16 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 	if err := bucketRole("infra-deploy-state", b.DeployState, "roles/storage.objectAdmin", member(a.Infra)); err != nil {
 		return nil, err
 	}
-	// The infra build's Go module/compile cache (scripts/cicd/infra_deploy.py),
-	// restored before and rewritten after `go build`. Only cb-infra touches it;
-	// a preview account has no access and so builds cold.
+	// The infra build's Go module/compile cache (scripts/cicd/infra_deploy.py):
+	// one object per infra/go.sum, restored before `go build` and written only
+	// by a deploy that found none for its go.sum. Only cb-infra writes it.
+	// cb-infra-preview reads it, so a pull request's preview skips the cold
+	// compile too: it holds compiled public modules, nothing secret, and a
+	// preview still cannot change what a deploy restores.
 	if err := bucketRole("infra-build-cache", b.BuildCache, "roles/storage.objectAdmin", member(a.Infra)); err != nil {
+		return nil, err
+	}
+	if err := bucketRole("infra-preview-build-cache", b.BuildCache, "roles/storage.objectViewer", member(a.InfraPreview)); err != nil {
 		return nil, err
 	}
 	// The release gate: read which drills have passed, record a new pass.

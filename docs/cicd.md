@@ -310,9 +310,16 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 - Builds run on the public pool, which caps a build at 10 CPUs with no
   high-memory type (hence `E2_HIGHCPU_8` and the constrained Go compile in
   `cloudbuild/infra.yaml`). The infra build's Go compile against pulumi-gcp is
-  cached across deploys in a GCS `<ci>-build-cache` bucket, which
-  `scripts/cicd/infra_deploy.py` restores before `go build` and saves after --
-  best-effort: a miss or error just builds cold, and previews can't read it.
+  cached across runs in a GCS `<ci>-build-cache` bucket, one object per
+  `infra/go.mod` + `go.sum` + Go version: `scripts/cicd/infra_deploy.py`
+  restores it before `go build` (deploys and previews) and a deploy writes it
+  only when its go.sum has none yet, so an ordinary deploy uploads nothing. A
+  dependency bump starts from the newest object. The build uses `-trimpath`:
+  without it Go keys every compiled package by its directory, which differs
+  each run, and the cache never hits. Best-effort: a miss or error just builds
+  cold. Infra deploys also hold the ops pool's node with a placeholder pod
+  from the build on, so the backup and verify Jobs never wait for it to scale
+  up from zero.
   The image build is still cold: both Dockerfiles are multi-stage and the cost
   is in the discarded builder stages (Caddy's xcaddy compile, gitea's
   GPG-verified download), which BuildKit inline cache does not reach -- caching
