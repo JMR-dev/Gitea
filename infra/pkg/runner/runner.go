@@ -67,6 +67,11 @@ const (
 	appLabel     = "gitea-runner"
 	podsAppLabel = "gitea-runner-pods"
 
+	// heavyJobImage is the image `runs-on: heavy` jobs run in (the same one
+	// ubuntu-latest jobs use). The pre-pull DaemonSet keeps it resident on
+	// heavy nodes so a reused node starts a job without pulling it again.
+	heavyJobImage = "docker.io/gitea/runner-images:ubuntu-latest"
+
 	spcName   = "gitea-runner-registration-token"
 	tokenDir  = "/var/run/secrets/gitea-runner"
 	configDir = "/etc/gitea-runner"
@@ -335,10 +340,84 @@ func podRunner(
 		return nil, err
 	}
 
+	// Keep the heavy job image resident on heavy nodes, so a job that reuses a
+	// node still up from an earlier one does not re-pull it. Only with the pool.
+	if cfg.RunnerHeavyMaxNodes > 0 {
+		if _, err := heavyPrepull(ctx, inJobsNS); err != nil {
+			return nil, err
+		}
+	}
+
 	// No job pod may exist before its fence, and the runner cannot do its job
 	// before it can reach the API server and create pods.
 	deps := append([]pulumi.Resource{jobsPol, podsPol, role, binding, grant, gk.NodePool}, inNSDeps...)
 	return podsStatefulSet(ctx, cfg, ksa, cm, with(inNS, pulumi.DependsOn(deps)))
+}
+
+// heavyPrepull runs one tiny pod per heavy node that holds the heavy job image
+// in the node's image cache. On a brand-new node (the pool scales from zero)
+// the image is still pulled once, shared with the first job's pod; the win is a
+// node reused within a burst, which then starts a job without pulling. It is
+// safe-to-evict and requests almost nothing, so it never holds a heavy node up
+// against scale-down nor crowds out the one heavy job the node is sized for.
+func heavyPrepull(ctx *pulumi.Context, inJobsNS []pulumi.ResourceOption) (*appsv1.DaemonSet, error) {
+	labels := pulumi.StringMap{"app": pulumi.String("gitea-runner-heavy-prepull")}
+	return appsv1.NewDaemonSet(ctx, "gitea-runner-heavy-prepull", &appsv1.DaemonSetArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String("gitea-runner-heavy-prepull"),
+			Namespace: pulumi.String(JobsNamespace),
+			Labels:    labels,
+		},
+		Spec: &appsv1.DaemonSetSpecArgs{
+			Selector: &metav1.LabelSelectorArgs{MatchLabels: labels},
+			Template: &corev1.PodTemplateSpecArgs{
+				Metadata: &metav1.ObjectMetaArgs{
+					Labels: labels,
+					Annotations: pulumi.StringMap{
+						// Must never keep a heavy node alive: scale-to-zero is the
+						// point of the pool.
+						"cluster-autoscaler.kubernetes.io/safe-to-evict": pulumi.String("true"),
+					},
+				},
+				Spec: &corev1.PodSpecArgs{
+					// Only heavy nodes, tolerating their taint like a heavy job.
+					NodeSelector: pulumi.StringMap{gke.PoolKey: pulumi.String(gke.HeavyPoolValue)},
+					Tolerations: corev1.TolerationArray{
+						&corev1.TolerationArgs{
+							Key:      pulumi.String(gke.PoolKey),
+							Operator: pulumi.String("Equal"),
+							Value:    pulumi.String(gke.HeavyPoolValue),
+							Effect:   pulumi.String("NoSchedule"),
+						},
+					},
+					AutomountServiceAccountToken:  pulumi.Bool(false),
+					EnableServiceLinks:            pulumi.Bool(false),
+					TerminationGracePeriodSeconds: pulumi.Int(0),
+					Containers: corev1.ContainerArray{
+						&corev1.ContainerArgs{
+							Name:  pulumi.String("prepull"),
+							Image: pulumi.String(heavyJobImage),
+							// IfNotPresent: hold the cached image, do not re-pull.
+							ImagePullPolicy: pulumi.String("IfNotPresent"),
+							Command:         pulumi.ToStringArray([]string{"sleep", "infinity"}),
+							Resources: &corev1.ResourceRequirementsArgs{
+								Requests: pulumi.StringMap{
+									"cpu":    pulumi.String("10m"),
+									"memory": pulumi.String("32Mi"),
+								},
+								Limits: pulumi.StringMap{"memory": pulumi.String("64Mi")},
+							},
+							SecurityContext: &corev1.SecurityContextArgs{
+								AllowPrivilegeEscalation: pulumi.Bool(false),
+								Capabilities:             &corev1.CapabilitiesArgs{Drop: pulumi.ToStringArray([]string{"ALL"})},
+								SeccompProfile:           &corev1.SeccompProfileArgs{Type: pulumi.String("RuntimeDefault")},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, inJobsNS...)
 }
 
 func rule(resource string, verbs ...string) *rbacv1.PolicyRuleArgs {
@@ -539,13 +618,20 @@ func podsConfig(cfg *config.Config) string {
 	//
 	// `runs-on: heavy` gets the same image on the heavy pool, through a
 	// pod_templates entry keyed by the label: it selects and tolerates the
-	// pool, and asks for enough memory that the autoscaler can only satisfy it
-	// with a heavy node. The memory limit is twice the request, as below:
-	// most of the node, since there is one heavy job per node. That is held
-	// by the CPU request, not the memory one (gitea:runnerHeavyCpu).
+	// pool, and requests enough CPU and memory that the autoscaler can only
+	// satisfy it with a heavy node and fits one job per node. Unlike the burst
+	// jobs, the job container's memory limit equals its request, so the request
+	// sizes the whole node (gitea:runnerHeavyMemory ~= the node's usable
+	// memory); there is no CPU limit, so the one job still bursts into all the
+	// node's cores. One-per-node is now held by both requests (two no longer
+	// fit by either CPU or memory). The $services sidecar from pod_template
+	// still merges in, so a job that uses `services:` is Burstable, not
+	// Guaranteed; the node budget leaves room for it. ephemeral-storage is set
+	// explicitly: the strategic merge over pod_template is not relied on to
+	// carry the base request through.
 	var heavy string
 	if cfg.RunnerHeavyMaxNodes > 0 {
-		labels = append(labels, "heavy:kubernetes://docker.io/gitea/runner-images:ubuntu-latest")
+		labels = append(labels, "heavy:kubernetes://"+heavyJobImage)
 		heavy = fmt.Sprintf(`  pod_templates:
     heavy:
       spec:
@@ -562,10 +648,11 @@ func podsConfig(cfg *config.Config) string {
               requests:
                 cpu: %q
                 memory: %q
+                ephemeral-storage: 2Gi
               limits:
                 memory: %q
 `, gke.PoolKey, gke.HeavyPoolValue, gke.PoolKey, gke.HeavyPoolValue,
-			cfg.RunnerHeavyCPU, cfg.RunnerHeavyMemory, double(cfg.RunnerHeavyMemory))
+			cfg.RunnerHeavyCPU, cfg.RunnerHeavyMemory, cfg.RunnerHeavyMemory)
 	}
 
 	// "$services" is literal, as in upstream's docs/kubernetes.md: config

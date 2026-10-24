@@ -264,7 +264,8 @@ func applyDefaults(c *Config) {
 	}
 	if c.RunnerHeavyMachineType == "" {
 		// 4 vCPU / 32 GB: about 28 GiB allocatable after GKE's reservations,
-		// so one 12Gi job per node with room to burst to its 24Gi limit.
+		// so one heavy job per node. The heavy job's memory limit equals its
+		// request (package runner), so RunnerHeavyMemory alone sizes the job.
 		// Compiling a Pulumi Go program against pulumi-cloudflare v6 is what
 		// needs it: that SDK is one package, and its one compile process peaks
 		// at about 14.4 GB, more than an e2-standard-4 holds.
@@ -371,9 +372,10 @@ func validate(c *Config) error {
 		if _, _, err := E2Shape(c.OpsMachineType); err != nil {
 			return fmt.Errorf("gitea:opsMachineType: %w", err)
 		}
-		if c.RunnerHeavyMaxNodes < 0 || c.RunnerHeavyMaxNodes > 5 {
-			// A cost guard: these are on-demand 32 GB machines.
-			return fmt.Errorf("gitea:runnerHeavyMaxNodes %d must be between 0 and 5", c.RunnerHeavyMaxNodes)
+		if c.RunnerHeavyMaxNodes < 0 || c.RunnerHeavyMaxNodes > 6 {
+			// A cost guard: these are on-demand 32 GB machines. 6 lets a
+			// typical heavy fan-out run fully in parallel; raise it deliberately.
+			return fmt.Errorf("gitea:runnerHeavyMaxNodes %d must be between 0 and 6", c.RunnerHeavyMaxNodes)
 		}
 		if !quantity.MatchString(c.RunnerHeavyCPU) {
 			return fmt.Errorf("gitea:runnerHeavyCpu %q is not a Kubernetes quantity (e.g. 2, 3500m)", c.RunnerHeavyCPU)
