@@ -254,6 +254,21 @@ func Classify(paths []string, complete bool) (mode string, pipelines []string, r
 			infra = true
 		case strings.HasPrefix(p, "image/"), p == "cloudbuild/image.yaml":
 			image = true
+		case strings.HasPrefix(p, "scripts/cicd/"):
+			// scripts/cicd/ drives a deploy (the infra deploy driver, the
+			// shared release gate), so a change there deploys through the
+			// pipeline(s) that run the file. ReleasePaths says which, and the
+			// release gate then makes that deploy wait for the file's drill.
+			// Files there that drive nothing (bootstrap.py, tests) are not in
+			// ReleasePaths, so they deploy nothing.
+			for _, pl := range ReleasePaths[p] {
+				switch pl {
+				case PipelineInfra:
+					infra = true
+				case PipelineImage:
+					image = true
+				}
+			}
 		}
 	}
 	if infra {
@@ -264,7 +279,7 @@ func Classify(paths []string, complete bool) (mode string, pipelines []string, r
 	}
 	switch {
 	case len(pipelines) == 0:
-		return ModeDeploy, nil, "no infra/, vm/, image/ or cloudbuild/ change"
+		return ModeDeploy, nil, "no infra/, vm/, image/, cloudbuild/ or scripts/cicd/ change"
 	case gated:
 		return ModeGated, pipelines, "gated file changed"
 	default:
