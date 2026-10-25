@@ -2,7 +2,7 @@
 // package gke, the NetworkPolicies that keep jobs away from the metadata
 // server, the plumbing that gets the registration token into the runner pods
 // without Pulumi ever handling it, and the fixed tunnel-pod count running jobs
-// depend on (tunnel.go). There are two runners, with disjoint labels:
+// depend on (tunnel.go). There are three runners, with disjoint labels:
 //
 //   - The pod runner takes `runs-on: ubuntu-*`. It uses the runner's kubernetes
 //     backend: every job is its own unprivileged pod in JobsNamespace, so jobs
@@ -10,14 +10,21 @@
 //     queue. It cannot run Docker actions, `docker://` steps or `docker build`.
 //   - The DinD runner takes `runs-on: docker`, for exactly those. A StatefulSet
 //     of the official rootless Docker-in-Docker image, one pod per node.
+//   - The arm64 runner takes `runs-on: docker-arm64`, for native linux/arm64
+//     builds. Another kubernetes-backend runner, but each of its job pods, in
+//     ArmJobsNamespace on the arm64 pool, carries its own rootless dockerd as
+//     a sidecar, so the pool can scale to zero between jobs (armConfig).
 //
 // Threat model, in one paragraph: DinD jobs run inside that runner pod's own
 // dockerd, and they get its socket (that is what makes `docker build` work). A
 // job there can therefore read anything that daemon can see -- the runner's
 // /data/.runner credentials and the registration token included. That is
 // accepted: this is a single-tenant instance with registration disabled, so
-// every workflow author is already trusted. Pod jobs share nothing with their
-// runner but the cache port, and run under the baseline Pod Security level.
+// every workflow author is already trusted. An arm64 job holds its own
+// dockerd's socket the same way, but that daemon is its pod's alone. Pod jobs
+// share nothing with their runner but the cache port; ubuntu-* ones run under
+// the baseline Pod Security level, arm64 ones in a namespace of their own that
+// admits the privileged sidecar their dockerd needs.
 // What is NOT accepted is a job reaching Google Cloud or the cluster. The node
 // SA holds nothing useful (package gke), the runners' Kubernetes service
 // accounts hold only read access to that one token, the pod runner's API token
@@ -61,11 +68,30 @@ const (
 	// principals, so renaming one means its IAM grant moves with it.
 	KSAName     = "gitea-runner"
 	PodsKSAName = "gitea-runner-pods"
+	// ArmJobsNamespace and ArmKSAName are the arm64 runner's: its jobs'
+	// namespace, which unlike JobsNamespace admits privileged containers (the
+	// jobs' dockerd sidecars), and its own service account.
+	ArmJobsNamespace = "gitea-jobs-arm64"
+	ArmKSAName       = "gitea-runner-arm64"
 
 	// The DinD runner's label, and the selector of its StatefulSet: immutable,
 	// so it keeps the name it had when it was the only runner.
 	appLabel     = "gitea-runner"
 	podsAppLabel = "gitea-runner-pods"
+	armAppLabel  = "gitea-runner-arm64"
+
+	// armLabel is what a workflow puts in runs-on for an arm64 job.
+	armLabel = "docker-arm64"
+	// dindImage is the arm64 jobs' Docker daemon: the rootless image, as in the
+	// DinD runner. Multi-arch, so an arm64 node pulls its own. Pinned; bump
+	// deliberately.
+	dindImage = "docker.io/library/docker:29.9.2-dind-rootless"
+	// dindSocketDir is where an arm64 job pod's dockerd puts its socket, on an
+	// emptyDir the job container mounts too. Not under /run, which rootlesskit
+	// copies up into a tmpfs of its own.
+	dindSocketDir = "/dind"
+	// dindConfigMap holds that dockerd's daemon.json, in ArmJobsNamespace.
+	dindConfigMap = "gitea-dind"
 
 	// heavyJobImage is the image `runs-on: heavy` jobs run in (the same one
 	// ubuntu-latest jobs use). The pre-pull DaemonSet keeps it resident on
@@ -102,9 +128,11 @@ const (
 
 type Runner struct {
 	Provider *kubernetes.Provider
-	// StatefulSet is the DinD runner, PodsStatefulSet the pod runner.
+	// StatefulSet is the DinD runner, PodsStatefulSet the pod runner, and
+	// ArmStatefulSet the arm64 runner (nil without the arm64 pool).
 	StatefulSet     *appsv1.StatefulSet
 	PodsStatefulSet *appsv1.StatefulSet
+	ArmStatefulSet  *appsv1.StatefulSet
 }
 
 // New returns nil (without error) when the cluster was not created.
@@ -234,7 +262,15 @@ func New(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, deps []pulumi
 		return nil, err
 	}
 
-	return &Runner{Provider: k8s, StatefulSet: sts, PodsStatefulSet: podsSts}, nil
+	var armSts *appsv1.StatefulSet
+	if gk.ArmPool != nil {
+		armSts, err = armRunner(ctx, cfg, gk, proj.Number, opts, k8sOpts, inNS, []pulumi.Resource{netpol, spc})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Runner{Provider: k8s, StatefulSet: sts, PodsStatefulSet: podsSts, ArmStatefulSet: armSts}, nil
 }
 
 // podRunner deploys the runner whose jobs are pods: their namespace, the
@@ -282,51 +318,16 @@ func podRunner(
 		return nil, err
 	}
 
-	// Exactly the verbs upstream's examples/kubernetes/kubernetes-pods.yaml
-	// grants, and only in the jobs namespace -- so the runner cannot exec into
-	// the DinD runner, or read the Secrets it creates for its own jobs back.
-	role, err := rbacv1.NewRole(ctx, "gitea-runner-pods", &rbacv1.RoleArgs{
-		Metadata: &metav1.ObjectMetaArgs{
-			Name:      pulumi.String(PodsKSAName),
-			Namespace: pulumi.String(JobsNamespace),
-		},
-		Rules: rbacv1.PolicyRuleArray{
-			rule("pods", "create", "get", "list", "delete"),
-			rule("pods/exec", "create", "get"),
-			rule("pods/log", "get"),
-			rule("secrets", "create", "delete"),
-		},
-	}, inJobsNS...)
-	if err != nil {
-		return nil, err
-	}
-	binding, err := rbacv1.NewRoleBinding(ctx, "gitea-runner-pods", &rbacv1.RoleBindingArgs{
-		Metadata: &metav1.ObjectMetaArgs{
-			Name:      pulumi.String(PodsKSAName),
-			Namespace: pulumi.String(JobsNamespace),
-		},
-		RoleRef: &rbacv1.RoleRefArgs{
-			ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
-			Kind:     pulumi.String("Role"),
-			Name:     role.Metadata.Name().Elem(),
-		},
-		Subjects: rbacv1.SubjectArray{
-			&rbacv1.SubjectArgs{
-				Kind:      pulumi.String("ServiceAccount"),
-				Name:      ksa.Metadata.Name().Elem(),
-				Namespace: pulumi.String(Namespace),
-			},
-		},
-	}, inJobsNS...)
+	role, binding, err := jobsAccess(ctx, PodsKSAName, JobsNamespace, ksa, inJobsNS)
 	if err != nil {
 		return nil, err
 	}
 
-	jobsPol, err := jobsNetworkPolicy(ctx, inJobsNS)
+	jobsPol, err := jobsNetworkPolicy(ctx, JobsNamespace, podsAppLabel, inJobsNS)
 	if err != nil {
 		return nil, err
 	}
-	podsPol, err := podsNetworkPolicy(ctx, inNS)
+	podsPol, err := podsNetworkPolicy(ctx, PodsKSAName, podsAppLabel, JobsNamespace, inNS)
 	if err != nil {
 		return nil, err
 	}
@@ -348,10 +349,162 @@ func podRunner(
 		}
 	}
 
+	// gitea:runnerJobCapacity 0 removes the pod runner, and with it its disk.
+	replicas := 0
+	if cfg.RunnerJobCapacity > 0 {
+		replicas = 1
+	}
+
 	// No job pod may exist before its fence, and the runner cannot do its job
 	// before it can reach the API server and create pods.
 	deps := append([]pulumi.Resource{jobsPol, podsPol, role, binding, grant, gk.NodePool}, inNSDeps...)
-	return podsStatefulSet(ctx, cfg, ksa, cm, with(inNS, pulumi.DependsOn(deps)))
+	return podsStatefulSet(ctx, cfg, PodsKSAName, podsAppLabel, replicas, "200m", "512Mi", ksa, cm,
+		with(inNS, pulumi.DependsOn(deps)))
+}
+
+// armRunner deploys the arm64 runner the way podRunner deploys the pod runner:
+// its jobs' namespace, its access to it, the NetworkPolicies, and the runner,
+// which runs on the base pool and only places its jobs on the arm64 pool. Its
+// own registration, service account and namespace, rather than more labels on
+// the pod runner, because a kubernetes-backend runner has one namespace for
+// all its jobs, and JobsNamespace must keep refusing privileged pods.
+func armRunner(
+	ctx *pulumi.Context,
+	cfg *config.Config,
+	gk *gke.Cluster,
+	projectNumber string,
+	opts pulumi.ResourceOption,
+	k8sOpts, inNS []pulumi.ResourceOption,
+	inNSDeps []pulumi.Resource,
+) (*appsv1.StatefulSet, error) {
+	jobsNS, err := corev1.NewNamespace(ctx, ArmJobsNamespace, &corev1.NamespaceArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name: pulumi.String(ArmJobsNamespace),
+			Labels: pulumi.StringMap{
+				// Privileged, for each job pod's dockerd sidecar: rootless
+				// dockerd still needs a privileged container (see the DinD
+				// runner's). Only the arm64 runner creates pods here, and only
+				// from armConfig's template; a workflow cannot set a security
+				// context on the kubernetes backend.
+				"pod-security.kubernetes.io/enforce": pulumi.String("privileged"),
+			},
+		},
+	}, k8sOpts...)
+	if err != nil {
+		return nil, err
+	}
+	inJobsNS := with(k8sOpts, pulumi.DependsOn([]pulumi.Resource{jobsNS}))
+
+	ksa, err := corev1.NewServiceAccount(ctx, ArmKSAName, &corev1.ServiceAccountArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(ArmKSAName),
+			Namespace: pulumi.String(Namespace),
+		},
+	}, inNS...)
+	if err != nil {
+		return nil, err
+	}
+	grant, err := grantToken(ctx, cfg, gk, projectNumber, "runner-arm64-read-registration-token", ArmKSAName, opts)
+	if err != nil {
+		return nil, err
+	}
+	role, binding, err := jobsAccess(ctx, ArmKSAName, ArmJobsNamespace, ksa, inJobsNS)
+	if err != nil {
+		return nil, err
+	}
+	jobsPol, err := jobsNetworkPolicy(ctx, ArmJobsNamespace, armAppLabel, inJobsNS)
+	if err != nil {
+		return nil, err
+	}
+	armPol, err := podsNetworkPolicy(ctx, ArmKSAName, armAppLabel, ArmJobsNamespace, inNS)
+	if err != nil {
+		return nil, err
+	}
+
+	// The jobs' dockerd reads this, as the DinD runner's does: the Docker Hub
+	// mirror, the data root one level into its emptyDir, and the MTU. A fixed
+	// name, because armConfig's pod template refers to it; job pods are new
+	// every time, so an update reaches the next job without a rollout.
+	daemon, err := daemonJSON()
+	if err != nil {
+		return nil, err
+	}
+	dind, err := corev1.NewConfigMap(ctx, "gitea-jobs-arm64-dind", &corev1.ConfigMapArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(dindConfigMap),
+			Namespace: pulumi.String(ArmJobsNamespace),
+		},
+		Data: pulumi.StringMap{"daemon.json": pulumi.String(daemon)},
+	}, inJobsNS...)
+	if err != nil {
+		return nil, err
+	}
+
+	cm, err := corev1.NewConfigMap(ctx, "gitea-runner-arm64-config", &corev1.ConfigMapArgs{
+		// Auto-named, like the other runners', so a change rolls the pod.
+		Metadata: &metav1.ObjectMetaArgs{Namespace: pulumi.String(Namespace)},
+		Data:     pulumi.StringMap{"config.yaml": pulumi.String(armConfig(cfg))},
+	}, inNS...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Its jobs need the arm64 pool, or they would wait for nodes that cannot
+	// come. Requests below the pod runner's: it does the same polling for
+	// fewer jobs, and the base node has only ~130m and ~400Mi to spare
+	// (docs/runners.md); the pod runner idles at ~1m and ~100Mi.
+	deps := append([]pulumi.Resource{jobsPol, armPol, role, binding, grant, dind, gk.NodePool, gk.ArmPool}, inNSDeps...)
+	return podsStatefulSet(ctx, cfg, ArmKSAName, armAppLabel, 1, "50m", "128Mi", ksa, cm,
+		with(inNS, pulumi.DependsOn(deps)))
+}
+
+// jobsAccess grants a kubernetes-backend runner exactly the verbs upstream's
+// examples/kubernetes/kubernetes-pods.yaml does, and only in its jobs'
+// namespace -- so it cannot exec into another runner, or read the Secrets it
+// creates for its own jobs back.
+func jobsAccess(
+	ctx *pulumi.Context,
+	name, jobsNS string,
+	ksa *corev1.ServiceAccount,
+	opts []pulumi.ResourceOption,
+) (*rbacv1.Role, *rbacv1.RoleBinding, error) {
+	role, err := rbacv1.NewRole(ctx, name, &rbacv1.RoleArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(name),
+			Namespace: pulumi.String(jobsNS),
+		},
+		Rules: rbacv1.PolicyRuleArray{
+			rule("pods", "create", "get", "list", "delete"),
+			rule("pods/exec", "create", "get"),
+			rule("pods/log", "get"),
+			rule("secrets", "create", "delete"),
+		},
+	}, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	binding, err := rbacv1.NewRoleBinding(ctx, name, &rbacv1.RoleBindingArgs{
+		Metadata: &metav1.ObjectMetaArgs{
+			Name:      pulumi.String(name),
+			Namespace: pulumi.String(jobsNS),
+		},
+		RoleRef: &rbacv1.RoleRefArgs{
+			ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+			Kind:     pulumi.String("Role"),
+			Name:     role.Metadata.Name().Elem(),
+		},
+		Subjects: rbacv1.SubjectArray{
+			&rbacv1.SubjectArgs{
+				Kind:      pulumi.String("ServiceAccount"),
+				Name:      ksa.Metadata.Name().Elem(),
+				Namespace: pulumi.String(Namespace),
+			},
+		},
+	}, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return role, binding, nil
 }
 
 // heavyPrepull runs one tiny pod per heavy node that holds the heavy job image
@@ -694,6 +847,124 @@ kubernetes:
 		cfg.RunnerJobCPU, cfg.RunnerJobMemory, double(cfg.RunnerJobMemory)) + heavy
 }
 
+// armConfig is the arm64 runner's config.yaml. A docker-arm64 job is a pod on
+// the arm64 pool with its own Docker daemon: the rootless DinD image as a
+// native sidecar (an init container that keeps running), which starts before
+// the job container and lives as long as the pod. The two share the daemon's
+// socket on an emptyDir, and DOCKER_HOST points the job's steps at it, so
+// `docker build`, `docker buildx build` and `docker run` work as on the
+// `docker` runner -- natively arm64, and with nothing left running once the
+// pod is gone, which is what lets the pool scale to zero.
+//
+// The daemon's data root is an emptyDir on the node's boot disk, so every job
+// starts with no images and no build cache; a job that wants layer reuse
+// keeps it in a registry (`--cache-from/--cache-to type=registry`).
+//
+// The job container's postStart waits up to two minutes for the daemon. The
+// runner waits for every container to be running before it starts the steps,
+// so this holds them until `docker info` answers -- and a daemon that never
+// comes up fails the job then, instead of hanging it until runner.timeout.
+//
+// Sized so one job fills a c4a-standard-2: of its ~1.3 CPU and ~4.9 GiB that
+// GKE's DaemonSets leave, the daemon requests 800m and 3.5Gi and the job
+// container 250m and 512Mi, so a second job pod never fits and the autoscaler
+// adds a node instead. The daemon has no limits: its builds may use the whole
+// node, which runs nothing else. Capacity is one job per node of the pool.
+func armConfig(cfg *config.Config) string {
+	// Spot nodes give 30 seconds' notice, so this matters only for a rollout
+	// of the runner itself, which lets running jobs finish.
+	shutdown := "55m"
+	labels := []string{armLabel + ":kubernetes://docker.io/gitea/runner-images:ubuntu-latest"}
+	socket := "unix://" + dindSocketDir + "/docker.sock"
+
+	return runnerYAML(cfg.RunnerArmMaxNodes, shutdown, labels) + fmt.Sprintf(`
+metrics:
+  enabled: true
+  addr: ":%d"
+
+kubernetes:
+  namespace: %s
+  pod_template:
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        %s: %s
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: %s
+          operator: Equal
+          value: %s
+          effect: NoSchedule
+        - key: kubernetes.io/arch
+          operator: Equal
+          value: arm64
+          effect: NoSchedule
+      initContainers:
+        - name: dind
+          image: %s
+          restartPolicy: Always
+          # "dockerd" first: the image's entrypoint then adds no listeners of
+          # its own, so the daemon serves only this socket -- no TCP port.
+          args: ["dockerd", "--host=%s"]
+          env:
+            - name: DOCKERD_ROOTLESS_ROOTLESSKIT_MTU
+              value: "%d"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: dind-socket
+              mountPath: %s
+            - name: dind-data
+              mountPath: %s
+            - name: dind-config
+              mountPath: %s
+              readOnly: true
+          resources:
+            requests:
+              cpu: 800m
+              memory: 3584Mi
+              ephemeral-storage: 10Gi
+      containers:
+        - name: job
+          env:
+            - name: DOCKER_HOST
+              value: %s
+          volumeMounts:
+            - name: dind-socket
+              mountPath: %s
+          lifecycle:
+            postStart:
+              exec:
+                command: ["timeout", "120", "sh", "-c", "until docker info >/dev/null 2>&1; do sleep 2; done"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 2Gi
+            limits:
+              memory: 2Gi
+        - name: $services
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: dind-socket
+          emptyDir: {}
+        - name: dind-data
+          emptyDir: {}
+        - name: dind-config
+          configMap:
+            name: %s
+`, metricsPort, ArmJobsNamespace,
+		gke.PoolKey, gke.ArmPoolValue, gke.PoolKey, gke.ArmPoolValue,
+		dindImage, socket, mtu, dindSocketDir, dockerDataMount, dockerConfigDir,
+		socket, dindSocketDir, dindConfigMap)
+}
+
 // double doubles a resource quantity that config.validate has already matched,
 // keeping its suffix: "1536Mi" -> "3072Mi", "1.5Gi" -> "3Gi".
 func double(q string) string {
@@ -784,23 +1055,24 @@ func networkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networki
 	}, opts...)
 }
 
-// podsNetworkPolicy adds to networkPolicy for the pod runner alone. Policies
-// are additive, so it only opens what that runner needs beyond the fence:
-// its jobs' cache traffic, and the API server.
-func podsNetworkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
-	return networkingv1.NewNetworkPolicy(ctx, "gitea-runner-pods", &networkingv1.NetworkPolicyArgs{
+// podsNetworkPolicy adds to networkPolicy for one kubernetes-backend runner
+// (the pod runner, or the arm64 one), selected by its app label. Policies are
+// additive, so it only opens what that runner needs beyond the fence: its
+// jobs' cache traffic from jobsNS, and the API server.
+func podsNetworkPolicy(ctx *pulumi.Context, name, app, jobsNS string, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
+	return networkingv1.NewNetworkPolicy(ctx, name, &networkingv1.NetworkPolicyArgs{
 		Metadata: &metav1.ObjectMetaArgs{
-			Name:      pulumi.String(PodsKSAName),
+			Name:      pulumi.String(name),
 			Namespace: pulumi.String(Namespace),
 		},
 		Spec: &networkingv1.NetworkPolicySpecArgs{
-			PodSelector: &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(podsAppLabel)}},
+			PodSelector: &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(app)}},
 			PolicyTypes: pulumi.ToStringArray([]string{"Ingress", "Egress"}),
 			Ingress: networkingv1.NetworkPolicyIngressRuleArray{
 				// Job pods, to the runner's cache server. Unlike DinD jobs,
 				// theirs is real pod-to-pod traffic, so this rule is needed.
 				&networkingv1.NetworkPolicyIngressRuleArgs{
-					From:  networkingv1.NetworkPolicyPeerArray{&networkingv1.NetworkPolicyPeerArgs{NamespaceSelector: namespace(JobsNamespace)}},
+					From:  networkingv1.NetworkPolicyPeerArray{&networkingv1.NetworkPolicyPeerArgs{NamespaceSelector: namespace(jobsNS)}},
 					Ports: tcp(cachePort),
 				},
 			},
@@ -822,16 +1094,18 @@ func podsNetworkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*netw
 	}, opts...)
 }
 
-// jobsNetworkPolicy fences JobsNamespace the way networkPolicy fences the
-// runners: no ingress, and egress to DNS, the pod runner's cache server and the
-// internet minus everything private and link-local. That last exclusion is
-// what keeps job pods away from the metadata server and the API server, so it
-// is load-bearing here too.
-func jobsNetworkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
-	return networkingv1.NewNetworkPolicy(ctx, "gitea-jobs", &networkingv1.NetworkPolicyArgs{
+// jobsNetworkPolicy fences a jobs namespace (jobsNS, whose runner's pods carry
+// the app label runnerApp) the way networkPolicy fences the runners: no
+// ingress, and egress to DNS, the runner's cache server and the internet minus
+// everything private and link-local. That last exclusion is what keeps job
+// pods away from the metadata server and the API server, so it is load-bearing
+// here too. In ArmJobsNamespace it fences each pod's dockerd sidecar as well,
+// which shares the pod's network, and so the containers that dockerd runs.
+func jobsNetworkPolicy(ctx *pulumi.Context, jobsNS, runnerApp string, opts []pulumi.ResourceOption) (*networkingv1.NetworkPolicy, error) {
+	return networkingv1.NewNetworkPolicy(ctx, jobsNS, &networkingv1.NetworkPolicyArgs{
 		Metadata: &metav1.ObjectMetaArgs{
-			Name:      pulumi.String(JobsNamespace),
-			Namespace: pulumi.String(JobsNamespace),
+			Name:      pulumi.String(jobsNS),
+			Namespace: pulumi.String(jobsNS),
 		},
 		Spec: &networkingv1.NetworkPolicySpecArgs{
 			PodSelector: &metav1.LabelSelectorArgs{},
@@ -842,7 +1116,7 @@ func jobsNetworkPolicy(ctx *pulumi.Context, opts []pulumi.ResourceOption) (*netw
 					To: networkingv1.NetworkPolicyPeerArray{
 						&networkingv1.NetworkPolicyPeerArgs{
 							NamespaceSelector: namespace(Namespace),
-							PodSelector:       &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(podsAppLabel)}},
+							PodSelector:       &metav1.LabelSelectorArgs{MatchLabels: pulumi.StringMap{"app": pulumi.String(runnerApp)}},
 						},
 					},
 					Ports: tcp(cachePort),
@@ -1088,32 +1362,31 @@ func statefulSet(
 	}, opts...)
 }
 
-// podsStatefulSet is the pod runner: one small, unprivileged pod that polls
-// Gitea and turns each job into a pod in JobsNamespace. A StatefulSet, like the
-// DinD runner, so its PVC keeps .runner and the actions cache across restarts.
+// podsStatefulSet is a kubernetes-backend runner (the pod runner, or the arm64
+// one): one small, unprivileged pod that polls Gitea and turns each job into a
+// pod in its jobs namespace. A StatefulSet, like the DinD runner, so its PVC
+// keeps .runner and the actions cache across restarts. name is the
+// StatefulSet's, app its pods' label; cpu and memory are its requests.
 func podsStatefulSet(
 	ctx *pulumi.Context,
 	cfg *config.Config,
+	name, app string,
+	replicas int,
+	cpu, memory string,
 	ksa *corev1.ServiceAccount,
 	cm *corev1.ConfigMap,
 	opts []pulumi.ResourceOption,
 ) (*appsv1.StatefulSet, error) {
-	labels := pulumi.StringMap{"app": pulumi.String(podsAppLabel)}
+	labels := pulumi.StringMap{"app": pulumi.String(app)}
 
-	// gitea:runnerJobCapacity 0 removes the pod runner, and with it its disk.
-	replicas := 0
-	if cfg.RunnerJobCapacity > 0 {
-		replicas = 1
-	}
-
-	return appsv1.NewStatefulSet(ctx, "gitea-runner-pods", &appsv1.StatefulSetArgs{
+	return appsv1.NewStatefulSet(ctx, name, &appsv1.StatefulSetArgs{
 		Metadata: &metav1.ObjectMetaArgs{
-			Name:      pulumi.String(PodsKSAName),
+			Name:      pulumi.String(name),
 			Namespace: pulumi.String(Namespace),
 			Labels:    labels,
 		},
 		Spec: &appsv1.StatefulSetSpecArgs{
-			ServiceName:                          pulumi.String(PodsKSAName),
+			ServiceName:                          pulumi.String(name),
 			Replicas:                             pulumi.Int(replicas),
 			Selector:                             &metav1.LabelSelectorArgs{MatchLabels: labels},
 			PersistentVolumeClaimRetentionPolicy: deletePVCs(),
@@ -1126,20 +1399,20 @@ func podsStatefulSet(
 				Metadata: &metav1.ObjectMetaArgs{
 					Labels: labels,
 					Annotations: pulumi.StringMap{
-						// Every running ubuntu-* job dies with this pod. The base
-						// pool is not autoscaled, so nothing asks today; this
+						// Every running job of this runner dies with this pod. The
+						// base pool is not autoscaled, so nothing asks today; this
 						// keeps it that way if the pool ever is.
 						"cluster-autoscaler.kubernetes.io/safe-to-evict": pulumi.String("false"),
 					},
 				},
 				Spec: &corev1.PodSpecArgs{
 					ServiceAccountName: ksa.Metadata.Name(),
-					// The one pod here that needs an API token: it creates,
-					// execs into and deletes job pods. The Role confines it to
-					// JobsNamespace.
+					// The pods here that need an API token: they create,
+					// exec into and delete job pods. The Role confines each to
+					// its own jobs namespace.
 					AutomountServiceAccountToken: pulumi.Bool(true),
 					EnableServiceLinks:           pulumi.Bool(false),
-					// Above runner.shutdown_timeout (podsConfig).
+					// Above runner.shutdown_timeout (podsConfig, armConfig).
 					TerminationGracePeriodSeconds: pulumi.Int(3600),
 
 					// Required for the Secret Manager add-on on Standard
@@ -1218,8 +1491,8 @@ func podsStatefulSet(
 							// node fits (docs/runners.md).
 							Resources: &corev1.ResourceRequirementsArgs{
 								Requests: pulumi.StringMap{
-									"cpu":    pulumi.String("200m"),
-									"memory": pulumi.String("512Mi"),
+									"cpu":    pulumi.String(cpu),
+									"memory": pulumi.String(memory),
 								},
 							},
 						},
