@@ -1,0 +1,49 @@
+# The names the vm/config and vm/quadlets templates use (their ${VAR}s), from
+# the instance metadata (preflight) and what this role probes. tests/render.yml
+# loads this same file, so the golden tests check these expressions too.
+#
+# caddy_mode -- "bridge" or "host" -- is probed once (see tasks); "host" is the
+# fallback when a container on the podman bridge cannot reach the metadata
+# server, which the googleclouddns ACME plugin needs.
+APP_NAME: "{{ app_name }}"
+DOMAIN: "{{ domain }}"
+REQUIRE_SIGNIN_VIEW: "{{ require_signin_view }}"
+WAF_MODE: "{{ waf_mode }}"
+GCP_PROJECT: "{{ gcp_project }}"
+IMAGE_GITEA: "{{ image_gitea }}"
+IMAGE_CADDY: "{{ image_caddy }}"
+PODMAN_SUBNET: "{{ podman_subnet }}"
+PODMAN_GATEWAY: "{{ podman_gateway }}"
+
+# Trust both the bridge CIDR and loopback so this stays correct in either Caddy
+# networking mode. Rootful podman SNATs host-loopback traffic to the bridge
+# gateway, so the CIDR covers the host-network case too.
+TRUSTED_PROXIES: "{{ podman_subnet }},127.0.0.1/32"
+
+# Left as placeholders: files/gitea-render-secrets fills them in on the VM.
+GITEA_SECRET_KEY: "${GITEA_SECRET_KEY}"
+GITEA_INTERNAL_TOKEN: "${GITEA_INTERNAL_TOKEN}"
+GITEA_OAUTH2_JWT_SECRET: "${GITEA_OAUTH2_JWT_SECRET}"
+GITEA_LFS_JWT_SECRET: "${GITEA_LFS_JWT_SECRET}"
+CADDY_EMAIL: "${CADDY_EMAIL}"
+
+GITEA_UPSTREAM: "{{ '127.0.0.1:3000' if caddy_mode == 'host' else 'gitea:3000' }}"
+CADDY_NETWORK: "{{ 'host' if caddy_mode == 'host' else 'gitea.network' }}"
+CADDY_PUBLISH_PORTS: "{{ caddy_publish_host if caddy_mode == 'host' else caddy_publish_bridge }}"
+CADDY_SYSCTL: "{{ caddy_sysctl_host if caddy_mode == 'host' else caddy_sysctl_bridge }}"
+caddy_publish_bridge: |-
+  PublishPort=80:80
+  PublishPort=443:443
+  PublishPort=443:443/udp
+caddy_publish_host: "# Network=host: ports are bound directly, publishing would be invalid."
+caddy_sysctl_bridge: Sysctl=net.ipv4.ip_unprivileged_port_start=0
+caddy_sysctl_host: "# Network=host: podman rejects net.* sysctls; set on the host instead."
+
+# Gitea calls log.Fatal when GITEA_RUNNER_REGISTRATION_TOKEN_FILE names a file
+# it cannot read, so the lines and the file come from one decision: whether
+# the file exists after the runner-token step (docs/runners.md).
+GITEA_RUNNER_TOKEN: "{{ runner_token_lines if runner_token_present | bool else runner_token_none }}"
+runner_token_lines: |-
+  Volume=/etc/gitea/runner-token:/etc/gitea/runner-token:ro,Z
+  Environment=GITEA_RUNNER_REGISTRATION_TOKEN_FILE=/etc/gitea/runner-token
+runner_token_none: "# No runner registration token: gitea:runnersEnabled is off, or the secret does not exist yet."

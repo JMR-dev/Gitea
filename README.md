@@ -24,7 +24,8 @@ infra/        Pulumi program (Go). One package per slice of infrastructure;
               pkg/gke and pkg/runner are the optional Actions runner cluster.
 image/        Dockerfiles for the Gitea and Caddy images, plus pinned versions.
 vm/           Everything that lands on the VM: quadlets, systemd units,
-              nftables, fail2ban, config templates, and bootstrap.sh.
+              nftables, fail2ban, config templates, and vm/ansible -- the
+              playbook that puts them there.
 cicd/         CI/CD for this repo, in a GCP project of its own: Pulumi program
               (Go) and the webhook relay functions (cicd/relay).
 cloudbuild/   The two build pipelines.
@@ -33,8 +34,13 @@ scripts/      One-time project bootstrap; ops/ is the release engine, cicd/ the
 docs/         Runbook, CI/CD, WAF tuning guide, Actions runners, migration-to-Gitea-SCM plan.
 ```
 
-`vm/` is uploaded to a GCS bucket by Pulumi and pulled down by the instance, so
-changing a quadlet is a normal pull request.
+The VM is configured by the Ansible playbook in `vm/ansible`, pushed to it over
+IAP SSH: every infra deploy runs it after `pulumi up`
+(`scripts/cicd/infra_deploy.py`), and `make vm-check` shows what it would change.
+Changing a quadlet is a normal pull request; its golden renders
+(`vm/ansible/tests/golden`) show the effect in the diff. The VM has no startup
+script: what the playbook sets up persists across reboots, and a replaced VM is
+configured by the same deploy that created it.
 
 ## First-time setup
 
@@ -94,9 +100,9 @@ cd infra && pulumi config set gitea:runnersEnabled true && pulumi up
 Between step 5 and step 6 the `:prod` images do not exist yet, so `gitea.service`
 and `caddy.service` crash-loop. That is intentional: the units carry
 `Restart=always` with `StartLimitIntervalSec=0`, so they recover on their own
-within 30 seconds of the first successful push. Likewise, `app.ini` is not
-rendered until Gitea's secrets are readable — `bootstrap.sh` skips rendering
-rather than writing a config with empty signing keys.
+within 30 seconds of the first successful push. Likewise, `app.ini` is never
+written with empty signing keys: the playbook generates Gitea's secrets once an
+image is there to generate them with, and fails rather than render without them.
 
 ## Day-to-day
 
@@ -108,7 +114,8 @@ make release GITEA=<sha>   # go live: backup, checks, automatic rollback
 make ops-backup # dump + config tarball + exports + data-disk snapshot
 make ops-verify # the release status checks, against prod
 make rollout    # pull the latest :prod images now
-make sync       # re-render VM config after a vm/ change
+make vm-check   # what the playbook would change on the VM (read-only)
+make vm-apply   # apply it now (a deploy does this itself); `make sync` is the same
 make ssh        # shell via IAP
 ```
 
@@ -162,7 +169,7 @@ containers on older runtimes). The Caddy version stays a deliberate change to
   `#!/usr/bin/env bash`; without it every push is rejected. Its
   `rsync`/`unzip`/`sqlite3` are the restore toolbox, because the host has none.
 - **`app.ini` is fully managed** and `INSTALL_LOCK=true`. Gitea settings changed
-  in the web UI that map to `app.ini` will not survive a config sync. Edit
+  in the web UI that map to `app.ini` will not survive the next deploy. Edit
   `vm/config/app.ini.tmpl` instead.
 - **The podman subnet is pinned** (`10.89.10.0/24`). It is what
   `REVERSE_PROXY_TRUSTED_PROXIES` names; an unpinned subnet would silently make

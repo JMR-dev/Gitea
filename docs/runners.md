@@ -256,10 +256,10 @@ value also carries the secret `gitea:fail2banIgnore`, the operator's own address
    The first apply takes 15–25 minutes: cluster, node pool, then the
    StatefulSet. If the StatefulSet wait times out (IAM or CSI propagation on a
    brand-new cluster), run `pulumi up` again. Everything already created stays.
-3. The infra pipeline's config-sync step restarts Gitea with the token.
+3. The infra deploy's playbook run writes the token file and restarts Gitea with it.
    Meanwhile the runner retries registration every 5 seconds. If the runner logs
    keep saying the token is invalid after the pipeline finishes, the VM most
-   likely read the secret before its IAM grant had propagated. Run `make sync`.
+   likely read the secret before its IAM grant had propagated. Run `make vm-apply`.
 4. Check:
    ```bash
    make kube && make runners    # both runner pods Running, logs show each registered and declared
@@ -476,7 +476,7 @@ rotation never affects them; it only governs new registrations.
 ```bash
 openssl rand -hex 32 | tr -d '\n' \
   | gcloud secrets versions add gitea-runner-registration-token --project <p> --data-file=-
-make sync     # renders the new token file and restarts Gitea
+make vm-apply # renders the new token file and restarts Gitea
 ```
 
 Two Gitea behaviours make this a one-way street:

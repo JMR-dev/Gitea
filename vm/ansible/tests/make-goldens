@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Writes tests/golden/*/ from each fixture.yml the way vm/bootstrap.sh
+rendered it -- envsubst with its exact variable lists and derived values,
+and its gitea-backup heredoc run through bash -- so tests/check proves the
+playbook writes the same bytes the bash did.
+
+The bash is gone from the tree (this playbook replaced it), so it is read
+from git at BOOTSTRAP_REV (default c5df517, a main commit that has it).
+Needs PyYAML (the ansible-core install has it) and gettext's envsubst. Run
+it when a fixture is added; the goldens are committed.
+"""
+import os
+import subprocess
+import sys
+
+import yaml
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VM = os.path.normpath(os.path.join(HERE, "..", ".."))
+REV = os.environ.get("BOOTSTRAP_REV", "c5df517")
+BOOTSTRAP = subprocess.run(["git", "show", f"{REV}:vm/bootstrap.sh"], cwd=VM, check=True,
+                           capture_output=True, text=True).stdout
+
+# The SHELL-FORMAT lists vm/bootstrap.sh passed to envsubst, and the files.
+LISTS = {
+    "app.ini": ("config/app.ini.tmpl", "${APP_NAME} ${DOMAIN} ${GITEA_SECRET_KEY} ${GITEA_INTERNAL_TOKEN} "
+                "${GITEA_OAUTH2_JWT_SECRET} ${GITEA_LFS_JWT_SECRET} ${TRUSTED_PROXIES} ${REQUIRE_SIGNIN_VIEW}"),
+    "Caddyfile": ("config/Caddyfile.tmpl", "${DOMAIN} ${CADDY_EMAIL} ${GITEA_UPSTREAM} ${WAF_MODE}"),
+    "nftables.conf": ("nftables/gitea.nft", "${PODMAN_SUBNET} ${PODMAN_GATEWAY}"),
+    "gitea.local": ("fail2ban/jail.d/gitea.local", "${PODMAN_SUBNET} ${CORAZA_JAIL_ENABLED} ${RUNNER_EGRESS_IP}"),
+}
+QUADLET_LIST = ("${IMAGE_GITEA} ${IMAGE_CADDY} ${PODMAN_SUBNET} ${PODMAN_GATEWAY} ${GCP_PROJECT} "
+                "${CADDY_NETWORK} ${CADDY_PUBLISH_PORTS} ${CADDY_SYSCTL} ${GITEA_RUNNER_TOKEN}")
+QUADLETS = ["gitea.network", "gitea.container", "caddy.container", "caddy-data.volume", "caddy-config.volume"]
+
+
+def bash_env(f):
+    """The environment render_all, setup_nftables and setup_fail2ban exported."""
+    host = f["caddy_mode"] == "host"
+    s = f["secrets"]
+    token = "/etc/gitea/runner-token"
+    env = {
+        "APP_NAME": f["app_name"], "DOMAIN": f["domain"], "REQUIRE_SIGNIN_VIEW": str(f["require_signin_view"]),
+        "WAF_MODE": f["waf_mode"], "GCP_PROJECT": f["gcp_project"],
+        "IMAGE_GITEA": f["image_gitea"], "IMAGE_CADDY": f["image_caddy"],
+        "PODMAN_SUBNET": f["podman_subnet"], "PODMAN_GATEWAY": f["podman_gateway"],
+        "TRUSTED_PROXIES": f"{f['podman_subnet']},127.0.0.1/32",
+        "GITEA_UPSTREAM": "127.0.0.1:3000" if host else "gitea:3000",
+        "CADDY_NETWORK": "host" if host else "gitea.network",
+        "CADDY_PUBLISH_PORTS": "# Network=host: ports are bound directly, publishing would be invalid." if host
+        else "PublishPort=80:80\nPublishPort=443:443\nPublishPort=443:443/udp",
+        "CADDY_SYSCTL": "# Network=host: podman rejects net.* sysctls; set on the host instead." if host
+        else "Sysctl=net.ipv4.ip_unprivileged_port_start=0",
+        "GITEA_RUNNER_TOKEN": f"Volume={token}:{token}:ro,Z\nEnvironment=GITEA_RUNNER_REGISTRATION_TOKEN_FILE={token}"
+        if f["runner_token_present"] else
+        "# No runner registration token: gitea:runnersEnabled is off, or the secret does not exist yet.",
+        "CORAZA_JAIL_ENABLED": "true" if f["waf_mode"] == "On" else "false",
+        "RUNNER_EGRESS_IP": f["runner_egress_ip"],
+        **{k: v for k, v in s.items()},
+    }
+    # Every literal above is in the bash it stands for.
+    for lit in ("127.0.0.1:3000", "gitea:3000", "PublishPort=80:80\\nPublishPort=443:443\\nPublishPort=443:443/udp",
+                "# Network=host: ports are bound directly, publishing would be invalid.",
+                "# Network=host: podman rejects net.* sysctls; set on the host instead.",
+                "Sysctl=net.ipv4.ip_unprivileged_port_start=0", '"Volume=${dst}:${dst}:ro,Z"',
+                '"Environment=GITEA_RUNNER_REGISTRATION_TOKEN_FILE=${dst}"',
+                "# No runner registration token: gitea:runnersEnabled is off, or the secret does not exist yet.",
+                '"${PODMAN_SUBNET},127.0.0.1/32"'):
+        assert lit in BOOTSTRAP, f"not in vm/bootstrap.sh at {REV}: {lit}"
+    for lst in [v[1] for v in LISTS.values()] + [QUADLET_LIST]:
+        assert lst in BOOTSTRAP, f"envsubst list not in vm/bootstrap.sh at {REV}: {lst}"
+    return env
+
+
+def envsubst(path, varlist, env):
+    with open(path, "rb") as fh:
+        return subprocess.run(["envsubst", varlist], input=fh.read(), capture_output=True, check=True,
+                              env={"PATH": os.environ["PATH"], **env}).stdout
+
+
+def backup_script(bucket):
+    """install_helpers' unquoted heredoc for /usr/local/bin/gitea-backup, run by bash."""
+    start = BOOTSTRAP.index("cat > /usr/local/bin/gitea-backup <<EOF")
+    end = BOOTSTRAP.index("\nEOF\n", start) + len("\nEOF\n")
+    block = BOOTSTRAP[start:end].replace("cat > /usr/local/bin/gitea-backup <<EOF", "cat <<EOF", 1)
+    return subprocess.run(["bash", "-c", block], capture_output=True, check=True,
+                          env={"PATH": os.environ["PATH"], "BACKUP_BUCKET": bucket}).stdout
+
+
+def main():
+    for name in sorted(os.listdir(os.path.join(HERE, "golden"))):
+        d = os.path.join(HERE, "golden", name)
+        with open(os.path.join(d, "fixture.yml")) as fh:
+            f = yaml.safe_load(fh)
+        env = bash_env(f)
+        out = {k: envsubst(os.path.join(VM, src), lst, env) for k, (src, lst) in LISTS.items()}
+        for q in QUADLETS:
+            out[q] = envsubst(os.path.join(VM, "quadlets", q), QUADLET_LIST, env)
+        out["gitea-backup"] = backup_script(f["backup_bucket"])
+        for k, v in out.items():
+            with open(os.path.join(d, k + ".golden"), "wb") as fh:
+                fh.write(v)
+        print(f"{name}: {len(out)} goldens")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

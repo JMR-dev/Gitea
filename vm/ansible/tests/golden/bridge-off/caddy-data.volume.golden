@@ -1,0 +1,9 @@
+# ACME account keys and issued certificates. Losing this means re-issuing certs
+# (and burning Let's Encrypt rate limit), so it is a named volume rather than
+# a tmpfs or an anonymous mount.
+[Unit]
+Description=Caddy certificate and ACME account storage
+
+[Volume]
+VolumeName=caddy-data
+Label=app=gitea

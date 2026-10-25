@@ -1,0 +1,162 @@
+# Packages, swap, the podman firewall driver, automatic updates.
+- name: Packages
+  ansible.builtin.dnf:
+    name:
+      - podman
+      - container-selinux
+      - nftables
+      - jq
+      - gettext  # envsubst, for files/gitea-render-secrets
+      - policycoreutils-python-utils
+      - xfsprogs
+    state: present
+    lock_timeout: 600  # dnf-makecache can hold the lock on a first boot
+
+# fail2ban lives in EPEL on RHEL-family distros. Probe rather than assume, as
+# the bash did: a missing fail2ban skips its setup, it does not fail the run.
+- name: EPEL
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+    lock_timeout: 600
+  register: epel
+  failed_when: false
+
+- name: fail2ban
+  ansible.builtin.dnf:
+    name: [fail2ban, fail2ban-server]
+    state: present
+    lock_timeout: 600
+  register: fail2ban_pkg
+  failed_when: false
+
+- name: Is fail2ban there?
+  ansible.builtin.shell: command -v fail2ban-server
+  register: fail2ban_server
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Remember it
+  ansible.builtin.set_fact:
+    fail2ban_present: "{{ fail2ban_server.rc == 0 }}"
+
+# The systemd journal backend needs the Python bindings; without them
+# fail2ban silently falls back and matches nothing.
+- name: fail2ban's journal bindings
+  ansible.builtin.dnf:
+    name: python3-systemd
+    state: present
+    lock_timeout: 600
+  when: fail2ban_present | bool
+
+- name: Warn when fail2ban is not installable
+  ansible.builtin.debug:
+    msg: "WARN: fail2ban not installable from the configured repos -- skipping fail2ban setup ({{ fail2ban_pkg.msg | default('') }})"
+  when: not fail2ban_present | bool
+
+# GCE instances ship with no swap. On e2-small (2 GB) that is a real risk:
+# git subprocesses spawned during a push (receive-pack, index-pack, gc) push
+# the total past 400 MB on a modest repo. Without swap, the OOM killer picks a
+# victim mid-push. Ballast, not working memory -- hence the low swappiness. If
+# the box is swapping steadily, the answer is a bigger machine type.
+- name: Swap file present?
+  ansible.builtin.stat:
+    path: /swapfile
+  register: swapfile
+
+# dd, not fallocate: a fallocated file can carry unwritten extents that mkswap
+# accepts and the kernel then refuses to swap to.
+- name: Swap file
+  ansible.builtin.shell: |
+    set -e
+    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    chmod 0600 /swapfile
+    mkswap /swapfile >/dev/null
+  when: not swapfile.stat.exists
+
+- name: Swap active?
+  ansible.builtin.command: swapon --show=NAME --noheadings
+  register: swaps
+  changed_when: false
+  check_mode: false
+
+- name: Swap on
+  ansible.builtin.command: swapon /swapfile
+  when: "'/swapfile' not in swaps.stdout_lines"
+
+- name: Swap in fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^/swapfile '
+    line: /swapfile none swap sw 0 0
+
+- name: Swappiness
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-gitea-swappiness.conf
+    content: "vm.swappiness = 10\n"
+    mode: "0644"
+  register: swappiness
+
+- name: Apply swappiness
+  ansible.builtin.command: sysctl -q -p /etc/sysctl.d/90-gitea-swappiness.conf
+  when: swappiness is changed
+
+# Netavark keeps its rules in a dedicated `netavark` nftables table, which is
+# what makes coexistence with our own table workable. Changing this with
+# containers running leaves conflicting rules behind; a reboot is the
+# documented fix if it is ever changed on a live host (docs/runbook.md).
+- name: Podman's drop-in directory
+  ansible.builtin.file:
+    path: /etc/containers/containers.conf.d
+    state: directory
+
+- name: Podman's firewall driver
+  ansible.builtin.copy:
+    dest: /etc/containers/containers.conf.d/10-gitea.conf
+    content: |
+      [network]
+      firewall_driver = "nftables"
+    mode: "0644"
+
+- name: dnf-automatic config
+  ansible.builtin.copy:
+    src: "{{ vm_src }}/dnf/automatic.conf"
+    dest: /etc/dnf/automatic.conf
+    mode: "0644"
+
+# AlmaLinux 10 has shipped both dnf4's dnf-automatic.timer and dnf5's
+# dnf5-automatic.timer; use whichever exists, installing a provider if none.
+- name: Find the dnf automatic timer
+  ansible.builtin.shell: |
+    for t in dnf5-automatic.timer dnf-automatic.timer; do
+      systemctl cat "$t" >/dev/null 2>&1 && { echo "$t"; exit 0; }
+    done
+    exit 0
+  register: dnf_timer
+  changed_when: false
+  check_mode: false
+
+- name: Install a dnf automatic provider
+  ansible.builtin.shell: |
+    dnf -y install "$(dnf -q provides '*/dnf5-automatic.timer' 2>/dev/null | awk 'NR==1{print $1}')" \
+      || dnf -y install dnf-automatic
+    for t in dnf5-automatic.timer dnf-automatic.timer; do
+      systemctl cat "$t" >/dev/null 2>&1 && { echo "$t"; exit 0; }
+    done
+    exit 1
+  register: dnf_timer_installed
+  when: dnf_timer.stdout | length == 0
+
+- name: Automatic updates
+  ansible.builtin.systemd_service:
+    name: "{{ dnf_timer.stdout or dnf_timer_installed.stdout_lines[-1] }}"
+    enabled: true
+    state: started
+  when: dnf_timer.stdout | length > 0 or dnf_timer_installed is changed
+
+- name: Image auto-update
+  ansible.builtin.systemd_service:
+    name: podman-auto-update.timer
+    enabled: true
+    state: started

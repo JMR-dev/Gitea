@@ -1,0 +1,60 @@
+# The Gitea VM, from a blank AlmaLinux 10 image to serving. Idempotent: a run
+# against a configured VM changes nothing (`make vm-check` shows what would).
+#
+# The config sources stay where vm/bootstrap.sh read them -- vm/config,
+# vm/quadlets, vm/systemd, vm/nftables, vm/fail2ban, vm/dnf -- and the
+# templates keep their ${VAR} syntax, rendered with ${ } as Jinja's variable
+# delimiters, so the output is byte for byte what envsubst produced
+# (tests/check proves it).
+- name: Gitea VM
+  hosts: gitea
+  become: true
+  vars:
+    vm_src: "{{ playbook_dir }}/.."
+  roles:
+    - preflight
+    - base
+    - data_disk
+    - firewall
+    - helpers
+    - app
+
+  # All the handlers live here, so they run in this order -- Ansible runs
+  # notified handlers in definition order: units are reloaded before the
+  # restarts, and Gitea restarts before Caddy, as the bash did.
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      listen: [units changed, gitea config changed]
+
+    - name: Restart gitea
+      ansible.builtin.systemd_service:
+        name: gitea.service
+        state: restarted
+      listen: gitea config changed
+
+    - name: Restart caddy
+      ansible.builtin.systemd_service:
+        name: caddy.service
+        state: restarted
+      listen: gitea config changed
+
+    # Never `systemctl reload` or `restart` nftables: on EL its ExecReload is
+    # `nft 'flush ruleset; include ...'` and its ExecStop a bare `flush
+    # ruleset`, which wipe netavark's DNAT rules and fail2ban's bans along with
+    # ours (every container not restarted afterwards silently loses its
+    # published ports). The file replaces exactly one table, so loading it is
+    # the reload. infra_deploy.py refuses a playbook that restarts the unit.
+    - name: Load nftables
+      ansible.builtin.command: nft -f /etc/sysconfig/nftables.conf
+      changed_when: true
+      notify: Check gitea_filter
+
+    - name: Check gitea_filter
+      ansible.builtin.command: nft list table inet gitea_filter
+      changed_when: false
+
+    - name: Reload fail2ban
+      ansible.builtin.shell: systemctl reload fail2ban || systemctl restart fail2ban
+      changed_when: true

@@ -5,8 +5,8 @@ own, `gitea-ci-781388`, not from the app project `gitea-496920`. CI for the
 repos Gitea *hosts* is unaffected. It stays on Gitea Actions and the GKE
 runners.
 
-**Status:** built, `autoDeploy = false`. Nothing deploys on merge until drills
-D1–D6 below have passed and `autoDeploy` is turned on.
+**Status:** live since 2026-10-23: drills D1–D6 passed and `autoDeploy = true`,
+so merges to main deploy (below).
 
 ## How it fits together
 
@@ -100,8 +100,14 @@ The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
   is release code, re-run its drill from the branch first (so the merge's
   deploy passes the gate); the merge's pending `cloudbuild/drill-*` status
   marks it due. `bootstrap.py` and the tests drive no deploy.
-- `vm/bootstrap.sh` is the VM's startup script, so any edit replaces the VM
-  (about 15 min down and a new Let's Encrypt certificate).
+- The VM is configured by the playbook in `vm/ansible`, which the infra deploy
+  runs over IAP SSH after `pulumi up`; a `vm/` change deploys through the infra
+  pipeline. Until 2026-10-26 `vm/bootstrap.sh` was the VM's startup script, so
+  editing it replaced the VM; the relay still gates that path.
+- A change that replaces the VM (machine type, boot image, anything Pulumi
+  cannot update in place) is about 20–30 min down and a new Let's Encrypt
+  certificate: the deploy deletes the old VM, creates the new one, waits for
+  SSH and boot, runs the playbook, then waits for HTTPS before verify.
 - Even without approval, the infra pipeline refuses to replace or delete the
   VM, a disk, a bucket, the cluster, an address or a DNS record.
 - The engine refuses a major or Alpine-minor change without `--allow-*`, which
@@ -138,7 +144,10 @@ make approve BUILD=<id>      # gcloud beta builds approve (there is no GA comman
 4. Destructive-change guard.
 5. Backup: the engine's backup Job (dump, config tarball, online snapshot) plus
    a `pulumi stack export` under `config/<stamp>-infra/`.
-6. `pulumi up` and the config sync.
+6. `pulumi up`, then the VM's config: the playbook (`vm/ansible`) for a tree
+   that has it, the old `gitea-config-sync` for one with `vm/bootstrap.sh` --
+   the tree being applied decides, so a rollback across the change works. A
+   replaced VM is waited for (SSH, boot, then HTTPS after its config).
 7. The engine's `verify` Job.
 8. A preview that must show nothing left to change.
 9. On success, the tree becomes **last-good**. On a failure in steps 6–8, the
@@ -273,7 +282,7 @@ secret `inputs.kubeconfig`.
 
 Everything still works by hand, as before:
 - `make release`, `make ops-rollback`;
-- `cd infra && pulumi up`, `make sync`;
+- `cd infra && pulumi up`, `make vm-apply` (`make up` runs both);
 - `make build` (in the app project).
 
 `make ci-infra-up` runs the infra pipeline from your checkout as CI's identity,

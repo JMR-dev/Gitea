@@ -26,20 +26,33 @@ fmt: ## Format Go sources
 
 # -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
+# Shell that runs on the VM (shipped by the playbook) or for it.
+SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/vm-steps.sh scripts/rehearsal.sh \
+	vm/ansible/roles/app/files/gitea-render-secrets vm/ansible/roles/helpers/files/gitea-ar-auth \
+	vm/ansible/roles/helpers/files/gitea-reboot-if-needed
 .PHONY: check
-check: ci-check ## Build and vet both Pulumi programs and the relay, test them, and syntax-check the scripts
+check: ci-check ansible-check ## Build and vet both Pulumi programs and the relay, test them, and check the scripts and the playbook
 	cd infra && go build -o gitea-infra . && go vet ./...
-	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh
+	bash -n $(SHELL_SCRIPTS)
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
-	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh || echo "shellcheck not installed -- skipped"
+	@command -v shellcheck >/dev/null && shellcheck -S warning $(SHELL_SCRIPTS) || echo "shellcheck not installed -- skipped"
+
+# The checks a PR preview and a deploy run on vm/ansible (infra_deploy.py's
+# ansible_checks), with the pinned ansible-core: no nftables restart/reload,
+# a syntax check, and the golden renders (vm/ansible/tests/check).
+.PHONY: ansible-check
+ansible-check: ## Lint, syntax-check and golden-test the playbook (vm/ansible)
+	python3 -c 'import os, sys, argparse; sys.path[:0] = ["scripts/cicd", "scripts/ops"]; import infra_deploy as D; \
+		D.Deploy(argparse.Namespace(mode="check", state_bucket="")).ansible_checks(os.getcwd())'
 
 .PHONY: preview
 preview: check ## Show what `pulumi up` would change
 	cd infra && pulumi preview
 
 .PHONY: up
-up: check ## Apply the infrastructure
+up: check ## Apply the infrastructure, then the VM's config (vm-apply)
 	cd infra && pulumi up
+	$(MAKE) vm-apply
 
 # --region: the triggers are 2nd-gen and therefore regional. Without this flag
 #   `builds submit` runs in the global region -- a different worker pool from
@@ -113,10 +126,23 @@ rollout: ## Pull the latest :prod images onto the VM right now
 	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
 		--command 'sudo systemctl start podman-auto-update.service && sudo podman ps'
 
+# The playbook (vm/ansible) against $(VM), as a deploy runs it after `pulumi
+# up`: scripts/cicd/infra_deploy.py installs the pinned ansible-core,
+# registers an hour's OS Login key and runs ansible-playbook over IAP SSH.
+# Against prod, vm-apply holds the infra deploy lock, so it never overlaps a
+# deploy. VM=gitea-rehearsal for the rehearsal VM (`make rehearsal-up`).
+VM_MODE = python3 scripts/cicd/infra_deploy.py --app-project=$(PROJECT) --region=$(REGION) --zone=$(ZONE) --vm=$(VM) \
+	$(if $(filter gitea-vm,$(VM)),--state-bucket=$(CI_STATE))
+.PHONY: vm-check
+vm-check: ## Show what the playbook would change on VM (read-only: --check --diff)
+	$(VM_MODE) vm-check
+
+.PHONY: vm-apply
+vm-apply: ## Apply the playbook to VM now and restart what changed
+	$(VM_MODE) --approved vm-apply
+
 .PHONY: sync
-sync: ## Re-render VM config from the bucket and restart what changed
-	gcloud compute ssh $(VM) --zone=$(ZONE) --tunnel-through-iap --project=$(PROJECT) \
-		--command 'sudo systemctl start gitea-config-sync.service && sudo journalctl -u gitea-config-sync -n 40 --no-pager'
+sync: vm-apply ## Same as vm-apply (the VM no longer pulls its config)
 
 .PHONY: ssh
 ssh: ## Shell on the VM through IAP
@@ -233,6 +259,34 @@ ci-drill: ci-clean ## Run drill NAME of PIPELINE through CI (see the comment abo
 		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-$(PIPELINE)@$(CI_PROJECT).iam.gserviceaccount.com \
 		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
 		--substitutions=_DRILL=$(NAME),_DRILL_OK=1,_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE)$(if $(filter image,$(PIPELINE)),$(COMMA)_RELEASE=true$(COMMA)SHORT_SHA=$$(git rev-parse --short=7 HEAD),$(COMMA)_MODE=up)
+
+# vm-check / vm-apply as CI's own identity (cb-infra), from this commit: the
+# path a deploy takes. APPROVED=1 is needed to apply to prod. Only an apply to
+# prod takes the infra deploy lock: a rehearsal holding it would make a real
+# deploy wait, and a cancelled build leaves its lock behind (removing it by
+# hand, after checking that build is gone, is the fix).
+.PHONY: ci-vm-check
+ci-vm-check: ci-clean ## vm-check through Cloud Build as cb-infra
+	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/infra.yaml \
+		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-infra@$(CI_PROJECT).iam.gserviceaccount.com \
+		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
+		--substitutions=_MODE=vm-check,_VM=$(VM),_SHA=$$(git rev-parse HEAD),_DEPLOY_STATE_BUCKET=$(CI_STATE)
+
+.PHONY: ci-vm-apply
+ci-vm-apply: ci-clean ## vm-apply through Cloud Build as cb-infra (APPROVED=1 for prod)
+	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/infra.yaml \
+		--service-account=projects/$(CI_PROJECT)/serviceAccounts/cb-infra@$(CI_PROJECT).iam.gserviceaccount.com \
+		--gcs-source-staging-dir=gs://$(CI_PROJECT)-build-source/source \
+		--substitutions=_MODE=vm-apply,_VM=$(VM),_APPROVED=$(if $(APPROVED),true,false),_SHA=$$(git rev-parse HEAD)$(if $(filter gitea-vm,$(VM)),$(COMMA)_DEPLOY_STATE_BUCKET=$(CI_STATE))
+
+# A throwaway VM like prod's but cut off from it (scripts/rehearsal.sh).
+.PHONY: rehearsal-up
+rehearsal-up: ## Create the rehearsal VM (LEGACY=1: booted by the old vm/bootstrap.sh)
+	PROJECT=$(PROJECT) ZONE=$(ZONE) REGION=$(REGION) scripts/rehearsal.sh up $(if $(LEGACY),--legacy)
+
+.PHONY: rehearsal-down
+rehearsal-down: ## Delete the rehearsal VM and everything rehearsal-up made
+	PROJECT=$(PROJECT) ZONE=$(ZONE) REGION=$(REGION) scripts/rehearsal.sh down
 
 COMMA := ,
 .PHONY: ci-clean

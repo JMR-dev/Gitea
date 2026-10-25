@@ -1,0 +1,15 @@
+# Rendered by vm/bootstrap.sh into /etc/containers/systemd/
+#
+# The subnet is PINNED deliberately. Left to podman it is drawn from the default
+# pool and is not stable across a network recreate -- and this CIDR is exactly
+# what Gitea's REVERSE_PROXY_TRUSTED_PROXIES has to name. An unpinned subnet
+# means a network recreate silently reverts every fail2ban ban to targeting
+# Caddy instead of the real client.
+[Unit]
+Description=Gitea container network
+
+[Network]
+NetworkName=gitea
+Subnet=10.89.10.0/24
+Gateway=10.89.10.1
+Label=app=gitea

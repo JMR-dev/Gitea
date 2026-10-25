@@ -1,0 +1,174 @@
+# Rendered by vm/bootstrap.sh -> /etc/caddy/Caddyfile
+#
+# Two compile-time plugins are doing the work here:
+#
+#   googleclouddns -- ACME DNS-01, so issuance and renewal never need inbound 80
+#   coraza_waf     -- OWASP Coraza with the Core Rule Set embedded in the binary
+{
+	email someone@example.test
+	admin 127.0.0.1:2019
+	# Required by coraza-caddy: Caddy has no built-in ordering for a third-party
+	# directive, and the WAF must run before anything that could act on the
+	# request. Applies inside handle blocks too.
+	order coraza_waf first
+}
+
+gitea.example.test {
+	tls {
+		dns googleclouddns {
+			# Application Default Credentials come from the GCE metadata server.
+			# The VM service account holds roles/dns.admin scoped to this zone, plus
+			# project-level dns.reader so the plugin can list zones to find it.
+			gcp_project {env.GCP_PROJECT}
+		}
+		# Only used for propagation checks. If issuance stalls waiting for
+		# propagation, this is the knob to turn.
+		resolvers 8.8.8.8 8.8.4.4
+	}
+
+	encode zstd gzip
+
+	# Governs the git/LFS branch below. The WAF branch has its own, much smaller,
+	# SecRequestBodyLimit -- they apply to different routes and are not a mismatch
+	# to be "fixed".
+	request_body {
+		max_size 512MB
+	}
+
+	# ---------------------------------------------------------------------
+	# robots.txt, answered here: Gitea ships none and returns 404, and
+	# without one AI crawlers walked every src/commits/raw/blame page of every
+	# public repo, a few requests a second at 1.5s of git work each, which
+	# kept Gitea at a full core. The list mirrors the routes Gitea itself
+	# treats as expensive (routers/common/blockexpensive.go), which
+	# REQUIRE_SIGNIN_VIEW = expensive closes to anonymous users anyway, plus
+	# the editor pages, the API and the login redirects they lead to.
+	# Repository home pages, releases and profiles stay crawlable.
+	# ---------------------------------------------------------------------
+	handle /robots.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `User-agent: *
+Disallow: /*/*/archive/
+Disallow: /*/*/blame/
+Disallow: /*/*/commit/
+Disallow: /*/*/commits/
+Disallow: /*/*/compare/
+Disallow: /*/*/graph
+Disallow: /*/*/media/
+Disallow: /*/*/raw/
+Disallow: /*/*/rss/branch/
+Disallow: /*/*/src/
+Disallow: /*/*/issues
+Disallow: /*/*/pulls
+Disallow: /*/*/wiki/
+Disallow: /*/*/activity
+Disallow: /*/*/find/
+Disallow: /*/*/search
+Disallow: /*/*/_
+Disallow: /api/
+Disallow: /user/
+` 200
+	}
+
+	# ---------------------------------------------------------------------
+	# Git transport and LFS: deliberately NOT behind the WAF.
+	#
+	# Packfiles are binary and trip CRS's SQLi/XSS rules constantly, and
+	# coraza.conf-recommended's SecRequestBodyLimit would reject any push
+	# larger than ~12MB outright. Running CRS here does not harden anything;
+	# it just breaks git. Authentication still applies -- Gitea does that.
+	# ---------------------------------------------------------------------
+	@gittransport path_regexp ^/[^/]+/[^/]+/(?:info/refs|git-upload-pack|git-receive-pack|HEAD|objects/.*|info/lfs(?:/.*)?)$
+	handle @gittransport {
+		reverse_proxy gitea:3000 {
+			transport http {
+				read_timeout 900s
+				write_timeout 900s
+			}
+		}
+	}
+
+	# ---------------------------------------------------------------------
+	# Gitea Actions runner protocol and artifacts: also NOT behind the WAF.
+	#
+	# The runner speaks Connect RPC with binary protobuf bodies
+	# (Content-Type: application/proto), and artifact uploads are PUT/PATCH
+	# with application/octet-stream. CRS rejects both outright -- the content
+	# type is not in tx.allowed_request_content_type, and PUT/PATCH are not in
+	# tx.allowed_methods -- so with wafMode On every runner would go offline,
+	# and log uploads (arbitrary build output) would trip SQLi/XSS rules even
+	# if they did not. Same reasoning as git above: inspecting this traffic
+	# breaks it without protecting anything. Every route here authenticates
+	# with a runner or task token, which Gitea checks.
+	#
+	# Prefixes, not an RPC-name list, so a Gitea upgrade that adds an RPC does
+	# not silently start 403ing. /api/v1/ is a different prefix and stays
+	# behind the WAF. See docs/runners.md.
+	# ---------------------------------------------------------------------
+	@actions path /api/actions/* /api/actions_pipeline/* /twirp/github.actions.results.api.v1.ArtifactService/*
+	handle @actions {
+		reverse_proxy gitea:3000 {
+			transport http {
+				read_timeout 900s
+				write_timeout 900s
+			}
+		}
+	}
+
+	# ---------------------------------------------------------------------
+	# Everything else -- web UI and API -- goes through the WAF.
+	# ---------------------------------------------------------------------
+	handle {
+		coraza_waf {
+			load_owasp_crs
+			directives `
+			Include @coraza.conf-recommended
+			Include @crs-setup.conf.example
+			Include @owasp_crs/*.conf
+
+			# DetectionOnly logs what it would have blocked without blocking.
+			# The fail2ban jail is enabled ONLY when this is On -- banning on
+			# detections that were never blocks would turn a false positive
+			# into an nftables ban, which is worse than the 403 it avoided.
+			SecRuleEngine Off
+
+			# Inspecting responses on a git host costs CPU and catches nothing
+			# worth catching.
+			SecResponseBodyAccess Off
+
+			# Truncate-and-inspect rather than reject: a large but legitimate
+			# attachment upload should not 413 because the WAF gave up.
+			SecRequestBodyLimitAction ProcessPartial
+
+			# RelevantOnly, not On. Auditing every request would pour the full
+			# request volume into journald and then into Cloud Logging.
+			SecAuditEngine RelevantOnly
+
+			# The default relevant-status is ^(?:5|4(?!04)), which audits every
+			# 401 -- and on a public git host unauthenticated API and web probes
+			# produce those constantly. That noise would bury the would-be blocks
+			# this log exists to surface. Narrowed to real WAF refusals and
+			# server errors; rule-triggered transactions are still audited on
+			# severity regardless of status, which is what keeps DetectionOnly
+			# useful.
+			SecAuditLogRelevantStatus "^(?:5[0-9]{2}|403)$"
+
+			SecAuditLog /dev/stdout
+			SecAuditLogFormat json
+			SecAuditLogParts ABIJDEFHZ
+			`
+		}
+
+		reverse_proxy gitea:3000 {
+			transport http {
+				read_timeout 900s
+				write_timeout 900s
+			}
+		}
+	}
+
+	log {
+		output stderr
+		format json
+	}
+}

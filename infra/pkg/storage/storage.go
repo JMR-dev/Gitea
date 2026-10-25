@@ -1,9 +1,10 @@
-// Package storage holds the buckets and, importantly, uploads the vm/ tree
-// as Pulumi-managed objects.
+// Package storage holds the buckets, and hashes the vm/ tree.
 //
-// Uploading the VM configuration through Pulumi (rather than a `gcloud storage
-// rsync` in a build step) means `pulumi preview` shows exactly which quadlet or
-// template changed, and drift on the bucket is visible in state.
+// The VM no longer pulls its config from the config bucket: the playbook in
+// vm/ansible is pushed to it over SSH (scripts/cicd/infra_deploy.py), and its
+// golden renders show a template change in the PR's own diff. The bucket stays
+// for now -- a rollback to a tree from before that change uploads into it again
+// -- and goes in a later, approved change.
 package storage
 
 import (
@@ -99,7 +100,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, vmDir string, deps []pulumi.Re
 		return nil, err
 	}
 
-	hash, err := uploadTree(ctx, configBucket, vmDir)
+	hash, err := hashTree(vmDir)
 	if err != nil {
 		return nil, err
 	}
@@ -107,15 +108,18 @@ func New(ctx *pulumi.Context, cfg *config.Config, vmDir string, deps []pulumi.Re
 	return &Buckets{Config: configBucket, Backup: backupBucket, BuildSource: buildSourceBucket, ConfigHash: hash}, nil
 }
 
-// uploadTree mirrors vmDir into gs://<bucket>/vm/ and returns a content hash of
-// the whole tree.
-func uploadTree(ctx *pulumi.Context, bucket *storage.Bucket, vmDir string) (string, error) {
+// hashTree returns a content hash of the vm/ tree, skipping dot-directories
+// (a local Ansible or Python cache, say).
+func hashTree(vmDir string) (string, error) {
 	var paths []string
 	err := filepath.WalkDir(vmDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			if path != vmDir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		paths = append(paths, path)
@@ -133,22 +137,12 @@ func uploadTree(ctx *pulumi.Context, bucket *storage.Bucket, vmDir string) (stri
 		if err != nil {
 			return "", err
 		}
-		rel = filepath.ToSlash(rel)
-
 		content, err := os.ReadFile(p)
 		if err != nil {
 			return "", err
 		}
-		sum.Write([]byte(rel))
+		sum.Write([]byte(filepath.ToSlash(rel)))
 		sum.Write(content)
-
-		if _, err := storage.NewBucketObject(ctx, "vm/"+rel, &storage.BucketObjectArgs{
-			Name:   pulumi.String("vm/" + rel),
-			Bucket: bucket.Name,
-			Source: pulumi.NewFileAsset(p),
-		}); err != nil {
-			return "", err
-		}
 	}
 	return hex.EncodeToString(sum.Sum(nil))[:16], nil
 }

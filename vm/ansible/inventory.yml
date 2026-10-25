@@ -1,0 +1,24 @@
+# One host, reached the way `gcloud compute ssh --tunnel-through-iap` does:
+# through an IAP tunnel, as the caller's OS Login user, with the key gcloud
+# registered. infra_deploy.py's prime_ssh does that registration (an hour's
+# key) and records the host key under compute.<instance id>, which is what
+# the HostKeyAlias below looks up -- so the host key is checked, strictly.
+#
+# `env -u PYTHONPATH`: ansible-core runs from a pip --target directory on
+# PYTHONPATH (infra_deploy.py ansible_env), and gcloud -- on its own bundled
+# Python -- would import that directory's cryptography over its own and crash
+# before the tunnel opened (seen in Cloud Build's gcloud image).
+all:
+  hosts:
+    gitea:
+      ansible_host: "{{ lookup('ansible.builtin.env', 'GITEA_VM') }}"
+      ansible_user: "{{ lookup('ansible.builtin.env', 'GITEA_SSH_USER') }}"
+      ansible_ssh_private_key_file: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/google_compute_engine"
+      ansible_ssh_common_args: >-
+        -o ProxyCommand="env -u PYTHONPATH gcloud compute start-iap-tunnel {{ lookup('ansible.builtin.env', 'GITEA_VM') }} 22
+        --listen-on-stdin --zone={{ lookup('ansible.builtin.env', 'GITEA_ZONE') }}
+        --project={{ lookup('ansible.builtin.env', 'GITEA_PROJECT') }} --verbosity=warning"
+        -o HostKeyAlias=compute.{{ lookup('ansible.builtin.env', 'GITEA_INSTANCE_ID') }}
+        -o UserKnownHostsFile={{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/google_compute_known_hosts
+        -o StrictHostKeyChecking=yes
+        -o IdentitiesOnly=yes

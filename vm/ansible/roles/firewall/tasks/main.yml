@@ -1,0 +1,84 @@
+# The host firewall (vm/nftables/gitea.nft) and fail2ban (vm/fail2ban).
+
+# firewalld and a hand-managed ruleset will fight. Pick one.
+- name: Is firewalld masked?
+  ansible.builtin.command: systemctl is-enabled firewalld.service
+  register: firewalld
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Mask firewalld
+  ansible.builtin.shell: systemctl disable --now firewalld >/dev/null 2>&1; systemctl mask firewalld
+  when: firewalld.stdout != 'masked'
+
+# Validated before it is installed: a ruleset that fails to parse must never
+# land in /etc/sysconfig, or nftables.service would fail to load it on the
+# next boot and the host would come up with no gitea_filter table at all.
+- name: nftables ruleset
+  ansible.builtin.template:
+    src: "{{ vm_src }}/nftables/gitea.nft"
+    dest: /etc/sysconfig/nftables.conf
+    mode: "0600"
+    variable_start_string: "${"
+    variable_end_string: "}"
+    validate: nft -c -f %s
+  notify: Load nftables
+
+# Started and enabled, never restarted or reloaded (see the handler).
+- name: nftables at boot
+  ansible.builtin.systemd_service:
+    name: nftables.service
+    enabled: true
+    state: started
+
+# The bash loaded the file on every run, so a table lost by hand came back on
+# the next sync; keep that.
+- name: Is gitea_filter loaded?
+  ansible.builtin.command: nft list table inet gitea_filter
+  register: gitea_filter
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Reload a missing gitea_filter
+  ansible.builtin.debug:
+    msg: gitea_filter is not loaded; loading /etc/sysconfig/nftables.conf
+  changed_when: true
+  when: gitea_filter.rc != 0
+  notify: Load nftables
+
+- name: fail2ban filters and action
+  ansible.builtin.copy:
+    src: "{{ vm_src }}/fail2ban/{{ item }}"
+    dest: /etc/fail2ban/{{ item }}
+    mode: "0644"
+  loop:
+    - action.d/nft-prerouting.conf
+    - filter.d/gitea.conf
+    - filter.d/caddy-coraza.conf
+  when: fail2ban_present | bool
+  notify: Reload fail2ban
+
+# One config value drives both halves: the WAF only blocks in On, and only
+# then is it safe to escalate a WAF verdict into an nftables ban. In
+# DetectionOnly the jail is inert so tuning cannot lock anyone out. The jail
+# lists runner-egress-ip, which carries the operator's own addresses, so no
+# diff of it is ever shown.
+- name: fail2ban jail
+  ansible.builtin.template:
+    src: "{{ vm_src }}/fail2ban/jail.d/gitea.local"
+    dest: /etc/fail2ban/jail.d/gitea.local
+    mode: "0644"
+    variable_start_string: "${"
+    variable_end_string: "}"
+  diff: false
+  when: fail2ban_present | bool
+  notify: Reload fail2ban
+
+- name: fail2ban running
+  ansible.builtin.systemd_service:
+    name: fail2ban.service
+    enabled: true
+    state: started
+  when: fail2ban_present | bool

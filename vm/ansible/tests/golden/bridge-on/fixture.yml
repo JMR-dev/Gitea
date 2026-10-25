@@ -1,0 +1,21 @@
+# Caddy on the podman bridge, a runner token, the WAF blocking (so its jail
+# is on), and runner-egress-ip with an operator address as well.
+app_name: Gitea
+domain: gitea.example.test
+require_signin_view: expensive
+waf_mode: "On"
+gcp_project: example-project
+image_gitea: us-east1-docker.pkg.dev/example-project/gitea/gitea:prod
+image_caddy: us-east1-docker.pkg.dev/example-project/gitea/caddy:prod
+podman_subnet: 10.89.10.0/24
+podman_gateway: 10.89.10.1
+runner_egress_ip: 34.26.149.196 203.0.113.7
+backup_bucket: example-project-gitea-backups
+caddy_mode: bridge
+runner_token_present: true
+secrets:
+  GITEA_SECRET_KEY: fixtureSecretKey0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL
+  GITEA_INTERNAL_TOKEN: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYmYiOjE3MDAwMDAwMDB9.fixture-internal-token
+  GITEA_OAUTH2_JWT_SECRET: fixture-oauth2-jwt-secret-abcdefghijklmnopqrstuvwxy
+  GITEA_LFS_JWT_SECRET: fixture-lfs-jwt-secret-abcdefghijklmnopqrstuvwxyz012
+  CADDY_EMAIL: email ops@example.test

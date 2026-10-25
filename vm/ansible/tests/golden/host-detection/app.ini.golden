@@ -1,0 +1,119 @@
+; Rendered by vm/bootstrap.sh -> /etc/gitea/app.ini (owner 1000:1000, mode 0400).
+;
+; This file is FULLY MANAGED. Configuration happens here, on the host, and the
+; file is bind-mounted read-only. Our image deliberately leaves out upstream's
+; entrypoint scripts and their `environment-to-ini` step, which rewrites
+; app.ini from GITEA__section__KEY variables -- and fails on a read-only mount.
+;
+; INSTALL_LOCK=true means the web installer is never reachable. Editing Gitea
+; settings through the UI that map to app.ini will NOT persist; change the
+; template in the repo and let the config-sync pipeline re-render it.
+
+APP_NAME = Our Gitea
+RUN_USER = git
+RUN_MODE = prod
+WORK_PATH = /var/lib/gitea
+
+[server]
+PROTOCOL          = http
+HTTP_ADDR         = 0.0.0.0
+HTTP_PORT         = 3000
+; Gitea 28 no longer reads DOMAIN: it takes the domain from ROOT_URL, which
+; names the same host. Kept so that rolling back to 1.27 -- which still reads
+; it -- needs no template change. Drop it once 1.27 is out of reach.
+DOMAIN            = git.example.test
+ROOT_URL          = https://git.example.test/
+APP_DATA_PATH     = /var/lib/gitea/data
+DISABLE_SSH       = false
+; Built-in Go SSH server -- no sshd inside the container, and the host's sshd
+; keeps port 22 for OS Login / IAP admin access.
+START_SSH_SERVER       = true
+BUILTIN_SSH_SERVER_USER = git
+SSH_DOMAIN        = git.example.test
+SSH_LISTEN_HOST   = 0.0.0.0
+SSH_LISTEN_PORT   = 2222
+; Advertised in clone URLs; must match the published host port.
+SSH_PORT          = 2222
+LFS_START_SERVER  = true
+LFS_JWT_SECRET    = l2
+OFFLINE_MODE      = true
+
+[database]
+DB_TYPE             = sqlite3
+PATH                = /var/lib/gitea/data/gitea.db
+; WAL is what makes SQLite tolerable under concurrent reads.
+SQLITE_JOURNAL_MODE = WAL
+SQLITE_TIMEOUT      = 500
+
+[repository]
+ROOT                    = /var/lib/gitea/data/gitea-repositories
+DEFAULT_BRANCH          = main
+DEFAULT_PRIVATE         = private
+DISABLE_HTTP_GIT        = false
+
+[repository.upload]
+TEMP_PATH = /var/lib/gitea/data/tmp/uploads
+
+[lfs]
+PATH = /var/lib/gitea/data/lfs
+
+[security]
+INSTALL_LOCK   = true
+SECRET_KEY     = k2
+INTERNAL_TOKEN = t2
+; Without these two, Gitea sees Caddy's address as the client for every request
+; and fail2ban ends up banning the reverse proxy, locking everyone out.
+REVERSE_PROXY_TRUSTED_PROXIES = 10.89.20.0/24,127.0.0.1/32
+REVERSE_PROXY_LIMIT           = 1
+PASSWORD_HASH_ALGO            = argon2
+
+[oauth2]
+JWT_SECRET = o2
+
+[service]
+DISABLE_REGISTRATION              = true
+REQUIRE_SIGNIN_VIEW               = false
+REGISTER_EMAIL_CONFIRM            = false
+ENABLE_NOTIFY_MAIL                = false
+ALLOW_ONLY_EXTERNAL_REGISTRATION  = false
+ENABLE_CAPTCHA                    = false
+DEFAULT_KEEP_EMAIL_PRIVATE        = true
+DEFAULT_ALLOW_CREATE_ORGANIZATION = true
+DEFAULT_ENABLE_TIMETRACKING       = true
+
+[session]
+PROVIDER      = file
+PROVIDER_CONFIG = /var/lib/gitea/data/sessions
+COOKIE_SECURE = true
+
+[mailer]
+ENABLED = false
+
+[log]
+; console -> journald -> Cloud Logging, and it is what fail2ban's systemd
+; backend reads via CONTAINER_NAME=gitea. Do not switch to file logging without
+; updating vm/fail2ban/jail.d/gitea.local.
+MODE      = console
+LEVEL     = info
+ROOT_PATH = /var/lib/gitea/log
+
+[actions]
+; Enabled now so the eventual migration off GitHub Cloud Build triggers onto
+; Gitea Actions does not need a config change + restart.
+ENABLED       = true
+DEFAULT_ACTIONS_URL = github
+; Runners run on GKE (docs/runners.md), but their logs and artifacts land HERE,
+; on the 30 GB data disk next to the repositories. Gitea's defaults are 365 and
+; 90 days; on this disk that is unbounded growth with a long fuse.
+LOG_RETENTION_DAYS      = 90
+ARTIFACT_RETENTION_DAYS = 30
+; Gitea 28 started deleting completed runs after 400 days by default. Stated
+; here so the retention policy is a decision in this file, not a default that
+; can move. 0 keeps runs forever (1.27 ignores the key).
+RUN_RETENTION_DAYS      = 400
+
+[cron.update_checker]
+ENABLED = false
+
+[ui]
+DEFAULT_THEME = gitea-auto

@@ -1,0 +1,84 @@
+# Installed by vm/bootstrap.sh as /etc/fail2ban/jail.d/gitea.local
+
+[DEFAULT]
+# Podman's journald log driver tags container output with CONTAINER_NAME, so
+# there are no log files to bind-mount, rotate, or keep in sync.
+backend  = systemd
+
+# Every ban goes through the prerouting action. The stock nftables/iptables
+# actions install INPUT rules, which do not see DNAT'd container traffic at all.
+banaction     = nft-prerouting
+banaction_allports = nft-prerouting
+
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+# Never lock out loopback, the podman bridge, or the IAP range -- IAP is the
+# only way back into this box.
+#
+# The last entry is instance metadata runner-egress-ip, empty when it is unset.
+# It holds the Cloud NAT address of the GKE runner cluster, when runners are on.
+# Every runner and every CI job shares that one address, so at maxretry = 5 a
+# single job retrying a bad token would ban all of CI for an hour -- and take
+# the runners offline, since they poll through the same IP. The cost of
+# exempting it: hostile traffic from a job is never banned. Acceptable with
+# registration disabled and only trusted workflow authors; see docs/runners.md.
+#
+# The same metadata value also carries gitea:fail2banIgnore, the operator's own
+# addresses. That is a Pulumi secret rather than a line here because this repo
+# is mirrored publicly. See infra/pkg/compute.
+ignoreip = 127.0.0.1/8 ::1 10.89.10.0/24 35.235.240.0/20 34.26.149.196
+
+[sshd]
+enabled  = true
+port     = 22
+# Belt-and-braces: port 22 already only accepts the IAP range, at both the VPC
+# firewall and nftables.
+maxretry = 5
+
+[gitea]
+# A credential offered and refused: a web sign-in, or an SSH key or password.
+# filter.d/gitea.conf explains what is deliberately left out.
+enabled  = true
+filter   = gitea[mode=auth]
+# One jail across all three ports rather than separate web/ssh jails: Gitea
+# serves them from one process with shared auth logging, and a bad actor should
+# lose every door at once, not just the one they knocked on.
+port     = 80,443,2222
+journalmatch = CONTAINER_NAME=gitea
+maxretry = 5
+bantime  = 1h
+
+[gitea-ssh-probe]
+# SSH connections that end without offering a credential: ssh-keyscan, port
+# scanners, and bots that ask which auth methods are allowed and leave. One
+# keyscan is five of these and harmless. A bot is persistent: the one that
+# prompted this jail came back every 110 seconds, day and night. So it takes
+# what no person checking a host key does by hand -- 50 in three hours, ten
+# keyscans' worth -- and a bot that comes back after its ban gets twice as long.
+enabled  = true
+filter   = gitea[mode=probe]
+port     = 2222
+journalmatch = CONTAINER_NAME=gitea
+maxretry = 50
+findtime = 3h
+bantime  = 1d
+bantime.increment = true
+bantime.maxtime   = 4w
+
+[caddy-coraza]
+# Enabled ONLY when gitea:wafMode is "On". In DetectionOnly the WAF reports what
+# it would have blocked but lets it through, and escalating those reports into
+# nftables bans would turn a tuning false positive into a locked-out user --
+# strictly worse than the 403 that DetectionOnly was chosen to avoid.
+# vm/bootstrap.sh derives this from the same config value as SecRuleEngine.
+enabled  = false
+filter   = caddy-coraza
+port     = 80,443
+journalmatch = CONTAINER_NAME=caddy
+# Deliberately looser than the auth jail. A WAF verdict is a weaker signal than
+# a failed password, so it takes sustained hostile traffic to earn a ban.
+maxretry = 10
+findtime = 10m
+bantime  = 2h

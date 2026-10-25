@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Writes a docker-format auth file for Artifact Registry using the VM service
+# account's metadata token.
+#
+# podman-auto-update.service runs as root with no interactive gcloud session, so
+# it needs a credential sitting on disk. This is the #1 reason auto-update
+# quietly stops working on GCE.
+set -euo pipefail
+
+AR_HOST=$(curl -fsS -H 'Metadata-Flavor: Google' \
+    http://169.254.169.254/computeMetadata/v1/instance/attributes/ar-host)
+TOKEN=$(curl -fsS -H 'Metadata-Flavor: Google' \
+    http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token \
+    | jq -r .access_token)
+
+[[ -n "${TOKEN}" && "${TOKEN}" != "null" ]] || { echo "no access token from metadata server" >&2; exit 1; }
+
+AUTH=$(printf 'oauth2accesstoken:%s' "${TOKEN}" | base64 -w0)
+umask 077
+tmp=$(mktemp /etc/containers/.ar-auth.XXXXXX)
+jq -n --arg host "${AR_HOST}" --arg auth "${AUTH}" \
+    '{auths: {($host): {auth: $auth}}}' > "${tmp}"
+chmod 0600 "${tmp}"
+mv "${tmp}" /etc/containers/ar-auth.json

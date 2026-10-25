@@ -1,0 +1,25 @@
+# The VM's own scripts, run by its timers (vm/systemd) and by people.
+
+# podman-auto-update.service runs as root with no interactive gcloud session,
+# so it needs a credential on disk: this writes one from the VM's metadata
+# token (gitea-ar-auth.timer refreshes it).
+- name: Artifact Registry auth refresher
+  ansible.builtin.copy:
+    src: gitea-ar-auth
+    dest: /usr/local/bin/gitea-ar-auth
+    mode: "0755"
+
+# Reboots only when the package layer says one is required, and never on "do
+# not know" (gitea-reboot-window.timer).
+- name: Reboot-if-needed check
+  ansible.builtin.copy:
+    src: gitea-reboot-if-needed
+    dest: /usr/local/bin/gitea-reboot-if-needed
+    mode: "0755"
+
+# Streams a portable `gitea dump` to the backup bucket (gitea-backup.timer).
+- name: Backup script
+  ansible.builtin.template:
+    src: gitea-backup.j2
+    dest: /usr/local/bin/gitea-backup
+    mode: "0755"

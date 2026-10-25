@@ -1,0 +1,20 @@
+# The bridge again, with the WAF off and only the runners' egress address.
+app_name: Gitea
+domain: gitea.example.test
+require_signin_view: "true"
+waf_mode: "Off"
+gcp_project: example-project
+image_gitea: us-east1-docker.pkg.dev/example-project/gitea/gitea:prod
+image_caddy: us-east1-docker.pkg.dev/example-project/gitea/caddy:prod
+podman_subnet: 10.89.10.0/24
+podman_gateway: 10.89.10.1
+runner_egress_ip: 34.26.149.196
+backup_bucket: example-project-gitea-backups
+caddy_mode: bridge
+runner_token_present: true
+secrets:
+  GITEA_SECRET_KEY: k3
+  GITEA_INTERNAL_TOKEN: t3
+  GITEA_OAUTH2_JWT_SECRET: o3
+  GITEA_LFS_JWT_SECRET: l3
+  CADDY_EMAIL: email someone@example.test

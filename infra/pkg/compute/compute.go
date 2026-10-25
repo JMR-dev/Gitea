@@ -3,7 +3,6 @@ package compute
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	gcpcompute "github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/compute"
@@ -17,8 +16,9 @@ import (
 )
 
 // DataDiskDeviceName is what the disk shows up as under /dev/disk/by-id/google-*
-// inside the guest. vm/bootstrap.sh mounts it by UUID, but it needs this name to
-// find the device the first time, before there is a filesystem to have a UUID.
+// inside the guest. The playbook (vm/ansible, role data_disk) mounts it by UUID,
+// but it needs this name to find the device the first time, before there is a
+// filesystem to have a UUID.
 const DataDiskDeviceName = "gitea-data"
 
 type Instance struct {
@@ -34,7 +34,6 @@ func New(
 	buckets *storage.Bucket,
 	backupBucket *storage.Bucket,
 	configHash string,
-	bootstrapPath string,
 	deps []pulumi.Resource,
 ) (*Instance, error) {
 	opts := pulumi.DependsOn(deps)
@@ -93,11 +92,6 @@ func New(
 		return nil, err
 	}
 
-	startupScript, err := os.ReadFile(bootstrapPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", bootstrapPath, err)
-	}
-
 	imageGitea := fmt.Sprintf("%s/%s/%s/gitea:prod", cfg.ARHost(), cfg.Project, registry.RepoID)
 	imageCaddy := fmt.Sprintf("%s/%s/%s/caddy:prod", cfg.ARHost(), cfg.Project, registry.RepoID)
 
@@ -134,13 +128,12 @@ func New(
 		// describe` shows which revision of vm/ the box was built against.
 		"config-hash": pulumi.String(configHash),
 	}
-	// vm/bootstrap.sh puts this value in fail2ban's ignoreip, verbatim. It holds
+	// The playbook puts this value in fail2ban's ignoreip, verbatim. It holds
 	// the Cloud NAT address every GKE runner and CI job egresses from: one
 	// misconfigured job retrying a bad token would otherwise ban all of CI at
 	// once. It also carries gitea:fail2banIgnore, which the key's name
-	// predates; renaming it means editing bootstrap.sh, which replaces the VM.
-	// Omitted, not empty, when there is neither -- meta() already returns ""
-	// on 404.
+	// predates. Omitted, not empty, when there is neither: the playbook's
+	// preflight role reads a missing key as "".
 	if net.Runners != nil || cfg.Fail2banIgnore != "" {
 		var egress pulumi.StringInput = pulumi.String("")
 		if net.Runners != nil {
@@ -205,16 +198,21 @@ func New(
 			EnableIntegrityMonitoring: pulumi.Bool(true),
 		},
 
+		// No startup script: the VM is configured from outside, by the
+		// playbook in vm/ansible, which the infra deploy runs over IAP SSH after
+		// every `pulumi up` (scripts/cicd/infra_deploy.py vm_sync). Everything
+		// it sets up persists across reboots on its own.
 		Metadata: metadata,
-
-		MetadataStartupScript: pulumi.String(string(startupScript)),
 
 		// Lets Pulumi change machine type or metadata in place instead of
 		// refusing the update.
 		AllowStoppingForUpdate: pulumi.Bool(true),
 
 		Labels: pulumi.StringMap{"app": pulumi.String("gitea")},
-	}, opts)
+		// The name is fixed, so a replacement cannot create the new VM before
+		// the old one is gone; say so rather than leave it to the provider.
+		// The downtime starts at the delete.
+	}, opts, pulumi.DeleteBeforeReplace(true))
 	if err != nil {
 		return nil, err
 	}

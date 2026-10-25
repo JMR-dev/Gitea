@@ -29,7 +29,7 @@ podman ps                                            # both healthy
 
 ```bash
 sudo nft list ruleset | grep -E '^table (inet gitea_filter|inet netavark|ip netavark)'
-sudo nft -f /etc/sysconfig/nftables.conf    # exactly what bootstrap.sh does
+sudo nft -f /etc/sysconfig/nftables.conf    # exactly what the playbook's handler does
 sudo nft list table inet netavark | grep -E 'dport (443|2222) dnat'   # both survive
 curl -fsS https://gitea.jasonmross.dev/api/healthz
 ```
@@ -234,7 +234,7 @@ The WAF is not the memory story — CRS costs about 50 MB and does not grow unde
 load. Git subprocesses are: `index-pack` and `gc` scale with what is being
 pushed, and that number climbs with repo size.
 
-`bootstrap.sh` provisions a 2 GB swap file with `vm.swappiness = 10` as ballast,
+The playbook (role `base`) provisions a 2 GB swap file with `vm.swappiness = 10` as ballast,
 because GCE images ship with none and an OOM kill mid-push is the failure this
 prevents. Check it:
 
@@ -302,7 +302,7 @@ sudo dnf install google-cloud-cli-gke-gcloud-auth-plugin
 command -v gke-gcloud-auth-plugin   # confirm it is on PATH
 ```
 
-In Cloud Build the pinned `pulumi/pulumi` image already ships it, and
+In Cloud Build the pinned gcloud image already ships it, and
 `scripts/cicd/infra_deploy.py` puts the SDK bin dir on PATH. The plugin mints a
 token from the caller's own credentials at connect time; no token is stored in
 the stack state.
@@ -485,14 +485,14 @@ to stop `gitea.service`, unpack over `/var/lib/gitea`, fix ownership to
 ### Caddy cannot get a certificate
 
 The most likely cause is the ACME plugin failing to reach the GCE metadata
-server for Application Default Credentials. `vm/bootstrap.sh` probes this at
-first boot and caches the answer:
+server for Application Default Credentials. The playbook (role `app`) probes
+this once, on its first run, and caches the answer:
 
 ```bash
 cat /etc/gitea/caddy-network     # "bridge" or "host"
 ```
 
-To re-probe, delete that file and run `sudo systemctl start gitea-config-sync`.
+To re-probe, delete that file and run `make vm-apply`.
 If the bridge cannot reach `169.254.169.254`, the file will say `host` and Caddy
 is switched to the host network, reaching Gitea over `127.0.0.1:3000` instead.
 Both paths are supported; only the rendering differs.
@@ -511,15 +511,25 @@ rules behind — stop the containers and reboot rather than reloading.
 
 ### A config change did not take effect
 
-`gitea-config-sync.service` only restarts services when a rendered file actually
-changed. To see what it did:
+The playbook restarts Gitea and Caddy only when a file it manages actually
+changed. The deploy's build log has the run (`--diff`: every changed file, with
+app.ini's and the Caddyfile's secrets masked). To see what a run would do now:
 
 ```bash
-sudo journalctl -u gitea-config-sync -n 100 --no-pager
+make vm-check      # read-only: --check --diff against the VM
+make vm-apply      # apply it
 ```
 
-If the render was skipped, the message will say the Gitea secrets were
-unavailable — check `gcloud secrets versions list gitea-internal-token`.
+If app.ini was not rendered, the run fails saying which Gitea secret was
+unavailable -- check `gcloud secrets versions list gitea-internal-token`.
+
+### Configuring a VM by hand (break-glass)
+
+The VM has no startup script: the playbook (`vm/ansible`) configures it, and
+what it sets up persists across reboots. A VM created outside a deploy (a
+manual `pulumi up`, say) is inert until the playbook runs: `make up` runs
+`pulumi up` and then `make vm-apply`. `make vm-apply` needs only gcloud with
+IAP and OS Login on the project -- no Pulumi, no passphrase.
 
 ---
 
