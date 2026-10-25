@@ -322,11 +322,17 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   `gcloud storage buckets add-iam-policy-binding gs://<b> --member=projectViewer:gitea-496920 --role=roles/storage.legacyObjectReader`.
 - Builds run on the public pool, which caps a build at 10 CPUs with no
   high-memory type (hence `E2_HIGHCPU_8` and the constrained Go compile in
-  `cloudbuild/infra.yaml`). The infra build's Go compile against pulumi-gcp is
+  `cloudbuild/infra.yaml`). The infra step runs on Google's gcloud image,
+  which the workers have cached (a 1 s pull, where `pulumi/pulumi` took
+  ~100 s from Docker Hub), and downloads the pinned Go and Pulumi CLI into it,
+  each checked against its publisher's SHA-256 (`TOOLS` in
+  `scripts/cicd/infra_deploy.py`; bump Pulumi there). The infra build's Go
+  compile against pulumi-gcp, and the gcp and kubernetes Pulumi plugins, are
   cached across runs in a GCS `<ci>-build-cache` bucket, one object per
-  `infra/go.mod` + `go.sum` + Go version: `scripts/cicd/infra_deploy.py`
-  restores it before `go build` (deploys and previews) and a deploy writes it
-  only when its go.sum has none yet, so an ordinary deploy uploads nothing. A
+  `infra/go.mod` + `go.sum` + Go version + `TOOLS`: `scripts/cicd/infra_deploy.py`
+  restores it before `go build` (deploys and previews) and a deploy writes it,
+  after its first preview has fetched the plugins, only when its go.sum has
+  none yet, so an ordinary deploy uploads nothing. A
   dependency bump starts from the newest object, and that upload goes up in
   parallel pieces (cb-infra can read the bucket's settings, which gcloud
   checks first). The build uses `-trimpath`:

@@ -38,21 +38,63 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.request
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # The infra stack's Kubernetes provider authenticates to the runner cluster with
 # the gke-gcloud-auth-plugin exec plugin (infra/pkg/runner/runner.go), so both
-# `pulumi preview` and `pulumi up` must find it on PATH. The pinned pulumi image
-# ships it under the Cloud SDK's bin dir but does not put that dir on PATH, and
-# it lives in a different place on a workstation; prepend whichever exists.
+# `pulumi preview` and `pulumi up` must find it on PATH. The deploy step's
+# gcloud image has it on PATH already; elsewhere it can sit under the Cloud
+# SDK's bin dir without that dir being on PATH, so prepend whichever exists.
 # Done here, not in cloudbuild/infra.yaml's step env, because a PATH set there
 # would replace the image's PATH wholesale.
 def ensure_auth_plugin_on_path():
     for d in ("/usr/lib/google-cloud-sdk/bin", "/usr/lib64/google-cloud-sdk/bin"):
         if os.path.isdir(d) and d not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
+
+# The deploy step runs on Google's gcloud image, which Cloud Build's workers
+# already hold, so it pulls in about a second against ~100 s for pulumi/pulumi
+# from Docker Hub. It has python3, git, ssh and the auth plugin, but neither Go
+# nor Pulumi: --fetch-tools downloads those two, pinned, and checks each against
+# the SHA-256 its publisher lists (go.dev/dl; Pulumi's checksums.txt, the same
+# on get.pulumi.com and GitHub). A few seconds. Go only bootstraps the build: if
+# infra/go.mod asks for a newer toolchain, Go fetches and verifies that itself.
+# Pulumi stays on the version the stack was last deployed with; bump it here.
+TOOLS = {  # name: (url, sha256, directory to put on PATH)
+    "go": ("https://go.dev/dl/go1.26.9.linux-amd64.tar.gz",
+           "42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d", "go/bin"),
+    "pulumi": ("https://get.pulumi.com/releases/sdk/pulumi-v3.266.0-linux-x64.tar.gz",
+               "05c42a7bf80b9aa0299773f4edd750eb8e1dcd8fbd52d99c3578f38a7de21262", "pulumi"),
+}
+
+
+def fetch_tools(dest):
+    """Download, check and unpack TOOLS under dest, and put them first on PATH."""
+    for name, (url, sha, bindir) in TOOLS.items():
+        tgz = os.path.join(dest, f"{name}.tgz")
+        for attempt in range(3):
+            log(f"fetching {url}")
+            try:
+                h = hashlib.sha256()
+                with urllib.request.urlopen(url, timeout=120) as r, open(tgz, "wb") as f:
+                    for chunk in iter(lambda: r.read(1 << 20), b""):
+                        h.update(chunk)
+                        f.write(chunk)
+                break
+            except OSError as e:
+                if attempt == 2:
+                    raise Failed(f"could not download {url}: {e}")
+                log(f"download failed ({e}); retrying")
+                time.sleep(10)
+        if h.hexdigest() != sha:
+            raise Failed(f"{url} has sha256 {h.hexdigest()}, not the pinned {sha}")
+        run(["tar", "-xzf", tgz, "-C", dest])
+        os.remove(tgz)
+        os.environ["PATH"] = os.path.join(dest, bindir) + os.pathsep + os.environ.get("PATH", "")
 
 # Replacing or deleting one of these is an outage or a data loss: approval.
 PROTECTED_TYPES = {
@@ -123,14 +165,16 @@ def leftover_changes(preview):
 
 
 def go_cache_name(go_mod, go_sum, go_version):
-    """The build-cache object for one dependency set and Go toolchain: infra's
-    go.mod and go.sum, and the image's own Go. Those three fix the toolchain the
-    build runs with too (go.mod can make Go download a newer one). The build
-    runs with -trimpath, so the compile cache records no paths and still hits
-    after being restored under a different temp dir; without it every cache key
-    named the random dir, and nothing ever hit."""
-    h = hashlib.sha256(b"trimpath-1\0" + go_version.encode())
-    for part in (go_mod, go_sum):
+    """The build-cache object for one dependency set and toolchain: infra's
+    go.mod and go.sum, the Go the build starts from, and the pinned TOOLS.
+    Those fix the toolchain the build runs with too (go.mod can make Go
+    download a newer one) and the Pulumi plugins the object also holds (the
+    provider SDKs in go.sum name them). The build runs with -trimpath, so the
+    compile cache records no paths and still hits after being restored under a
+    different temp dir; without it every cache key named the random dir, and
+    nothing ever hit."""
+    h = hashlib.sha256(b"plugins-2\0" + go_version.encode())
+    for part in (json.dumps(TOOLS, sort_keys=True).encode(), go_mod, go_sum):
         h.update(b"\0" + part)
     return f"{GO_CACHE_PREFIX}{h.hexdigest()[:16]}.tar"
 
@@ -168,17 +212,18 @@ class Deploy:
 
     def prepare(self, src):
         infra = os.path.join(src, "infra")
-        # Go's module and compile caches persist across deploys in the
-        # build-cache bucket: compiling against pulumi-gcp from cold is the slow
-        # part of an infra build. Restored once per run (a second prepare, or a
-        # rollback's, builds against the same directory) and saved at most once.
+        # Go's module and compile caches and Pulumi's plugins persist across
+        # deploys in the build-cache bucket: compiling against pulumi-gcp from
+        # cold is the slow part of an infra build, and the gcp and kubernetes
+        # plugins are ~400 MB to download. Restored once per run (a second
+        # prepare, or a rollback's, builds against the same directory) and saved
+        # at most once, by up() after its first preview has fetched the plugins.
         # Best-effort: a missing, broken or unreadable cache just means a cold
         # build, never a failed deploy. -trimpath is what lets the compile cache
         # hit at all, since the directory differs every run (go_cache_name).
-        env = self.go_cache_env()
+        self.use_cache_dirs()
         self.restore_go_cache(infra)
-        run(["go", "build", "-trimpath", "-o", "gitea-infra", "."], cwd=infra, env=env)
-        self.save_go_cache()
+        run(["go", "build", "-trimpath", "-o", "gitea-infra", "."], cwd=infra)
         run(["pulumi", "login", f"gs://{self.a.app_project}-pulumi-state"], cwd=infra)
         return infra
 
@@ -193,13 +238,14 @@ class Deploy:
     def go_cache_dir(self):
         return os.path.join(self.tmp, "gocache")
 
-    def go_cache_env(self):
+    def use_cache_dirs(self):
+        """Point Go and Pulumi at the cache dir, for this whole process: Pulumi's
+        Go language host reads the module cache too, to find which plugins the
+        program needs, and installs them under PULUMI_HOME/plugins."""
         base = self.go_cache_dir()
-        env = dict(os.environ)
-        env["GOCACHE"], env["GOMODCACHE"] = os.path.join(base, "build"), os.path.join(base, "mod")
-        for d in (env["GOCACHE"], env["GOMODCACHE"]):
-            os.makedirs(d, exist_ok=True)
-        return env
+        for var, sub in (("GOCACHE", "build"), ("GOMODCACHE", "mod"), ("PULUMI_HOME", "pulumi")):
+            os.environ[var] = os.path.join(base, sub)
+            os.makedirs(os.environ[var], exist_ok=True)
 
     def restore_go_cache(self, infra):
         if self.go_cache is not None:  # once per run
@@ -251,8 +297,10 @@ class Deploy:
         if not bucket:
             return
         url, tar = f"gs://{bucket}/{self.go_cache}", os.path.join(self.tmp, "go-cache-out.tar")
+        plugins = os.path.join("pulumi", "plugins")
+        parts = ["build", "mod"] + ([plugins] if os.path.isdir(os.path.join(self.go_cache_dir(), plugins)) else [])
         try:
-            if run(["tar", "-cf", tar, "-C", self.go_cache_dir(), "build", "mod"], check=False).returncode == 0 \
+            if run(["tar", "-cf", tar, "-C", self.go_cache_dir(), *parts], check=False).returncode == 0 \
                     and run(["gcloud", "storage", "cp", tar, url], check=False).returncode == 0:
                 log(f"go cache: saved to {url}")
             if os.path.exists(tar):
@@ -501,7 +549,9 @@ class Deploy:
             # Before the build, so the pool scales up while it compiles.
             self.warm_ops()
             infra = self.prepare(ROOT)
-            risky = destructive_steps(self.preview_json(infra))
+            plan = self.preview_json(infra)
+            self.save_go_cache()  # after a preview, which has fetched the plugins
+            risky = destructive_steps(plan)
             if risky:
                 listing = "; ".join(f"{op} {t} {n}" for op, t, n in risky)
                 if not self.a.approved:
@@ -551,12 +601,16 @@ def main():
     p.add_argument("--repo", default=e("_GITEA_REPO", "JMR-dev/Gitea"))
     p.add_argument("--approved", action="store_true", default=e("_APPROVED") == "true")
     p.add_argument("--drill", default=e("_DRILL", ""), choices=["", "fail-verify"])
+    p.add_argument("--fetch-tools", action="store_true",
+                   help="download the pinned Go and Pulumi (TOOLS) first; cloudbuild/infra.yaml sets it")
     a = p.parse_args()
     if a.mode == "up" and not (a.sha and a.state_bucket):
         p.error("up needs --sha and --state-bucket (_SHA, _DEPLOY_STATE_BUCKET)")
     ensure_auth_plugin_on_path()
-    d = Deploy(a)
     try:
+        if a.fetch_tools:
+            fetch_tools(tempfile.mkdtemp(prefix="infra-tools-"))
+        d = Deploy(a)
         sys.exit(d.preview() if a.mode == "preview" else d.up())
     except Failed as err:
         log(f"FAILED: {err}")
