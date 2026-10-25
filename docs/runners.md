@@ -288,10 +288,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
-        with: { path: cached, key: smoke-${{ matrix.n }}-${{ github.run_id }}, restore-keys: smoke-${{ matrix.n }}- }
+        with:                   # block style: ${{ }} is not valid inside { }
+          path: cached
+          key: smoke-${{ matrix.n }}-${{ github.run_id }}
+          restore-keys: smoke-${{ matrix.n }}-
       - run: mkdir -p cached && date >> cached/stamp && cat cached/stamp
       - uses: actions/upload-artifact@v4
-        with: { name: smoke-${{ matrix.n }}, path: cached }
+        with:
+          name: smoke-${{ matrix.n }}
+          path: cached
       - name: metadata server must be unreachable
         run: |
           ! curl -sf -m 5 -H 'Metadata-Flavor: Google' \
@@ -395,9 +400,11 @@ the path is spot.
 and tolerates it (and the `kubernetes.io/arch=arm64` taint GKE puts on Arm
 nodes), so it alone makes the autoscaler add one. What to expect:
 
-- **A cold start of a few minutes**: the node boots, then pulls the job image
-  and the Docker daemon's. The job container then waits for the daemon to
-  answer (up to two minutes; a daemon that never does fails the job).
+- **A cold start of about a minute and a half**: the node boots (about 50
+  seconds), then pulls the job image and the Docker daemon's. The job
+  container then waits for the daemon to answer (up to two minutes; a daemon
+  that never does fails the job). Measured on 2026-10-25: 93 seconds from push
+  to the first step, and about 3 seconds while the node is still up.
 - **One job per node.** The daemon requests 800m and 3.5Gi and the job
   container 250m and 512Mi, which is all a `c4a-standard-2` has after GKE's
   DaemonSets, so a second job gets a second node. The daemon has no limits, so
