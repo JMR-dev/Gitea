@@ -362,7 +362,7 @@ should have two lines. `make logs` should show **no** Coraza audit entries for
 | Bigger or smaller job pods | `gitea:runnerJobCpu` / `gitea:runnerJobMemory` (requests; the memory limit is twice the request) |
 | Heavy jobs | `runs-on: heavy`. Size with `gitea:runnerHeavyCpu` / `gitea:runnerHeavyMemory` and `gitea:runnerHeavyMachineType` (the memory request must fit the machine's allocatable memory, about 28 GiB on `e2-highmem-4`, and the CPU request is what keeps it to one job per node); `gitea:runnerHeavyMaxNodes` caps how many run at once, 0 removes the pool |
 | More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (an always-on, on-demand base node each, max 10) |
-| arm64 jobs | `runs-on: docker-arm64`. `gitea:runnerArmMaxNodes` (max 4) is how many run at once, one per node; 0 removes the pool and its runner. `gitea:runnerArmMachineType` must be `c4a-standard-N` or `c4a-highmem-N`, N ≥ 2 |
+| arm64 jobs | `runs-on: docker-arm64`. `gitea:runnerArmMaxNodes` (max 18; quotas may hold it lower: see "The arm64 pool idles at zero nodes too") is how many run at once, one per node; 0 removes the pool and its runner. `gitea:runnerArmMachineType` must be `c4a-standard-N` or `c4a-highmem-N`, N ≥ 2 |
 | Spot burst nodes | `gitea:runnerBurstSpot true`: about 40% off each burst node-hour, and a preemption fails only the jobs on that node. The base pool is always on demand. |
 | Bigger nodes | `gitea:runnerMachineType e2-standard-4`, for both the base and burst pools. Each is replaced create-first, so the runners reschedule. The commitment does not grow with it (*The commitment*). |
 | Upgrade the runner | bump `gitea:runnerImageTag`; it must stay a `-dind-rootless` tag |
@@ -414,6 +414,23 @@ nodes), so it alone makes the autoscaler add one. What to expect:
   `docker buildx build --cache-from type=registry,ref=… --cache-to type=registry,ref=…,mode=max`.
 - **Spot.** A preempted node gives its pod about 30 seconds and the job fails.
   Re-run it.
+- **Quotas, not the pool size, may be the real ceiling.** Each node is 2 C4A
+  vCPUs and a 50 GB Hyperdisk Balanced disk, in us-east1, and its vCPUs also
+  count towards the project's all-regions CPU quota, as every runner node and
+  the Gitea VM do (Spot draws the ordinary quotas: the project has no
+  preemptible-CPU quota). A scale-up the quota refuses leaves the job pod
+  Pending, so the job waits for a node to free up rather than failing. At
+  `runnerArmMaxNodes` 18 the pool alone needs these quotas on the app project
+  (`gcloud beta quotas info describe <id> --service=compute.googleapis.com`):
+
+  | Quota | ID | Limit on 2026-10-25 | Arm pool at 18 |
+  |---|---|---|---|
+  | C4A vCPUs, us-east1 | `CPUS-PER-VM-FAMILY-per-project-region` (`vm_family=C4A`) | 24 | 36 |
+  | Hyperdisk Balanced, us-east1 | `HDB-TOTAL-GB-per-project-region` | 500 GB | 900 GB |
+  | vCPUs, all regions | `CPUS-ALL-REGIONS-per-project` | 32 | 36, plus about 6 for the Gitea VM, the base node and the ops node |
+  | VM instances, us-east1 | `INSTANCES-per-project-region` | 24 | 18, plus 3 |
+
+  Every pool at its maximum at once would be 78 vCPUs and 33 instances.
 
 **A heavy node is an `e2-highmem-4` because of one Go package.** The
 pulumi-cloudflare v6 Go SDK is a single package, and its one `compile` process
