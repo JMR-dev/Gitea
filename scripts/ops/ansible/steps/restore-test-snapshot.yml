@@ -1,0 +1,7 @@
+# restore-test-snapshot IMAGE: boot the attached snapshot copy in isolation.
+# Bash: step_restore_test_snapshot in files/gitea-ops-lib.sh.
+- name: restore-test-snapshot (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'restore-test-snapshot'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

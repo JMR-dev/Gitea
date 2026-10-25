@@ -28,7 +28,7 @@
 #   * `gitea` is on PATH at /usr/local/bin     (`podman exec gitea gitea dump`)
 #   * uid 1000, HOME and GITEA_WORK_DIR = /var/lib/gitea, no image volumes
 #   * curl in the image, for the quadlet's HealthCmd
-#   * rsync, unzip, sqlite3 in the image, for scripts/ops/vm-steps.sh restores
+#   * rsync, unzip, sqlite3 in the image, for the release engine's restores
 #
 # GITEA_VERSION is a full x.y.z, resolved from the major line in
 # image/gitea.version by the build (cloudbuild/image.yaml); this file never
@@ -100,7 +100,8 @@ LABEL org.opencontainers.image.title="gitea" \
 # package set the Debian image had (LFS migrations, SSH mirrors).
 #
 # rsync, unzip and sqlite are not for Gitea: the image doubles as the toolbox
-# for restores (scripts/ops/vm-steps.sh), because the host has none of them.
+# for restores (scripts/ops/ansible/files/gitea-ops-lib.sh), because the host
+# has none of them.
 # Info-ZIP unzip rather than busybox's, which cannot read zip64 -- and `gitea
 # dump` switches to zip64 once a dump passes 4 GB.
 RUN set -eux; \

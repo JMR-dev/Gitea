@@ -1,0 +1,7 @@
+# pre-restore-remove NAME...: delete those trees (exact names only).
+# Bash: step_pre_restore_remove in files/gitea-ops-lib.sh.
+- name: pre-restore-remove (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'pre-restore-remove'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

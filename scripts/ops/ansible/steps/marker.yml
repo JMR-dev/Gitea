@@ -1,0 +1,7 @@
+# marker NAME: drop a file in the live data directory. The data-restore drill
+# writes one AFTER its snapshot; a restore that really happened removes it.
+- name: Drop /var/lib/gitea/.drill-{{ step_args[0] }}
+  ansible.builtin.command:
+    argv: [install, -o, "1000", -g, "1000", -m, "0644", /dev/null, "/var/lib/gitea/.drill-{{ step_args[0] }}"]
+    expand_argument_vars: false
+  register: step_result

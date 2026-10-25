@@ -1,0 +1,7 @@
+# journal-errors UNIT SINCE: the count of fatal and panic lines since SINCE (UTC).
+# Bash: step_journal_errors in files/gitea-ops-lib.sh.
+- name: journal-errors (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'journal-errors'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

@@ -163,8 +163,11 @@ deployed. An edit to that code is live at the next release, and once
 automation is on, that can be the unattended weekly rebuild. So the gate makes
 re-running the drills a check rather than a rule:
 
-- The release-path files of each pipeline are hashed: the engine, its
-  launcher, `vm-steps.sh`, the gate and the pipeline file.
+- The release-path files of each pipeline are hashed: the engine
+  (`gitea_ops.py`), its launcher, every file of its VM steps
+  (`scripts/ops/ansible/`: the playbook, each step, the bash lib, the pinned
+  requirements), the gate and the pipeline file. `release_gate.py` names each
+  one (`ENGINE`), and the relay's `ReleasePaths` has one line for each.
 - A passing drill records the hash under `gs://gitea-ci-781388-deploy-state/drills/`.
 - An automatic release or infra deploy refuses code no drill has passed with.
 - An approved build goes ahead with a warning, and `make release` never asks.
@@ -353,9 +356,10 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   so each registered a new key that never expired; on 2026-10-24 the VM began
   refusing the backup Job's SSH (`Permission denied (publickey)`) and two infra
   deploys failed before changing anything. Keys now expire after an hour
-  (`--ssh-key-expire-after=1h` in `scripts/ops/gitea_ops.py` and the config
-  sync in `scripts/cicd/infra_deploy.py`), and each Job / infra run first
-  removes its account's keys that never expire or already have.
+  (`SSH_KEY_TTL` in `scripts/ops/gitea_ops.py`, which extends its key before
+  it runs out, and `--ssh-key-expire-after=1h` in the config sync in
+  `scripts/cicd/infra_deploy.py`), and each Job / infra run first removes its
+  account's keys that never expire or already have.
 
 ## Drill log
 

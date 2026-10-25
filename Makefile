@@ -29,9 +29,9 @@ fmt: ## Format Go sources
 .PHONY: check
 check: ci-check ## Build and vet both Pulumi programs and the relay, test them, and syntax-check the scripts
 	cd infra && go build -o gitea-infra . && go vet ./...
-	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh
+	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
-	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh || echo "shellcheck not installed -- skipped"
+	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh || echo "shellcheck not installed -- skipped"
 
 .PHONY: preview
 preview: check ## Show what `pulumi up` would change
@@ -107,6 +107,18 @@ ops-rollback: ## Undo a release from its manifest (MANIFEST=...; RESTORE_DATA=1 
 .PHONY: ops-drill-restore
 ops-drill-restore: ## Prove the latest snapshot and dump restore, in isolation (TOOL_IMAGE=... before 28)
 	$(OPS) --yes drill-restore $(if $(TOOL_IMAGE),--tool-image $(TOOL_IMAGE))
+
+.PHONY: ops-probe
+ops-probe: ## Read-only: run every VM step that changes nothing, and check what each says
+	$(OPS) probe
+
+# The engine's VM steps (scripts/ops/ansible) with the pinned ansible-core and
+# podman, on this machine only: syntax, the rules every step follows, ops.yml
+# end to end against localhost, and the bash lib in an AlmaLinux 10 container.
+# Never reaches a cloud project (scripts/cicd/ops_check.py).
+.PHONY: ops-check
+ops-check: ## Check the release engine's Ansible steps locally (pinned ansible-core, podman)
+	python3 scripts/cicd/ops_check.py
 
 .PHONY: rollout
 rollout: ## Pull the latest :prod images onto the VM right now

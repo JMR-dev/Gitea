@@ -1,0 +1,53 @@
+# pause-timers [DEADMAN]: stop the timers, and arm a dead man's switch.
+#
+# The two timers must not fire mid-release: auto-update would race the
+# rollout, and the reboot window would reboot with a restore disk attached.
+#
+# The engine resumes the timers itself, but only if it is still alive to. If
+# it dies mid-release (its pod, its node, a laptop), the switch re-enables
+# them after DEADMAN (default 3h, longer than the engine Job's 2h deadline)
+# and logs at crit. It does NOT touch gitea.service: whether starting it is
+# safe depends on how far a migration got, which is a decision for a person.
+# And with a restore disk still attached it leaves the timers paused too,
+# because the reboot window would then boot onto a copy (fstab mounts by UUID).
+#
+# The switch is the transient unit gitea-ops-deadman, as the bash engine
+# (vm-steps.sh, before this playbook) armed it: either engine disarms the
+# other's.
+- name: Stop the auto-update and reboot timers
+  ansible.builtin.command:
+    argv: [systemctl, stop, podman-auto-update.timer, gitea-reboot-window.timer]
+    expand_argument_vars: false
+
+- name: Disarm an earlier dead man's switch
+  ansible.builtin.command:
+    argv: [systemctl, stop, gitea-ops-deadman.timer, gitea-ops-deadman.service]
+    expand_argument_vars: false
+  failed_when: false
+
+- name: Forget its failure, if it had one
+  ansible.builtin.command:
+    argv: [systemctl, reset-failed, gitea-ops-deadman.service]
+    expand_argument_vars: false
+  failed_when: false
+
+- name: Arm the dead man's switch
+  ansible.builtin.command:
+    argv:
+      - systemd-run
+      - --quiet
+      - --unit=gitea-ops-deadman
+      - "--on-active={{ step_args[0] | default('3h') }}"
+      - --timer-property=AccuracySec=1min
+      - "--description=Re-enable Gitea's timers if the release engine died"
+      - /bin/bash
+      - -c
+      - |-
+        if [ -e /dev/disk/by-id/google-gitea-restore ]; then
+            logger -p user.crit -t gitea-ops "DEADMAN: the release engine never came back and a restore disk is attached; timers left paused"
+        else
+            systemctl start podman-auto-update.timer gitea-reboot-window.timer
+            logger -p user.crit -t gitea-ops "DEADMAN: the release engine never came back; timers re-enabled; gitea.service is $(systemctl is-active gitea.service)"
+        fi
+    expand_argument_vars: false
+  register: step_result

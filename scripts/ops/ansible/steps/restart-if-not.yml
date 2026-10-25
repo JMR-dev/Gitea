@@ -1,0 +1,32 @@
+# restart-if-not DIGEST UNIT CONTAINER: restart only when the container is not
+# already running DIGEST (after a :prod tag move and a pull). A container that
+# is not there runs nothing, so it is restarted too.
+- name: The digest {{ step_args[2] }} runs
+  ansible.builtin.command:
+    argv: [podman, inspect, "{{ step_args[2] }}"]
+    expand_argument_vars: false
+  register: inspected
+  changed_when: false
+  failed_when: false
+
+- name: Compare it with {{ step_args[0] }}
+  ansible.builtin.set_fact:
+    running: >-
+      {{ (inspected.stdout | from_json | first).ImageDigest | default('')
+         if inspected.rc == 0 else '' }}
+
+- name: Restart {{ step_args[1] }}
+  ansible.builtin.command:
+    argv: [systemctl, restart, "{{ step_args[1] }}"]
+    expand_argument_vars: false
+  when: running != step_args[0]
+  register: restarted
+
+- name: Report
+  ansible.builtin.set_fact:
+    step_result:
+      rc: 0
+      stdout: ""
+      stderr: >-
+        {{ restarted.stderr | default('') if running != step_args[0]
+           else '[vm-steps] ' ~ step_args[2] ~ ' already runs ' ~ step_args[0] }}

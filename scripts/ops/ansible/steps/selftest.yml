@@ -1,0 +1,7 @@
+# selftest: the sha256 of the lib's text as the VM received it.
+# Bash: step_selftest in files/gitea-ops-lib.sh.
+- name: selftest (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'selftest'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

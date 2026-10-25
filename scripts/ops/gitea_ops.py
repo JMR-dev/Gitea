@@ -4,8 +4,10 @@ data restores, and the drills that prove them.
 
 One implementation for both callers: an operator on a workstation (ADC) and
 Cloud Build (the build service account). It shells out to gcloud for
-everything it changes, and runs VM-side steps by shipping vm-steps.sh over IAP
-SSH, so the VM itself needs nothing installed.
+everything it changes, and runs each VM-side step through Ansible
+(scripts/ops/ansible/ops.yml) over IAP SSH, so the VM itself needs nothing
+installed. The pinned ansible-core is installed on first use, before anything
+changes (ensure_ansible).
 
 Subcommands:
   backup         gitea dump + config tarball + exports + data-disk snapshot
@@ -17,6 +19,8 @@ Subcommands:
   verify         the status checks on their own
   drill-restore  prove a snapshot and a dump each restore to a working Gitea,
                  in an isolated container, without touching prod
+  probe          read-only: every VM step that changes nothing, checked
+                 against what it must say
 
 Anything that changes something needs --yes; --dry-run prints what would run.
 Every backup and release writes a JSON manifest to
@@ -30,20 +34,38 @@ GITEA_RESTORE_DISK_LEFT_ATTACHED are alerting hooks; keep them stable.
 Usage: see `gitea_ops.py <subcommand> --help`.
 """
 import argparse
-import base64
+import atexit
 import datetime
+import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VM_STEPS = os.path.join(HERE, "vm-steps.sh")
+# The VM steps: one playbook, one task file per step, and the bash the steps
+# that move data run (scripts/ops/ansible/ops.yml says how).
+ANSIBLE_DIR = os.path.join(HERE, "ansible")
+OPS_YML = os.path.join(ANSIBLE_DIR, "ops.yml")
+LIB = os.path.join(ANSIBLE_DIR, "files", "gitea-ops-lib.sh")
+# Every step ops.yml allows (its allowed_steps; test_cicd.py keeps the two,
+# and the files in steps/, the same).
+VM_STEPS = (
+    "auto-update", "config-tarball", "dump", "inventory", "journal-errors", "marker", "marker-check",
+    "migrate", "pause-timers", "pre-restore-list", "pre-restore-remove", "pull", "restart-if-not",
+    "restarts", "restore-sync", "restore-test-dump", "restore-test-snapshot", "resume-timers",
+    "running-digest", "selftest", "start", "stop",
+)
+# Every argument of a VM step, whole (ops.yml's arg_pattern): image references,
+# digests, gs:// URLs, unit names, UTC times, tree names.
+VM_ARG = re.compile(r"[A-Za-z0-9@:/._+=, -]*")
 
 # Secret ids whose *version numbers* go into the manifest -- never the values.
 SECRETS = [
@@ -57,13 +79,86 @@ SECRETS = [
 ]
 
 IMAGES = ("gitea", "caddy")
-# Printed on the VM right before a step runs; see Ops.vm.
-VM_MARK = "__GITEA_VM_STEP_OUTPUT__"
 # How long the OS Login key each Job registers stays valid. Every Job pod makes
 # a key of its own, and without an expiry they piled up on the account's OS
-# Login profile until the VM refused them. `gcloud compute ssh` re-registers
-# an expired key, so a Job that outlives it is unaffected.
+# Login profile until the VM refused them. A run that outlives it extends it
+# first: a step that starts more than KEY_REFRESH seconds after the last
+# registration registers the key again.
 SSH_KEY_TTL = "1h"
+KEY_REFRESH = 45 * 60
+
+
+def cache_dir():
+    """What the engine keeps for itself: the pinned ansible-core and a
+    directory per run. In a Job, HOME is the pod's own /work."""
+    return os.path.join(os.path.expanduser("~"), ".cache", "gitea-ops")
+
+
+def ansible_env(pylib, work):
+    """The environment ansible-playbook runs in: the pinned install first on
+    the path, this file's ansible.cfg named explicitly (Ansible ignores one
+    in a world-writable directory, and a ConfigMap mount is a symlink farm),
+    and its state under the run's own directory."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (pylib, env.get("PYTHONPATH", "")) if p)
+    env.update({
+        "ANSIBLE_CONFIG": os.path.join(ANSIBLE_DIR, "ansible.cfg"),
+        "ANSIBLE_HOME": os.path.join(work, "ansible-home"),
+        "ANSIBLE_LOCAL_TEMP": os.path.join(work, "tmp"),
+        "LC_ALL": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    return env
+
+
+def ensure_ansible():
+    """Install the pinned ansible-core (scripts/ops/ansible/requirements.txt,
+    every wheel hash-locked) into a directory keyed on that file, once per
+    machine or Job pod, and return the directory. pip --target rather than a
+    venv: the engine image's Python has pip but no venv module. main() runs
+    this before anything else, so a run that could not reach the VM stops
+    before it changes anything rather than halfway."""
+    req = os.path.join(ANSIBLE_DIR, "requirements.txt")
+    with open(req, "rb") as f:
+        target = os.path.join(cache_dir(), "py-" + hashlib.sha256(f.read()).hexdigest()[:16])
+    playbook = os.path.join(target, "bin", "ansible-playbook")
+    if not os.path.isfile(playbook):
+        # Into a directory of its own, then renamed: a half-finished install
+        # (a killed pod, a full disk) is never mistaken for a whole one.
+        tmp = f"{target}.tmp-{os.getpid()}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        log(f"ansible: installing {req} into {target}")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--require-hashes",
+                            "--only-binary=:all:", "--no-deps", "--root-user-action=ignore",
+                            "--disable-pip-version-check", "--no-cache-dir", "--target", tmp, "-r", req],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise Abort(f"could not install ansible-core from {req}: {(r.stderr or r.stdout).strip()[-800:]}")
+        try:
+            os.rename(tmp, target)
+        except OSError:  # another run on this machine finished first
+            shutil.rmtree(tmp, ignore_errors=True)
+    r = subprocess.run([sys.executable, playbook, "--version"], capture_output=True, text=True,
+                       env=ansible_env(target, target))
+    if r.returncode != 0:
+        raise Abort(f"the ansible-core in {target} does not run: {(r.stderr or r.stdout).strip()[-800:]}")
+    log(f"ansible: {r.stdout.splitlines()[0] if r.stdout else '?'} from {target}")
+    return target
+
+
+def read_result(path):
+    """The {rc, stdout, stderr, failed, msg} ops.yml wrote for one step, or
+    None when there is none, or none in that shape."""
+    try:
+        with open(path) as f:
+            res = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(res, dict) and isinstance(res.get("rc"), int) and isinstance(res.get("failed"), bool)
+            and all(isinstance(res.get(k), str) for k in ("stdout", "stderr"))):
+        return None
+    return res
 
 
 def stale_ssh_keys(listing, now_usec):
@@ -75,7 +170,7 @@ def stale_ssh_keys(listing, now_usec):
 VERSION_LABEL = "org.opencontainers.image.version"
 ALPINE_LABEL = "dev.jasonmross.alpine.minor"
 # How long a tree a data restore moved aside (/var/lib/gitea/.pre-restore-
-# <stamp>, vm-steps.sh restore-sync) stays on the data disk. Each is a full
+# <stamp>, gitea-ops-lib.sh restore-sync) stays on the data disk. Each is a full
 # copy of Gitea's data, and every D4 drill leaves one, so a backup removes the
 # older ones once its own snapshot exists. That snapshot, and each daily one
 # taken while the tree was there, keeps it for 14 days more.
@@ -83,7 +178,7 @@ PRE_RESTORE_DAYS = 7
 
 
 def stale_pre_restore(names, now, days=PRE_RESTORE_DAYS):
-    """The names in vm-steps.sh pre-restore-list output whose stamp is older
+    """The names in the pre-restore-list step's output whose stamp is older
     than `days`. A name not exactly .pre-restore-<stamp> is never one."""
     cutoff = now - datetime.timedelta(days=days)
     out = []
@@ -128,6 +223,13 @@ class Ops:
             "build": os.environ.get("BUILD_ID", ""),
             "commit": os.environ.get("COMMIT_SHA") or git_head(),
         }
+        self.pylib = None      # ensure_ansible()'s install; main() sets it
+        self.work = None       # this run's directory, made by the first VM step
+        self.cp_dir = None     # where its SSH master connection's socket is
+        self.inventory = None
+        self.ssh_user = None
+        self.key_at = 0        # when this run last registered its OS Login key
+        self.calls = 0
 
     # -- plumbing -----------------------------------------------------------
 
@@ -174,37 +276,155 @@ class Ops:
         except (subprocess.CalledProcessError, ValueError, KeyError, TypeError) as e:
             log(f"ssh: could not prune OS Login keys ({e}); trying SSH anyway")
 
-    def vm(self, step, *args, mutate=True):
-        """Run one vm-steps.sh step on the VM as root; returns its stdout.
-
-        Only what the step prints after VM_MARK counts: anything gcloud, ssh
-        or the login shell writes to stdout before it is not the step's."""
-        with open(VM_STEPS, "rb") as f:
-            payload = base64.b64encode(f.read()).decode()
-        remote = (
-            "t=$(mktemp) && echo " + payload + " | base64 -d > \"$t\" && echo " + VM_MARK + " && "
-            "sudo bash \"$t\" " + shlex.join([step, *args]) + "; rc=$?; rm -f \"$t\"; exit $rc"
-        )
-        if mutate and self.a.dry_run:
-            log(f"DRY-RUN: vm-steps {shlex.join([step, *args])}")
-            return ""
-        log(f"vm: {shlex.join([step, *args])}")
+    def connect(self):
+        """Before each VM step: this run's directory and inventory, and an OS
+        Login key that outlives the step. The inventory reaches the VM the way
+        `gcloud compute ssh --tunnel-through-iap` does (an IAP tunnel, as this
+        account's OS Login user), with one SSH master connection kept for the
+        whole run. Its known_hosts is the run's own, as gcloud's was the pod's
+        own: the VM's host key is taken on first use, and a key that changes
+        within the run is refused."""
+        if not self.work:
+            os.makedirs(cache_dir(), exist_ok=True)
+            self.work = tempfile.mkdtemp(prefix=self.stamp + "-", dir=cache_dir())
+            os.mkdir(os.path.join(self.work, "calls"))
+            # The SSH control socket's path, plus the suffix ssh adds while
+            # binding it, must fit in a socket address (107 bytes). Under an
+            # unusually long HOME it goes to the system's temp directory.
+            self.cp_dir = os.path.join(self.work, "cp")
+            if len(os.path.join(self.cp_dir, self.a.vm)) > 80:
+                self.cp_dir = tempfile.mkdtemp(prefix="gitea-ops-cp-")
+            else:
+                os.mkdir(self.cp_dir)
+            atexit.register(self.disconnect)
         self.ensure_ssh_key()
+        if time.time() - self.key_at > KEY_REFRESH:
+            self.register_key()
+        if not self.inventory:
+            self.ssh_user = self.os_login_user()
+            self.inventory = self.write_inventory()
+
+    def register_key(self):
+        """Register this run's key with OS Login for SSH_KEY_TTL, or extend it,
+        as `gcloud compute ssh --ssh-key-expire-after` did on every call:
+        update the expiry of a key the profile has, add one it has not."""
+        pub = os.path.expanduser("~/.ssh/google_compute_engine.pub")
+        err = ""
+        for verb in ("update", "add"):
+            r = subprocess.run(["gcloud", "compute", "os-login", "ssh-keys", verb, f"--key-file={pub}",
+                                f"--ttl={SSH_KEY_TTL}", "--format=none"], capture_output=True, text=True)
+            if r.returncode == 0:
+                self.key_at = time.time()
+                log(f"ssh: OS Login key {'extended' if verb == 'update' else 'added'} for {SSH_KEY_TTL}")
+                return
+            err = r.stderr.strip()
+        raise subprocess.CalledProcessError(r.returncode, ["gcloud", "compute", "os-login", "ssh-keys", "add"],
+                                            "", err)
+
+    def os_login_user(self):
+        """The POSIX user OS Login gives this account: the primary one."""
+        prof = json.loads(self.run(["gcloud", "compute", "os-login", "describe-profile", "--format=json"]))
+        accounts = prof.get("posixAccounts") or []
+        primary = [x for x in accounts if x.get("primary")] or accounts
+        if not primary or not primary[0].get("username"):
+            raise ValueError("the OS Login profile has no POSIX account")
+        return primary[0]["username"]
+
+    def write_inventory(self):
+        """The one-host inventory ops.yml runs against (JSON, which Ansible
+        reads as YAML). All the SSH options are here, none in ansible.cfg:
+        ssh takes the first value it is given for each, so two places would
+        quietly disagree."""
+        proxy = shlex.join(["gcloud", "compute", "start-iap-tunnel", "%h", "22", "--listen-on-stdin",
+                            f"--zone={self.a.zone}", f"--project={self.a.project}", "--verbosity=warning"])
+        host = {
+            "ansible_host": self.a.vm,
+            "ansible_user": self.ssh_user,
+            "ansible_ssh_private_key_file": os.path.expanduser("~/.ssh/google_compute_engine"),
+            "ansible_python_interpreter": "/usr/bin/python3",
+            # One master connection for the run; its tunnel is closed at exit.
+            "ansible_ssh_args": "-o ControlMaster=auto -o ControlPersist=60m "
+                                "-o ServerAliveInterval=30 -o ServerAliveCountMax=4",
+            "ansible_ssh_common_args": shlex.join([
+                "-o", f"ProxyCommand={proxy}",
+                # One host and one user a run, so the host name is enough.
+                "-o", f"ControlPath={os.path.join(self.cp_dir, '%h')}",
+                "-o", f"UserKnownHostsFile={os.path.join(self.work, 'known_hosts')}",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "IdentitiesOnly=yes",
+            ]),
+        }
+        path = os.path.join(self.work, "inventory.json")
+        with open(path, "w") as f:
+            json.dump({"all": {"hosts": {"gitea": host}}}, f, indent=2)
+        return path
+
+    def disconnect(self):
+        """At exit: close the SSH master connection (ControlPersist would hold
+        its IAP tunnel open for an hour) and remove the run's directory.
+        Best-effort: it is only tidying up."""
+        if not self.work:
+            return
+        if self.ssh_user:
+            try:
+                subprocess.run(["ssh", "-o", f"ControlPath={os.path.join(self.cp_dir, '%h')}", "-O", "exit",
+                                f"{self.ssh_user}@{self.a.vm}"], capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        shutil.rmtree(self.cp_dir, ignore_errors=True)
+        shutil.rmtree(self.work, ignore_errors=True)
+        self.work = self.inventory = None
+
+    def vm(self, step, *args, mutate=True):
+        """Run one VM step (scripts/ops/ansible/steps/<step>.yml) on the VM as
+        root, through ops.yml; returns its stdout, stripped.
+
+        Only the result file ops.yml writes counts, never ansible-playbook's
+        own output. Any failure -- the step's, the SSH connection's, or no
+        result at all -- raises CalledProcessError, as every caller expects."""
+        cmd = ["vm-step", step, *args]
+        if step not in VM_STEPS or not all(isinstance(x, str) and VM_ARG.fullmatch(x) for x in args):
+            raise subprocess.CalledProcessError(2, cmd, "", f"refused: no VM step {cmd[1:]!r}")
+        what = shlex.join([step, *args])
+        if mutate and self.a.dry_run:
+            log(f"DRY-RUN: vm-steps {what}")
+            return ""
+        log(f"vm: {what}")
+        t0 = time.time()
+        try:
+            self.connect()
+        except (subprocess.CalledProcessError, OSError, ValueError, KeyError, AttributeError,
+                TypeError) as e:
+            log(f"vm: {step}: cannot reach {self.a.vm}: {e}")
+            raise subprocess.CalledProcessError(255, cmd, "", f"cannot reach {self.a.vm}: {e}")
+        self.calls += 1
+        base = os.path.join(self.work, "calls", f"{self.calls:02d}-{step}")
+        call = {"step": step, "step_args": list(args), "result_file": base + ".result.json"}
+        with open(base + ".json", "w") as f:
+            json.dump(call, f)
         r = subprocess.run(
-            ["gcloud", "compute", "ssh", self.a.vm, f"--zone={self.a.zone}",
-             f"--project={self.a.project}", "--tunnel-through-iap", "--quiet",
-             f"--ssh-key-expire-after={SSH_KEY_TTL}",
-             "--ssh-flag=-oServerAliveInterval=30", f"--command={remote}"],
-            capture_output=True, text=True,
-        )
-        # The step's own progress goes to its stderr; pass it through.
-        sys.stderr.write(r.stderr)
-        if r.returncode != 0:
-            raise subprocess.CalledProcessError(r.returncode, ["vm-steps", step, *args], r.stdout, r.stderr)
-        out = r.stdout
-        if VM_MARK not in out:
-            raise subprocess.CalledProcessError(1, ["vm-steps", step, *args], out, "no output marker from the VM")
-        return out.rsplit(VM_MARK, 1)[1].strip()
+            [sys.executable, os.path.join(self.pylib, "bin", "ansible-playbook"),
+             "-i", self.inventory, OPS_YML, "-e", "@" + base + ".json"],
+            capture_output=True, text=True, cwd=self.work, env=ansible_env(self.pylib, self.work))
+        res = read_result(call["result_file"])
+        took = time.time() - t0
+        if res is None:
+            # It never got to run the step, or never got its result back
+            # (unreachable, refused key): its own output says why.
+            sys.stderr.write((r.stdout + r.stderr)[-4000:])
+            log(f"vm: {step} failed after {took:.1f}s: no result (ansible-playbook exit {r.returncode})")
+            raise subprocess.CalledProcessError(r.returncode or 1, cmd, r.stdout, r.stderr)
+        # The step's own progress went to its stderr; pass it through. A step
+        # that failed without any (an assert, a module) has a message instead.
+        err = res["stderr"] or res.get("msg") or ""
+        if err:
+            sys.stderr.write(err.rstrip("\n") + "\n")
+        if res["failed"] or res["rc"] != 0 or r.returncode != 0:
+            rc = res["rc"] or r.returncode or 1
+            log(f"vm: {step} failed (exit {rc}) after {took:.1f}s")
+            raise subprocess.CalledProcessError(rc, cmd, res["stdout"], err)
+        log(f"vm: {step} ok in {took:.1f}s")
+        return res["stdout"].strip()
 
     def require_yes(self):
         if not (self.a.yes or self.a.dry_run):
@@ -739,7 +959,7 @@ def cmd_rollback(ops, a):
 
 
 def parse_inventory(text):
-    """The TSV vm-steps.sh `inventory` prints (plus "boot ok" from a restore test)."""
+    """The TSV the `inventory` step prints (plus "boot ok" from a restore test)."""
     inv = {"integrity": None, "users": {}, "repos": {}, "boot": False, "dbsource": None}
     for line in text.splitlines():
         f = line.split("\t")
@@ -865,6 +1085,68 @@ def cmd_drill_restore(ops, a):
         sys.exit(1)
 
 
+def cmd_probe(ops, a):
+    """Read-only: every VM step that changes nothing, run the way a release
+    runs them, each checked against what it must say. Proof the engine reaches
+    the VM and reads it right, before it is trusted to change anything."""
+    failures = []
+    seen = {}
+
+    def check(ok, what):
+        log(("ok   " if ok else "FAIL ") + what)
+        if not ok:
+            failures.append(what)
+
+    def step(*args):
+        try:
+            return ops.vm(*args, mutate=False)
+        except subprocess.CalledProcessError as e:
+            check(False, f"{shlex.join(args)}: exit {e.returncode}")
+            return None
+
+    with open(LIB, "rb") as f:
+        want = hashlib.sha256(f.read()).hexdigest()
+    got = step("selftest")
+    if got is not None:
+        check(got == want, f"gitea-ops-lib.sh arrived intact: sha256 {got[:16]} == {want[:16]}")
+    restarts0 = step("restarts", "gitea.service")
+    if restarts0 is not None:
+        check(restarts0.isdigit(), f"gitea.service NRestarts {restarts0!r}")
+    prod = {}
+    for img in IMAGES:
+        prod[img] = ops.digest(img, "prod")
+        running = step("running-digest", img)
+        if running is not None:
+            check(running == prod[img], f"{img} runs {running[:19]} == :prod {prod[img][:19]}")
+        seen[img] = running
+    since = (utcnow() - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    errs = step("journal-errors", "gitea.service", since)
+    if errs is not None:
+        check(errs.isdigit(), f"journal-errors since {since}: {errs!r} fatal/panic line(s)")
+    pre = step("pre-restore-list")
+    if pre is not None:
+        log(f"pre-restore-list: {len(pre.split())} tree(s){': ' + ' '.join(pre.split()) if pre else ''}")
+    marker = step("marker-check", "none")
+    if marker is not None:
+        check(marker == "absent", f"marker-check none -> {marker!r}")
+    text = step("inventory", f"{ops.ar}/gitea@{prod['gitea']}")
+    inv = parse_inventory(text or "")
+    if text is not None:
+        check(inv["integrity"] == "ok", f"inventory: sqlite integrity_check {inv['integrity']!r}")
+        check(bool(inv["users"]) and bool(inv["repos"]),
+              f"inventory: {len(inv['users'])} users, {len(inv['repos'])} repos")
+    restarts1 = step("restarts", "gitea.service")
+    if restarts0 is not None and restarts1 is not None:
+        check(restarts0 == restarts1, f"gitea restarts {restarts0} -> {restarts1}")
+    print(json.dumps({"lib_sha256": got, "prod": prod, "running": seen, "restarts": restarts1,
+                      "journal_errors": errs, "pre_restore": (pre or "").split(), "marker": marker,
+                      "users": len(inv["users"]), "repos": len(inv["repos"]), "failures": failures},
+                     indent=2, sort_keys=True))
+    log(f"PROBE: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s), {ops.calls} VM step(s))")
+    if failures:
+        sys.exit(1)
+
+
 def git_head():
     try:
         return subprocess.run(["git", "-C", HERE, "rev-parse", "HEAD"], capture_output=True,
@@ -931,12 +1213,17 @@ def main():
     d.add_argument("--tool-image")
     d.set_defaults(fn=cmd_drill_restore)
 
+    pr = sub.add_parser("probe", help="read-only: every VM step that changes nothing, checked")
+    pr.set_defaults(fn=cmd_probe)
+
     a = p.parse_args()
     a.backup_bucket = a.backup_bucket or f"{a.project}-gitea-backups"
     if a.cmd == "rollback" and not a.manifest and not (a.gitea_digest and a.caddy_digest and a.expect_version):
         p.error("rollback needs --manifest, or --gitea-digest, --caddy-digest and --expect-version")
     ops = Ops(a)
     try:
+        # First: a run that cannot reach the VM stops before any lock or change.
+        ops.pylib = ensure_ansible()
         a.fn(ops, a)
     except Abort as e:
         log(f"ABORT: {e}")

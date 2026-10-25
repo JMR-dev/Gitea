@@ -1,0 +1,114 @@
+# One VM-side step of the release engine. scripts/ops/gitea_ops.py (Ops.vm)
+# runs this once per step:
+#
+#   ansible-playbook -i <inventory> ops.yml -e @<call>.json
+#
+# with the call {step, step_args, result_file}. It runs that one step on the
+# VM as root and writes {rc, stdout, stderr, failed, msg} as JSON to
+# result_file on the controller. That file is all gitea_ops.py reads; it never
+# parses this playbook's output.
+#
+# Each step is one small action in steps/<step>.yml. The orchestrator owns
+# every decision and the order they happen in, so it can run from a
+# workstation or from a Job and roll back from wherever it got to. The steps
+# that move data (inventory, migrate, dump, the restores) are bash, in
+# files/gitea-ops-lib.sh, passed to `bash -c` as an argument: nothing is ever
+# copied to the VM or installed on it.
+#
+# Two rules for every step file:
+#   - every `command` sets expand_argument_vars: false. Without it the module
+#     expands $VARS and ~ in each argument -- in the lib's text too.
+#   - no Go templates (podman's --format strings): Jinja would read their
+#     double braces. Parse podman's JSON with from_json instead.
+- name: gitea-ops step
+  hosts: gitea
+  gather_facts: false
+  become: true
+  vars:
+    # Keep in step with gitea_ops.py VM_STEPS (scripts/cicd/test_cicd.py checks).
+    allowed_steps:
+      - auto-update
+      - config-tarball
+      - dump
+      - inventory
+      - journal-errors
+      - marker
+      - marker-check
+      - migrate
+      - pause-timers
+      - pre-restore-list
+      - pre-restore-remove
+      - pull
+      - restart-if-not
+      - restarts
+      - restore-sync
+      - restore-test-dump
+      - restore-test-snapshot
+      - resume-timers
+      - running-digest
+      - selftest
+      - start
+      - stop
+    # Every argument, whole: image references, digests, gs:// URLs, unit
+    # names, UTC times, tree names. Nothing a shell could read as more than
+    # one word of text. Same as gitea_ops.py VM_ARG.
+    arg_pattern: '[A-Za-z0-9@:/._+=, -]*'
+    lib: "{{ lookup('ansible.builtin.file', 'files/gitea-ops-lib.sh', rstrip=False) }}"
+  tasks:
+    - name: "{{ step }}"
+      block:
+        - name: Refuse an unknown step, or an argument outside the allowlist
+          ansible.builtin.assert:
+            that:
+              - step is string
+              - step in allowed_steps
+              - step_args is sequence
+              - step_args is not string
+              - step_args is not mapping
+              - step_args | select('string') | list | length == step_args | length
+              - step_args | reject('regex', arg_pattern, match_type='fullmatch') | list | length == 0
+            fail_msg: "refused: step {{ step | default('?') }} with arguments {{ step_args | default('?') }}"
+            quiet: true
+
+        - name: Run the step
+          ansible.builtin.include_tasks: "steps/{{ step }}.yml"
+
+        # Every step leaves step_result: a command's registered result, or a
+        # set_fact with the same rc/stdout/stderr.
+        - name: Hand the result to gitea_ops.py
+          ansible.builtin.command:
+            argv: [tee, "{{ result_file }}"]
+            stdin: >-
+              {{ {'rc': step_result.rc | default(0, true),
+                  'stdout': step_result.stdout | default(''),
+                  'stderr': step_result.stderr | default(''),
+                  'failed': false, 'msg': ''} | to_json }}
+            expand_argument_vars: false
+          # On the controller, as whoever runs the engine: sudo there would
+          # fail (a Job's container has none) and is not needed.
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+      rescue:
+        - name: Hand the failure to gitea_ops.py
+          ansible.builtin.command:
+            argv: [tee, "{{ result_file }}"]
+            stdin: >-
+              {{ {'rc': ansible_failed_result.rc | default(1, true),
+                  'stdout': ansible_failed_result.stdout | default(''),
+                  'stderr': ansible_failed_result.stderr | default(''),
+                  'failed': true,
+                  'msg': ansible_failed_result.msg | default('') | string} | to_json }}
+            expand_argument_vars: false
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+        - name: Fail the run as the step failed
+          ansible.builtin.fail:
+            msg: "step {{ step }} failed"

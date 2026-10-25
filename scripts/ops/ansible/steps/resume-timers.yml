@@ -1,0 +1,19 @@
+# resume-timers: start the timers pause-timers stopped, and disarm its dead
+# man's switch (whichever engine armed it).
+- name: Start the auto-update and reboot timers
+  ansible.builtin.command:
+    argv: [systemctl, start, podman-auto-update.timer, gitea-reboot-window.timer]
+    expand_argument_vars: false
+  register: step_result
+
+- name: Disarm the dead man's switch
+  ansible.builtin.command:
+    argv: [systemctl, stop, gitea-ops-deadman.timer, gitea-ops-deadman.service]
+    expand_argument_vars: false
+  failed_when: false
+
+- name: Forget its failure, if it had one
+  ansible.builtin.command:
+    argv: [systemctl, reset-failed, gitea-ops-deadman.service]
+    expand_argument_vars: false
+  failed_when: false

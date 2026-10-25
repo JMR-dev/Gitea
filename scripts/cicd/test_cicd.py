@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for the decisions in infra_deploy.py and release_gate.py.
+"""Tests for the decisions in infra_deploy.py, release_gate.py and the release
+engine (scripts/ops: gitea_ops.py, launch_job.py). The engine's checks that
+need ansible-core or podman are scripts/cicd/ops_check.py (make ops-check).
 
 Run: python3 -m unittest discover -s scripts/cicd   (make ci-check runs it)
 """
@@ -8,7 +10,9 @@ import contextlib
 import datetime
 import hashlib
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ops"))
 import gitea_ops as O  # noqa: E402
 import infra_deploy as D  # noqa: E402
+import launch_job as L  # noqa: E402
 import release_gate as G  # noqa: E402
 
 U = "urn:pulumi:prod::gitea::"
@@ -158,7 +163,6 @@ class SshKeys(unittest.TestCase):
         self.assertEqual(O.stale_ssh_keys([], self.NOW), [])
 
     def test_infra_deploy_prunes_once_and_spares_a_live_key(self):
-        import json
         d = D.Deploy(argparse.Namespace(mode="up", state_bucket="ci-deploy-state"))
         listing = subprocess.CompletedProcess([], 0, stdout=json.dumps(self.LISTING))
         with mock.patch.object(D, "run", return_value=listing) as run, \
@@ -290,7 +294,7 @@ class PreRestore(unittest.TestCase):
         def vm(step, *args, mutate=True):
             calls.append((step, *args))
             if fail:
-                raise subprocess.CalledProcessError(255, ["vm-steps", step])
+                raise subprocess.CalledProcessError(255, ["vm-step", step])
             return listing if step == "pre-restore-list" else ""
         with mock.patch.object(ops, "vm", side_effect=vm), mock.patch.object(O, "utcnow", return_value=self.NOW), \
                 redirect_stderr(io.StringIO()):
@@ -311,6 +315,378 @@ class PreRestore(unittest.TestCase):
         self.assertEqual((calls, removed), ([("pre-restore-list",)], None))
 
 
+class EngineVm(unittest.TestCase):
+    """Ops.vm: one VM step through ansible-playbook and ops.yml."""
+
+    def ops(self, dry_run=False):
+        o = O.Ops(argparse.Namespace(region="r", project="p", repo="gitea", cmd="release", dry_run=dry_run,
+                                     vm="gitea-vm", zone="z"))
+        o.pylib = "/py"
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work)
+
+        def connect():
+            if not o.work:
+                o.work = work
+                os.mkdir(os.path.join(work, "calls"))
+                o.inventory = os.path.join(work, "inventory.json")
+        o.connect = connect
+        return o
+
+    def vm(self, o, *args, result=None, rc=0, mutate=True):
+        """o.vm(*args) with ansible-playbook faked: it writes `result` (if
+        any) where the call says and exits rc. (outcome, runs, stderr)."""
+        runs = []
+
+        def fake_run(cmd, **kw):
+            with open(cmd[cmd.index("-e") + 1][1:]) as f:
+                call = json.load(f)
+            runs.append((cmd, kw, call))
+            if result is not None:
+                with open(call["result_file"], "w") as f:
+                    f.write(result if isinstance(result, str) else json.dumps(result))
+            return subprocess.CompletedProcess(cmd, rc, stdout="PLAY RECAP ...", stderr="")
+        with mock.patch.object(O.subprocess, "run", side_effect=fake_run), redirect_stderr(io.StringIO()) as err:
+            try:
+                out = o.vm(*args, mutate=mutate)
+            except subprocess.CalledProcessError as e:
+                out = e
+        return out, runs, err.getvalue()
+
+    OK = {"rc": 0, "stdout": "sha256:abc\n", "stderr": "[vm-steps] progress", "failed": False, "msg": ""}
+
+    def test_runs_the_playbook_with_the_call_and_returns_stdout(self):
+        o = self.ops()
+        out, runs, err = self.vm(o, "running-digest", "gitea", result=self.OK, mutate=False)
+        self.assertEqual(out, "sha256:abc")
+        self.assertIn("[vm-steps] progress", err)
+        (cmd, kw, call), = runs
+        self.assertEqual(cmd[:6], [sys.executable, "/py/bin/ansible-playbook", "-i", o.inventory, O.OPS_YML, "-e"])
+        self.assertTrue(cmd[6].startswith("@" + os.path.join(o.work, "calls", "01-running-digest")))
+        self.assertEqual(call["step"], "running-digest")
+        self.assertEqual(call["step_args"], ["gitea"])
+        self.assertTrue(call["result_file"].startswith(o.work))
+        env = kw["env"]
+        self.assertEqual(env["ANSIBLE_CONFIG"], os.path.join(O.HERE, "ansible", "ansible.cfg"))
+        self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], "/py")
+        self.assertTrue(env["ANSIBLE_LOCAL_TEMP"].startswith(o.work) and env["ANSIBLE_HOME"].startswith(o.work))
+        self.assertEqual(env["LC_ALL"], "C.UTF-8")
+        # A second step is a second call file.
+        _, runs, _ = self.vm(o, "restarts", "gitea.service", result=self.OK, mutate=False)
+        self.assertIn("02-restarts", runs[0][0][6])
+
+    def test_a_failed_step_raises_its_own_exit_code(self):
+        res = {"rc": 7, "stdout": "", "stderr": "[vm-steps] ERROR: gitea.service is running", "failed": True,
+               "msg": "non-zero return code"}
+        e, _, err = self.vm(self.ops(), "migrate", "img", result=res, rc=2)
+        self.assertIsInstance(e, subprocess.CalledProcessError)
+        self.assertEqual((e.returncode, e.cmd), (7, ["vm-step", "migrate", "img"]))
+        self.assertIn("gitea.service is running", err)
+        # A failure with no output of its own (an assert) shows its message.
+        res = {"rc": 1, "stdout": "", "stderr": "", "failed": True, "msg": "refused: step x"}
+        e, _, err = self.vm(self.ops(), "stop", "gitea.service", result=res, rc=2)
+        self.assertEqual(e.returncode, 1)
+        self.assertIn("refused: step x", err)
+
+    def test_no_result_or_a_bad_one_raises(self):
+        for result, rc in ((None, 4), (None, 0), ("{not json", 0), ({"rc": "0", "stdout": "", "stderr": "",
+                                                                     "failed": False}, 0),
+                           ({**self.OK, "failed": "no"}, 0), (self.OK, 2)):
+            e, runs, _ = self.vm(self.ops(), "restarts", "gitea.service", result=result, rc=rc, mutate=False)
+            self.assertIsInstance(e, subprocess.CalledProcessError, (result, rc))
+            self.assertEqual(e.cmd, ["vm-step", "restarts", "gitea.service"])
+            self.assertNotEqual(e.returncode, 0)
+            self.assertEqual(len(runs), 1)
+
+    def test_dry_run_skips_mutating_steps_only(self):
+        o = self.ops(dry_run=True)
+        out, runs, err = self.vm(o, "stop", "gitea.service", result=self.OK)
+        self.assertEqual((out, runs), ("", []))
+        self.assertIn("DRY-RUN: vm-steps stop gitea.service", err)
+        out, runs, _ = self.vm(o, "restarts", "gitea.service", result=self.OK, mutate=False)
+        self.assertEqual((out, len(runs)), ("sha256:abc", 1))
+
+    REAL_ARGS = ["us-east1-docker.pkg.dev/gitea-496920/gitea/gitea@sha256:" + "0123456789abcdef" * 4,
+                 "us-east1-docker.pkg.dev/gitea-496920/gitea/gitea:prod",
+                 "gs://gitea-496920-gitea-backups/dumps/gitea-20261025T060000Z.zip",
+                 "gs://gitea-496920-gitea-backups/config/20261025T060000Z/vm-config.tar.gz",
+                 "2026-10-25 06:00:00 UTC", ".pre-restore-20261024T230540Z", "gitea.service", "caddy",
+                 "sha256:" + "f" * 64, "3h", "20261025T060000Z", "none", ""]
+
+    def test_the_argument_allowlist(self):
+        for x in self.REAL_ARGS:
+            self.assertTrue(O.VM_ARG.fullmatch(x), x)
+        for x in ("a;b", "$(id)", "${HOME}", "a\nb", "a\n", "a'b", 'a"b', "`id`", "a|b", "a&b", "{{ x }}",
+                  "a\\b", "*", "~root", "a\tb", "<x", "a>b", "!x", "#x", "x?"):
+            self.assertIsNone(O.VM_ARG.fullmatch(x), repr(x))
+
+    def test_refused_steps_and_arguments_never_run(self):
+        for args in (("rm", "-rf"), ("../ops",), ("marker", "x;y"), ("pull", "img\n"), ("stop", 1)):
+            e, runs, _ = self.vm(self.ops(), *args, result=self.OK)
+            self.assertIsInstance(e, subprocess.CalledProcessError, args)
+            self.assertEqual(runs, [], args)
+
+    def test_steps_playbook_and_files_agree(self):
+        with open(O.OPS_YML) as f:
+            ops_yml = f.read()
+        block = ops_yml[ops_yml.index("    allowed_steps:\n"):]
+        block = block[:block.index("\n    # ")]
+        allowed = re.findall(r"^      - ([a-z-]+)$", block, re.M)
+        files = sorted(n[:-4] for n in os.listdir(os.path.join(O.ANSIBLE_DIR, "steps")))
+        self.assertEqual(sorted(O.VM_STEPS), allowed)
+        self.assertEqual(sorted(O.VM_STEPS), files)
+        self.assertIn(f"arg_pattern: '{O.VM_ARG.pattern}'", ops_yml)
+
+
+class EngineConnection(unittest.TestCase):
+    """The pinned ansible-core, the OS Login key and the inventory."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home)
+        p = mock.patch.dict(os.environ, {"HOME": self.home})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_installs_the_hash_locked_requirements_once(self):
+        runs = []
+
+        def fake_run(cmd, **kw):
+            runs.append(cmd)
+            if "pip" in cmd:
+                os.makedirs(os.path.join(cmd[cmd.index("--target") + 1], "bin"))
+                open(os.path.join(cmd[cmd.index("--target") + 1], "bin", "ansible-playbook"), "w").close()
+            return subprocess.CompletedProcess(cmd, 0, stdout="ansible-playbook [core 2.21.5]\n", stderr="")
+        with mock.patch.object(O.subprocess, "run", side_effect=fake_run), redirect_stderr(io.StringIO()):
+            target = O.ensure_ansible()
+            self.assertEqual(O.ensure_ansible(), target)
+        with open(os.path.join(O.ANSIBLE_DIR, "requirements.txt"), "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()[:16]
+        self.assertEqual(target, os.path.join(self.home, ".cache", "gitea-ops", "py-" + sha))
+        pips = [c for c in runs if "pip" in c]
+        self.assertEqual(len(pips), 1)
+        for flag in ("--require-hashes", "--only-binary=:all:", "--no-deps"):
+            self.assertIn(flag, pips[0])
+        self.assertEqual(pips[0][pips[0].index("-r") + 1], os.path.join(O.ANSIBLE_DIR, "requirements.txt"))
+        self.assertTrue(os.path.isfile(os.path.join(target, "bin", "ansible-playbook")))
+        self.assertEqual([c[1:] for c in runs if "pip" not in c], [[os.path.join(target, "bin", "ansible-playbook"),
+                                                                      "--version"]] * 2)
+
+    def test_a_failed_install_aborts_and_leaves_nothing(self):
+        def fake_run(cmd, **kw):
+            os.makedirs(cmd[cmd.index("--target") + 1], exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no route to pypi.org")
+        with mock.patch.object(O.subprocess, "run", side_effect=fake_run), redirect_stderr(io.StringIO()), \
+                self.assertRaises(O.Abort) as ctx:
+            O.ensure_ansible()
+        self.assertIn("no route to pypi.org", str(ctx.exception))
+        self.assertEqual(os.listdir(os.path.join(self.home, ".cache", "gitea-ops")), [])
+
+    def test_main_installs_before_anything_else_and_exits_3(self):
+        ran = []
+        with mock.patch.object(O, "ensure_ansible", side_effect=O.Abort("pip failed")), \
+                mock.patch.object(O, "cmd_release", side_effect=lambda *a: ran.append(a)), \
+                mock.patch.object(sys, "argv", ["gitea_ops.py", "--yes", "release", "--gitea", "abc"]), \
+                redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            O.main()
+        self.assertEqual((ctx.exception.code, ran), (3, []))
+
+    def connect(self, now, profile, verbs_ok=("add", "update")):
+        o = O.Ops(argparse.Namespace(region="r", project="p", repo="gitea", cmd="release", dry_run=False,
+                                     vm="gitea-vm", zone="z"))
+        gcloud = []
+
+        def fake_run(cmd, **kw):
+            gcloud.append(cmd[:5])
+            ok = cmd[4] in verbs_ok if cmd[:4] == ["gcloud", "compute", "os-login", "ssh-keys"] else True
+            return subprocess.CompletedProcess(cmd, 0 if ok else 1, stdout="", stderr="" if ok else "not found")
+        with mock.patch.object(O.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(o, "run", return_value=json.dumps(profile)) as run, \
+                mock.patch.object(o, "ensure_ssh_key"), mock.patch.object(O.atexit, "register"), \
+                mock.patch.object(O.time, "time", side_effect=lambda: now[0]), redirect_stderr(io.StringIO()):
+            o.connect()
+            first = list(gcloud)
+            now[0] += 10 * 60
+            o.connect()
+            self.assertEqual(gcloud, first, "no new registration 10 minutes later")
+            now[0] += 36 * 60
+            o.connect()
+        self.addCleanup(shutil.rmtree, o.work, True)
+        self.assertEqual(run.call_count, 1, "the OS Login user is asked for once")
+        return o, first, gcloud[len(first):]
+
+    def test_inventory_and_key_registration(self):
+        profile = {"posixAccounts": [{"username": "sa_other", "accountId": "x"},
+                                     {"username": "sa_123", "primary": True, "accountId": "p"}]}
+        o, first, later = self.connect([1_000_000.0], profile, verbs_ok=("add", "update"))
+        verb = lambda calls: [c[4] for c in calls]
+        self.assertEqual(verb(first), ["update"])
+        self.assertEqual(verb(later), ["update"], "the key is extended 46 minutes later")
+        self.assertTrue(o.work.startswith(os.path.join(self.home, ".cache", "gitea-ops")))
+        with open(o.inventory) as f:
+            host = json.load(f)["all"]["hosts"]["gitea"]
+        self.assertEqual(host["ansible_host"], "gitea-vm")
+        self.assertEqual(host["ansible_user"], "sa_123")
+        self.assertEqual(host["ansible_python_interpreter"], "/usr/bin/python3")
+        self.assertIn("ControlPersist=60m", host["ansible_ssh_args"])
+        args = dict(a.split("=", 1) for a in __import__("shlex").split(host["ansible_ssh_common_args"]) if a != "-o")
+        self.assertEqual(args["ProxyCommand"], "gcloud compute start-iap-tunnel %h 22 --listen-on-stdin "
+                                               "--zone=z --project=p --verbosity=warning")
+        self.assertEqual(args["ControlPath"], os.path.join(o.cp_dir, "%h"))
+        self.assertEqual(args["UserKnownHostsFile"], os.path.join(o.work, "known_hosts"))
+        self.assertEqual(args["StrictHostKeyChecking"], "accept-new")
+        # A socket path, plus the suffix ssh adds while binding it, must fit,
+        # whatever HOME is (this one is long).
+        self.assertLessEqual(len(os.path.join(o.cp_dir, "gitea-vm")), 80)
+        self.addCleanup(shutil.rmtree, o.cp_dir, True)
+        o.ssh_user = None
+        o.disconnect()
+        self.assertFalse(os.path.exists(o.cp_dir) or o.work)
+
+    def test_a_new_key_is_added(self):
+        o, first, _ = self.connect([1_000_000.0], {"posixAccounts": [{"username": "sa_9"}]}, verbs_ok=("add",))
+        self.assertEqual([c[4] for c in first], ["update", "add"])
+        with open(o.inventory) as f:
+            self.assertEqual(json.load(f)["all"]["hosts"]["gitea"]["ansible_user"], "sa_9")
+
+    def test_unreachable_is_a_called_process_error(self):
+        o = O.Ops(argparse.Namespace(region="r", project="p", repo="gitea", cmd="release", dry_run=False,
+                                     vm="gitea-vm", zone="z"))
+        o.pylib = "/py"
+        with mock.patch.object(o, "connect", side_effect=OSError("no gcloud")), redirect_stderr(io.StringIO()), \
+                self.assertRaises(subprocess.CalledProcessError) as ctx:
+            o.vm("restarts", "gitea.service", mutate=False)
+        self.assertEqual(ctx.exception.returncode, 255)
+
+
+class EngineManifests(unittest.TestCase):
+    """A release's manifests keep what any engine's `rollback --manifest`
+    reads, so the bash engine (c6ac72c) can still undo this one's runs."""
+
+    def test_path_b_progress_and_manifest_hold_the_rollback_inputs(self):
+        a = argparse.Namespace(region="r", project="p", repo="gitea", cmd="release", dry_run=False, yes=True,
+                               vm="gitea-vm", zone="z", data_disk="gitea-data", backup_bucket="b",
+                               state_bucket=None, gitea="abc1234", caddy=None, allow_major=False,
+                               allow_alpine_minor=False, soak=0, rollback_soak=0, drill="fail-after-migrate")
+        ops = O.Ops(a)
+        labels = {O.VERSION_LABEL: "28.2.0", O.ALPINE_LABEL: "3.22"}
+        saved, steps = {}, []
+
+        def record_state():
+            ops.manifest["prod"] = {"gitea": {"digest": "sha256:oldg", "labels": labels},
+                                    "caddy": {"digest": "sha256:oldc", "labels": {}}}
+
+        def snapshot(purpose, keep=False, disk=None):
+            name = f"gitea-data-{purpose}"
+            ops.manifest.setdefault("snapshots", []).append(name)
+            return name
+
+        def save(quiet=False, name="manifest.json"):
+            saved[name] = json.loads(json.dumps(ops.manifest))
+
+        def vm(step, *args, mutate=True):
+            steps.append((step, *args))
+            return "absent" if step == "marker-check" else ""
+        with mock.patch.object(ops, "record_state", side_effect=record_state), \
+                mock.patch.object(ops, "digest", return_value="sha256:newg"), \
+                mock.patch.object(ops, "labels", return_value=labels), mock.patch.object(ops, "backup"), \
+                mock.patch.object(ops, "tag"), mock.patch.object(ops, "snapshot", side_effect=snapshot), \
+                mock.patch.object(ops, "verify", return_value=[]), mock.patch.object(ops, "restore_data"), \
+                mock.patch.object(ops, "save_manifest", side_effect=save), \
+                mock.patch.object(ops, "vm", side_effect=vm), \
+                mock.patch.dict(os.environ, {"GITEA_DRILL_OK": "1"}), redirect_stderr(io.StringIO()) as err, \
+                redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            O.cmd_release(ops, a)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("DRILL fail-after-migrate: PASS (marker absent)", err.getvalue())
+        self.assertIn("GITEA_RELEASE_ROLLBACK path=B reason=DrillFailure(", err.getvalue())
+        snapped = [n for n in saved if "-snapshotted" in n]
+        self.assertEqual(len(snapped), 1)
+        for name in (snapped[0], "manifest.json"):
+            m = saved[name]
+            self.assertEqual(m["previous"], {"gitea": "sha256:oldg", "caddy": "sha256:oldc"}, name)
+            self.assertEqual(m["versions"]["previous"], "28.2.0", name)
+            self.assertEqual(m["restore_point"], "gitea-data-pre-release", name)
+            self.assertEqual(m["snapshots"], ["gitea-data-pre-release"], name)
+        self.assertEqual(saved["manifest.json"]["outcome"], "rolled-back")
+        ar = "r-docker.pkg.dev/p/gitea"
+        self.assertEqual(steps, [
+            ("pull", f"{ar}/gitea@sha256:newg"), ("pause-timers",), ("stop", "gitea.service"),
+            ("migrate", f"{ar}/gitea@sha256:newg"), ("pull", f"{ar}/gitea:prod"), ("start", "gitea.service"),
+            ("marker", ops.stamp),
+            # the rollback
+            ("stop", "gitea.service"), ("pull", f"{ar}/gitea:prod", f"{ar}/caddy:prod"), ("start", "gitea.service"),
+            ("restart-if-not", "sha256:oldc", "caddy.service", "caddy"), ("marker-check", ops.stamp),
+            ("resume-timers",)])
+
+
+class EngineProbe(unittest.TestCase):
+    def probe(self, running):
+        ops = O.Ops(argparse.Namespace(region="r", project="p", repo="gitea", cmd="probe", dry_run=False))
+        with open(O.LIB, "rb") as f:
+            lib = hashlib.sha256(f.read()).hexdigest()
+        out = {"selftest": lib, "restarts": "0", "journal-errors": "0", "pre-restore-list": "",
+               "marker-check": "absent", "inventory": "integrity\tok\nuser\tjmr\t0\t1\nrepo\tjmr/x\t1\t2\tabc\n"}
+        calls = []
+
+        def vm(step, *args, mutate=True):
+            calls.append((step, mutate))
+            return running[args[0]] if step == "running-digest" else out[step]
+        with mock.patch.object(ops, "vm", side_effect=vm), \
+                mock.patch.object(ops, "digest", side_effect=lambda img, tag: f"sha256:{img}"), \
+                redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()) as stdout:
+            try:
+                O.cmd_probe(ops, None)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        self.assertTrue(all(not m for _, m in calls), "every probe step is read-only")
+        return code, json.loads(stdout.getvalue()), {s for s, _ in calls}
+
+    def test_passes_when_the_vm_runs_prod(self):
+        code, summary, steps = self.probe({"gitea": "sha256:gitea", "caddy": "sha256:caddy"})
+        self.assertEqual((code, summary["failures"], summary["users"], summary["repos"]), (0, [], 1, 1))
+        self.assertEqual(steps, {"selftest", "restarts", "running-digest", "journal-errors", "pre-restore-list",
+                                 "marker-check", "inventory"})
+
+    def test_fails_on_a_digest_that_is_not_prod(self):
+        code, summary, _ = self.probe({"gitea": "sha256:gitea", "caddy": "sha256:old"})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(summary["failures"]), 1)
+
+
+class LaunchJob(unittest.TestCase):
+    def test_the_job_ships_exactly_the_engine(self):
+        with mock.patch.object(L, "gcloud", return_value="me@example.com"), \
+                mock.patch.object(L, "git", side_effect=lambda *a: "" if a[0] == "status" else "abc"):
+            cm, job, dirty = L.manifests(["--yes", "backup"], "p")
+        self.assertFalse(dirty)
+        volume, = [v for v in job["spec"]["template"]["spec"]["volumes"] if v["name"] == "ops"]
+        items = {i["key"]: i["path"] for i in volume["configMap"]["items"]}
+        self.assertEqual(set(items), set(cm["data"]))
+        self.assertEqual({f"scripts/ops/{p}" for p in items.values()}, set(G.ENGINE))
+        for key, path in items.items():
+            self.assertRegex(key, r"^[-._a-zA-Z0-9]+$")
+            self.assertNotIn("__", path, "the key encoding must be reversible")
+            with open(os.path.join(L.HERE, path)) as f:
+                self.assertEqual(cm["data"][key], f.read(), path)
+        self.assertEqual(items["ansible__steps__start.yml"], "ansible/steps/start.yml")
+        cmd = job["spec"]["template"]["spec"]["containers"][0]["command"]
+        self.assertEqual(cmd[:3], ["python3", "-u", "/ops/gitea_ops.py"])
+
+    def test_a_change_anywhere_in_scripts_ops_is_dirty(self):
+        seen = []
+
+        def git(*a):
+            seen.append(a)
+            return " M ansible/steps/start.yml" if a[0] == "status" else "abc"
+        with mock.patch.object(L, "gcloud", return_value="me"), mock.patch.object(L, "git", side_effect=git):
+            cm, job, dirty = L.manifests(["probe"], "p")
+        self.assertTrue(dirty)
+        self.assertIn(("status", "--porcelain", "--", "."), seen)
+        self.assertEqual(cm["metadata"]["annotations"]["gitea-ops/commit"], "abc-dirty")
+
+
 class Gate(unittest.TestCase):
     def test_hash_is_stable_and_covers_the_engine(self):
         self.assertEqual(G.code_hash("image"), G.code_hash("image"))
@@ -324,14 +700,29 @@ class Gate(unittest.TestCase):
     def test_hash_changes_with_content(self):
         real = open
 
-        def fake_open(path, mode="r", *a, **k):
-            if path.endswith("vm-steps.sh") and "b" in mode:
-                with real(path, mode, *a, **k) as f:
-                    return io.BytesIO(f.read() + b"\n# edited")
-            return real(path, mode, *a, **k)
-        before = G.code_hash("image")
-        with mock.patch("builtins.open", fake_open):
-            self.assertNotEqual(G.code_hash("image"), before)
+        def edited(name):
+            def fake_open(path, mode="r", *a, **k):
+                if path.endswith(name) and "b" in mode:
+                    with real(path, mode, *a, **k) as f:
+                        return io.BytesIO(f.read() + b"\n# edited")
+                return real(path, mode, *a, **k)
+            return fake_open
+        for pipeline in ("image", "infra"):
+            before = G.code_hash(pipeline)
+            for name in ("gitea-ops-lib.sh", "steps/start.yml", "ansible.cfg", "requirements.txt"):
+                with mock.patch("builtins.open", edited(name)):
+                    self.assertNotEqual(G.code_hash(pipeline), before, (pipeline, name))
+
+    def test_every_engine_file_is_release_code_of_both_pipelines(self):
+        on_disk = {f"scripts/ops/{n}" for n in os.listdir(os.path.join(G.ROOT, "scripts/ops")) if n.endswith(".py")}
+        for root, dirs, names in os.walk(os.path.join(G.ROOT, "scripts/ops/ansible")):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            on_disk |= {os.path.relpath(os.path.join(root, n), G.ROOT) for n in names}
+        self.assertEqual(set(G.ENGINE), on_disk)
+        self.assertEqual(len(G.ENGINE), len(set(G.ENGINE)))
+        for files in G.FILES.values():
+            self.assertTrue(set(G.ENGINE) <= set(files))
+        self.assertFalse(os.path.exists(os.path.join(G.ROOT, "scripts/ops/vm-steps.sh")))
 
     def check(self, listing, approved=False, rc=0):
         a = argparse.Namespace(pipeline="image", bucket="b", approved=approved)
@@ -381,7 +772,8 @@ class RelayAgrees(unittest.TestCase):
 
     def test_release_paths_match(self):
         import re
-        src = open(os.path.join(G.ROOT, "cicd/relay/webhook.go")).read()
+        with open(os.path.join(G.ROOT, "cicd/relay/webhook.go")) as f:
+            src = f.read()
         block = src[src.index("var ReleasePaths"):]
         block = block[:block.index("\n}\n")]
         relay = {}

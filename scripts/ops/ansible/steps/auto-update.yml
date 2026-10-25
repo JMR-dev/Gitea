@@ -1,0 +1,26 @@
+# auto-update: run podman-auto-update now (a path A release, or a new Caddy),
+# with a fresh registry credential, and show what it did.
+- name: Refresh the registry credential
+  ansible.builtin.command:
+    argv: [systemctl, start, gitea-ar-auth.service]
+    expand_argument_vars: false
+
+- name: Run podman-auto-update
+  ansible.builtin.command:
+    argv: [systemctl, start, podman-auto-update.service]
+    expand_argument_vars: false
+
+- name: What it did
+  ansible.builtin.command:
+    argv: [journalctl, -u, podman-auto-update, -n, "20", --no-pager, -o, cat]
+    expand_argument_vars: false
+  register: journal
+  changed_when: false
+  failed_when: false
+
+- name: Report
+  ansible.builtin.set_fact:
+    step_result:
+      rc: 0
+      stdout: ""
+      stderr: "{{ journal.stdout | default('') }}"

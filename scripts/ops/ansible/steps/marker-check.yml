@@ -1,0 +1,14 @@
+# marker-check NAME: "present" or "absent" (see marker).
+- name: Look for /var/lib/gitea/.drill-{{ step_args[0] }}
+  ansible.builtin.stat:
+    path: "/var/lib/gitea/.drill-{{ step_args[0] }}"
+    follow: true
+    get_checksum: false
+  register: marker
+
+- name: Say which
+  ansible.builtin.set_fact:
+    step_result:
+      rc: 0
+      stdout: "{{ 'present' if marker.stat.exists else 'absent' }}"
+      stderr: ""

@@ -1,0 +1,14 @@
+# stop UNIT, then flush to disk: a snapshot or a restore usually follows.
+# systemctl itself rather than the systemd_service module, here and in start
+# and restart-if-not: the module skips a unit it finds already deactivating,
+# where systemctl waits until it is down.
+- name: Stop {{ step_args[0] }}
+  ansible.builtin.command:
+    argv: [systemctl, stop, "{{ step_args[0] }}"]
+    expand_argument_vars: false
+  register: step_result
+
+- name: Flush to disk
+  ansible.builtin.command:
+    argv: [sync]
+    expand_argument_vars: false

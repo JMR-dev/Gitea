@@ -1,0 +1,7 @@
+# pre-restore-list: the trees restore-sync moved aside, one name a line.
+# Bash: step_pre_restore_list in files/gitea-ops-lib.sh.
+- name: pre-restore-list (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'pre-restore-list'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result
