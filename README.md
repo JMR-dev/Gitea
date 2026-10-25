@@ -15,7 +15,7 @@ Engine VM, served at `gitea.jasonmross.dev`.
 | Firewall | nftables + fail2ban on the host, VPC firewall outside it |
 | IaC | Pulumi, Go, self-managed GCS state backend |
 | CI/CD | Cloud Build in its own project (`cicd/`): Gitea webhook → relay → Pub/Sub triggers, with backups, checks and automatic rollback; off until its drills pass ([cicd.md](docs/cicd.md)) |
-| Gitea Actions | Optional runners on a dedicated GKE Standard cluster: a fixed on-demand base node for the runners, and each `ubuntu-*` job its own pod on autoscaled burst nodes; `runs-on: docker` gets rootless Docker-in-Docker — [docs/runners.md](docs/runners.md) |
+| Gitea Actions | Optional runners on a dedicated GKE Standard cluster: a fixed on-demand base node for the runners, and each `ubuntu-*` job its own pod on autoscaled burst nodes; `runs-on: docker` gets rootless Docker-in-Docker, and `runs-on: docker-arm64` native arm64 builds on Spot Axion nodes scaled from zero — [docs/runners.md](docs/runners.md) |
 
 ## Layout
 
@@ -182,11 +182,12 @@ containers on older runtimes). The Caddy version stays a deliberate change to
   thing standing between a workflow and that runner's Workload Identity token.
   The same block keeps job pods in `gitea-jobs` off the metadata server and the
   API server.
-- **Workflows that need Docker must say `runs-on: docker`.** `ubuntu-*` jobs run
+- **Workflows that need Docker must say `runs-on: docker`** (or `docker-arm64`
+  to build for arm64). `ubuntu-*` jobs run
   as plain pods with no Docker daemon, so `docker build`, Docker actions and
   `docker://` steps fail there.
-- **Turning runners off is two applies**: `gitea:runnerReplicas 0` and
-  `gitea:runnerJobCapacity 0` first, so the PVC disks are deleted, then
+- **Turning runners off is two applies**: `gitea:runnerReplicas 0`,
+  `gitea:runnerJobCapacity 0` and `gitea:runnerArmMaxNodes 0` first, so the PVC disks are deleted, then
   `gitea:runnersEnabled false`. Deleting the cluster alone orphans billable
   disks.
 - **`image/caddy.version` and `image/coraza.version` are coupled.** coraza-caddy

@@ -96,6 +96,13 @@ type Config struct {
 	RunnerHeavyCPU         string
 	RunnerHeavyMemory      string
 
+	// The arm64 pool, for `runs-on: docker-arm64` jobs: native linux/arm64
+	// builds on Spot Axion (C4A) nodes that scale from zero to
+	// RunnerArmMaxNodes, one job per node, each with its own Docker daemon
+	// (package runner). 0 removes the pool, its runner and the label.
+	RunnerArmMaxNodes    int
+	RunnerArmMachineType string
+
 	// OpsMachineType sizes the ops pool: the one on-demand node, scaled from
 	// zero, that release-engine Jobs (scripts/ops) run on and nothing else
 	// does. Part of the runner cluster, so it exists only with RunnersEnabled.
@@ -150,6 +157,8 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		RunnerHeavyCPU:         c.Get("runnerHeavyCpu"),
 		RunnerHeavyMemory:      c.Get("runnerHeavyMemory"),
 
+		RunnerArmMachineType: c.Get("runnerArmMachineType"),
+
 		OpsMachineType: c.Get("opsMachineType"),
 		OpsLaunchers:   strings.Fields(strings.ReplaceAll(c.Get("opsLaunchers"), ",", " ")),
 	}
@@ -195,6 +204,13 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 			return nil, fmt.Errorf("gitea:runnerBurstMaxNodes: %w", err)
 		}
 		cfg.RunnerBurstMaxNodes = 2
+	}
+	// Off unless asked for: unlike the other pools it serves one label that
+	// only some repositories use.
+	if cfg.RunnerArmMaxNodes, err = c.TryInt("runnerArmMaxNodes"); err != nil {
+		if !errors.Is(err, config.ErrMissingVar) {
+			return nil, fmt.Errorf("gitea:runnerArmMaxNodes: %w", err)
+		}
 	}
 
 	applyDefaults(cfg)
@@ -280,6 +296,11 @@ func applyDefaults(c *Config) {
 	if c.RunnerHeavyMemory == "" {
 		c.RunnerHeavyMemory = "12Gi"
 	}
+	if c.RunnerArmMachineType == "" {
+		// 2 vCPU / 8 GB, about 1.3 CPU and 4.9 GiB free once GKE's DaemonSets
+		// have theirs: one docker-arm64 job, and its Docker daemon, per node.
+		c.RunnerArmMachineType = "c4a-standard-2"
+	}
 	if c.OpsMachineType == "" {
 		// The engine itself is gcloud and SSH: the dump, the snapshot and the
 		// restore copy all run on the VM or in Google's APIs, not here.
@@ -290,6 +311,10 @@ func applyDefaults(c *Config) {
 // quantity is a loose match for a Kubernetes resource quantity, enough to make a
 // typo fail at preview rather than when the first job pod is created.
 var quantity = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(m|k|M|G|Ki|Mi|Gi)?$`)
+
+// armMachine is a C4A type with 2 or more vCPUs and at least 4 GB per vCPU,
+// which the docker-arm64 job pod's requests need.
+var armMachine = regexp.MustCompile(`^c4a-(standard|highmem)-([2-9]|[1-9][0-9])$`)
 
 func validate(c *Config) error {
 	if !strings.Contains(c.Domain, ".") {
@@ -382,6 +407,15 @@ func validate(c *Config) error {
 		}
 		if !quantity.MatchString(c.RunnerHeavyMemory) {
 			return fmt.Errorf("gitea:runnerHeavyMemory %q is not a Kubernetes quantity (e.g. 12Gi)", c.RunnerHeavyMemory)
+		}
+		if c.RunnerArmMaxNodes < 0 || c.RunnerArmMaxNodes > 4 {
+			// A cost guard, like the others; also the arm runner's capacity.
+			return fmt.Errorf("gitea:runnerArmMaxNodes %d must be between 0 and 4", c.RunnerArmMaxNodes)
+		}
+		if c.RunnerArmMaxNodes > 0 && !armMachine.MatchString(c.RunnerArmMachineType) {
+			// The pool's Hyperdisk boot disk is what C4A requires, and the job
+			// pod's requests (package runner) need at least c4a-standard-2.
+			return fmt.Errorf("gitea:runnerArmMachineType %q must be c4a-standard-N or c4a-highmem-N, N >= 2", c.RunnerArmMachineType)
 		}
 		if !strings.HasSuffix(c.RunnerImageTag, "-dind-rootless") {
 			// The pod spec hard-codes the rootless image's uid and paths

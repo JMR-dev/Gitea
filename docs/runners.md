@@ -8,16 +8,17 @@ loop [migrate-to-gitea-scm.md](migrate-to-gitea-scm.md) warns about.
 Everything here is behind one flag, `gitea:runnersEnabled`, which is off by
 default.
 
-There are two runners, and a job's `runs-on` picks one:
+There are three runners, and a job's `runs-on` picks one:
 
 | `runs-on` | Runner | How the job runs |
 |---|---|---|
 | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | **pod runner** (`gitea-runner-pods`) | As its own pod in the `gitea-jobs` namespace. Jobs run in parallel, up to `gitea:runnerJobCapacity`, on burst nodes added to fit them. |
 | `heavy` | **pod runner**, on the **heavy pool** | Like `ubuntu-latest`, but the pod requests 12 Gi and 2 CPUs (a 24 Gi memory limit) and runs alone on an on-demand `e2-highmem-4` (32 GB) node. The pool scales up from zero for it. For Pulumi and other memory-hungry jobs. |
 | `docker` | **DinD runner** (`gitea-runner`) | Inside that runner's rootless Docker daemon, one node per replica, `gitea:runnerCapacity` jobs at a time. |
+| `docker-arm64` | **arm64 runner** (`gitea-runner-arm64`), on the **arm64 pool** | As its own pod in `gitea-jobs-arm64`, with a rootless Docker daemon of its own beside it, on a Spot `c4a-standard-2` (Axion) node scaled up from zero. One job per node, up to `gitea:runnerArmMaxNodes` at once. For native `linux/arm64` image builds: `docker build`, `docker buildx build`, `docker run`. |
 
-**A job that needs a Docker daemon must use `runs-on: docker`.** Job pods have
-none. On the pod runner, Docker actions, `docker://` steps, and a job
+**A job that needs a Docker daemon must use `runs-on: docker`** (or
+`docker-arm64`, for arm64). `ubuntu-*` and `heavy` job pods have none. On the pod runner, Docker actions, `docker://` steps, and a job
 container's `options`, `volumes` or `credentials` fail the job, and so does
 `docker build` in a `run:` step.
 
@@ -29,6 +30,7 @@ container's `options`, `volumes` or `credentials` fail the job, and so does
 | Base nodes | `max(1, runnerReplicas)` × `e2-standard-2`, **on demand**, never autoscaled. Both runners and all of GKE's own pods. One node can be covered by a 1-year commitment (`runnerBaseCommitment`, not yet bought) | `infra/pkg/gke` |
 | Burst nodes | `e2-standard-2`, on demand, 0 to `runnerBurstMaxNodes`, tainted so only job pods land there | `infra/pkg/gke` |
 | Heavy nodes | `e2-highmem-4`, on demand, 0 to `runnerHeavyMaxNodes`, tainted so only `heavy` jobs land there | `infra/pkg/gke` |
+| Arm64 nodes | `c4a-standard-2` (Axion), **Spot**, 0 to `runnerArmMaxNodes`, 50 GB Hyperdisk Balanced boot disk (C4A takes no Persistent Disk), tainted so only `docker-arm64` jobs land there | `infra/pkg/gke` |
 | All nodes | Private (no external IPs), COS, Shielded | `infra/pkg/gke` |
 | Tunnel pods | GKE's `konnectivity-agent`, pinned at 2 instead of one per node | `infra/pkg/runner` |
 | Node identity | `gitea-gke-nodes@`, holding only `roles/container.defaultNodeServiceAccount` | `infra/pkg/gke` |
@@ -37,6 +39,7 @@ container's `options`, `volumes` or `credentials` fail the job, and so does
 | Pod runner | StatefulSet of `docker.io/gitea/runner:<tag>` (no Docker daemon), one unprivileged pod that creates a pod per job | `infra/pkg/runner` |
 | Job pods | Namespace `gitea-jobs`, Pod Security `baseline` enforced, own NetworkPolicy | `infra/pkg/runner` |
 | DinD runner | StatefulSet of `docker.io/gitea/runner:<tag>-dind-rootless`, one pod per node | `infra/pkg/runner` |
+| Arm64 runner | Like the pod runner, on the base node. Its job pods are in `gitea-jobs-arm64` (Pod Security `privileged`, for each pod's `docker:<ver>-dind-rootless` sidecar), own NetworkPolicy | `infra/pkg/runner` |
 | Registration | Preset token in Secret Manager, shared by Gitea and the runners | `scripts/bootstrap.sh` |
 | WAF | Runner protocol and artifact routes bypass Coraza | `vm/config/Caddyfile.tmpl` |
 
@@ -70,30 +73,30 @@ With one autoscaled spot pool, that happened in routine operation:
   failed every running job at once, `heavy` ones included.
 
 So the runners and GKE's own pods now live on the base pool, which nothing
-scales down and which is never spot. The burst and heavy pools are tainted, so
-nothing a job depends on can land there, and the tunnel-pod count is pinned at
+scales down and which is never spot. The burst, heavy and arm64 pools are
+tainted, so nothing a job depends on can land there, and the tunnel-pod count is pinned at
 2 (`infra/pkg/runner/tunnel.go`). What still interrupts running jobs: node
 upgrades and auto-repairs of the base pool, which normally happen in the Sunday
 maintenance window.
 
 **The base node is full by design.** One `e2-standard-2` has 1930m of
 allocatable CPU. GKE's per-node pods take about 630m and its other system pods
-about 460m, so the runners get the rest: 500m for the DinD runner and 200m for
-the pod runner. That leaves about 140m, too little for a 400m job pod, so jobs
-always run on burst nodes. CPU requests only steer scheduling. With no CPU
+about 460m, so the runners get the rest: 500m for the DinD runner, 200m for
+the pod runner and 50m for the arm64 runner. That leaves about 80m, too little
+for a 400m job pod, so jobs always run on burst nodes. CPU requests only steer scheduling. With no CPU
 limits, the DinD runner's builds use whatever the node has idle. Memory is
 tighter too: `docker` builds now share the node's ~6 GiB allocatable with the
 pod runner and all of GKE's pods, rather than having a node mostly to
 themselves. A build that peaks well above 2 GiB can push the node into memory
 pressure, and the kubelet then evicts pods rather than OOM-killing the build.
-If a GKE upgrade adds system pods beyond the spare 140m, see *Troubleshooting*.
+If a GKE upgrade adds system pods beyond the spare 80m, see *Troubleshooting*.
 
 **A fourth pool, `ops`, is not for CI.** It holds the Gitea release engine's
 Jobs (`infra/pkg/ops`, *Releases* in [runbook.md](runbook.md)): one
 on-demand node (`gitea:opsMachineType`, default `e2-standard-2`), scaled from
 zero, tainted `gitea-runner-pool=ops`. No runner can schedule a job there,
-because the pod runner's template tolerates only the burst taint and the heavy
-one. And no runner identity can create pods in `gitea-ops`. That matters
+because the pod runner's template tolerates only the burst and heavy taints,
+and the arm64 runner's only the arm64 ones. And no runner identity can create pods in `gitea-ops`. That matters
 because that namespace's identity can stop Gitea and restore its disk.
 
 ### Cost
@@ -107,7 +110,7 @@ carrying both runners:
 | base `e2-standard-2`, on demand ($30.82 with the 1-year commitment) | $48.92 |
 | static NAT IP (in use) | $3.65 |
 | Cloud NAT gateway + data processing | $1 + $0.045/GB |
-| boot disk 30 GB + PVCs 10 + 20 + 10 GB, pd-balanced | $7 |
+| boot disk 30 GB + PVCs 10 + 20 + 10 + 10 GB, pd-balanced | $8 |
 
 These are us-east1 list prices from October 2026. For comparison, a spot
 `e2-standard-2` was $29.35/month: spot saves about 40%, not two thirds.
@@ -117,7 +120,9 @@ plus its boot disk, about $0.07/hour together, only while it exists. A **heavy
 node** is an on-demand `e2-highmem-4` plus its boot disk, about $0.18/hour,
 also only while it exists. That is roughly 3 cents for a 10-minute `pulumi up`,
 plus the node's boot time and the 10 minutes the autoscaler waits before
-removing it. The autoscaler removes a burst or heavy node about 10 minutes after
+removing it. An **arm64 node** is a Spot `c4a-standard-2` ($0.047/hour; $0.090
+on demand) plus its 50 GB Hyperdisk boot disk, about $0.05/hour together, on
+the same terms. The autoscaler removes a burst or heavy node about 10 minutes after
 its last job pod finishes. Each extra DinD replica adds an always-on, on-demand
 base node and two PVCs.
 
@@ -161,16 +166,27 @@ Read this before pointing a repository you do not fully trust at these runners.
   runner's credentials. `gitea-jobs` enforces the `baseline` Pod Security
   level, so no job pod can be privileged or use host namespaces or hostPath,
   whatever creates it.
+- **`docker-arm64` jobs hold their own daemon, and only that.** Each job pod
+  carries a rootless dockerd sidecar, and the job container gets its socket.
+  Unlike the `docker` runner's, that daemon sees nothing but its own pod: no
+  runner credentials, no registration token. The sidecar is a privileged
+  container (rootless dockerd needs one, as the DinD runner does) with the
+  daemon running as uid 1000, so `gitea-jobs-arm64` admits privileged pods.
+  Only the arm64 runner creates pods there, from its fixed template; a
+  workflow cannot set a security context on the Kubernetes backend. A job that
+  breaks out lands as uid 1000 on an arm64 node, which runs only other arm64
+  jobs and GKE's DaemonSets.
 - **The pod runner holds an API token, scoped to `gitea-jobs`.** It can create,
   exec into and delete pods there, and create and delete Secrets. It cannot
   read Secrets back, and it cannot touch `gitea-runner`, so it cannot exec into
-  the DinD runner. Only the pod runner may reach the API server: job pods are
+  the DinD runner. The arm64 runner holds the same, scoped to
+  `gitea-jobs-arm64`. Only these two may reach the API server: job pods are
   blocked by the RFC1918 exclusion below.
 - **Jobs cannot reach Google Cloud.** This part is enforced, not assumed:
   - **Jobs get no useful Google identity.** Each runner's Kubernetes service
     account holds exactly one permission, read access to the registration
-    token secret. Job pods run as `gitea-jobs`'s `default` account, which holds
-    none.
+    token secret. Job pods run as their namespace's `default` account, which
+    holds none.
   - **The metadata server is blocked.** `docker` job containers' traffic
     leaves from the DinD runner pod's network namespace, so the GKE metadata
     server would issue them that KSA's token. The NetworkPolicies on both
@@ -251,9 +267,11 @@ value also carries the secret `gitea:fail2banIgnore`, the operator's own address
    `make kube` needs `gke-gcloud-auth-plugin`: `gcloud components install
    gke-gcloud-auth-plugin`, or `google-cloud-cli-gke-gcloud-auth-plugin` from
    the same package repository as a distro-packaged gcloud.
-   Site Administration → Actions → Runners should list two runners as Idle:
+   Site Administration → Actions → Runners should list the runners as Idle:
    `gitea-runner-pods-0`, with labels `ubuntu-latest`, `ubuntu-24.04` and
-   `ubuntu-22.04`, and `gitea-runner-0`, with label `docker`.
+   `ubuntu-22.04`; `gitea-runner-0`, with label `docker`; and, with
+   `gitea:runnerArmMaxNodes` above 0, `gitea-runner-arm64-0`, with label
+   `docker-arm64`.
 5. Run the smoke workflow below once.
 
 ### Smoke workflow
@@ -303,6 +321,24 @@ jobs:
         run: |
           ! curl -sf -m 5 -H 'Metadata-Flavor: Google' \
             http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email
+
+  arm64:                        # a pod on an arm64 node, scaled up from zero
+    runs-on: docker-arm64
+    steps:
+      - run: uname -m                          # aarch64
+      - name: docker build, natively
+        run: |
+          printf 'FROM alpine:3\nRUN uname -m\n' > Dockerfile
+          docker buildx build --platform linux/arm64 --load -t smoke . && docker run --rm smoke uname -m
+          docker info | grep -A1 'Registry Mirrors'    # expect mirror.gcr.io
+      - name: metadata server must be unreachable
+        run: |
+          ! curl -sf -m 5 -H 'Metadata-Flavor: Google' \
+            http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email
+      - name: API server must be unreachable
+        run: "! curl -sk -m 5 https://kubernetes.default.svc/version"
+      - name: egress IP
+        run: curl -s https://api.ipify.org   # the same NAT address as the others
 ```
 
 While it runs, `make runners` should show the four `fan-out` pods in
@@ -321,11 +357,12 @@ should have two lines. `make logs` should show **no** Coraza audit entries for
 | Bigger or smaller job pods | `gitea:runnerJobCpu` / `gitea:runnerJobMemory` (requests; the memory limit is twice the request) |
 | Heavy jobs | `runs-on: heavy`. Size with `gitea:runnerHeavyCpu` / `gitea:runnerHeavyMemory` and `gitea:runnerHeavyMachineType` (the memory request must fit the machine's allocatable memory, about 28 GiB on `e2-highmem-4`, and the CPU request is what keeps it to one job per node); `gitea:runnerHeavyMaxNodes` caps how many run at once, 0 removes the pool |
 | More parallel `docker` jobs | `gitea:runnerCapacity 2` (same node), or `gitea:runnerReplicas` (an always-on, on-demand base node each, max 10) |
+| arm64 jobs | `runs-on: docker-arm64`. `gitea:runnerArmMaxNodes` (max 4) is how many run at once, one per node; 0 removes the pool and its runner. `gitea:runnerArmMachineType` must be `c4a-standard-N` or `c4a-highmem-N`, N ≥ 2 |
 | Spot burst nodes | `gitea:runnerBurstSpot true`: about 40% off each burst node-hour, and a preemption fails only the jobs on that node. The base pool is always on demand. |
 | Bigger nodes | `gitea:runnerMachineType e2-standard-4`, for both the base and burst pools. Each is replaced create-first, so the runners reschedule. The commitment does not grow with it (*The commitment*). |
 | Upgrade the runner | bump `gitea:runnerImageTag`; it must stay a `-dind-rootless` tag |
 | Shell into a runner | `kubectl --context=gke_<p>_<zone>_gitea-runners -n gitea-runner exec -it gitea-runner-pods-0 -- sh` (or `gitea-runner-0`) |
-| Watch job pods | `kubectl --context=… -n gitea-jobs get pods -o wide -w` |
+| Watch job pods | `kubectl --context=… -n gitea-jobs get pods -o wide -w` (`-n gitea-jobs-arm64` for arm64) |
 
 **Scaling follows the job queue.** Each `ubuntu-*` job pod requests
 `runnerJobCpu` and `runnerJobMemory`. When a job pod fits on no node, it waits
@@ -353,6 +390,23 @@ than spot because `pulumi up` runs here: a preempted apply leaves the stack
 with pending operations to clear by hand. The runner and the tunnel pods a
 heavy job streams through are on the on-demand base pool too, so nothing on
 the path is spot.
+
+**The arm64 pool idles at zero nodes too.** A `docker-arm64` job pod selects
+and tolerates it (and the `kubernetes.io/arch=arm64` taint GKE puts on Arm
+nodes), so it alone makes the autoscaler add one. What to expect:
+
+- **A cold start of a few minutes**: the node boots, then pulls the job image
+  and the Docker daemon's. The job container then waits for the daemon to
+  answer (up to two minutes; a daemon that never does fails the job).
+- **One job per node.** The daemon requests 800m and 3.5Gi and the job
+  container 250m and 512Mi, which is all a `c4a-standard-2` has after GKE's
+  DaemonSets, so a second job gets a second node. The daemon has no limits, so
+  a build may use the whole node.
+- **No layer cache between jobs.** The daemon's data root is an `emptyDir` that
+  goes with the pod. Keep a cache in a registry instead:
+  `docker buildx build --cache-from type=registry,ref=… --cache-to type=registry,ref=…,mode=max`.
+- **Spot.** A preempted node gives its pod about 30 seconds and the job fails.
+  Re-run it.
 
 **A heavy node is an `e2-highmem-4` because of one Go package.** The
 pulumi-cloudflare v6 Go SDK is a single package, and its one `compile` process
@@ -421,6 +475,7 @@ Two applies, in this order:
 ```bash
 cd infra
 pulumi config set gitea:runnerReplicas 0 && pulumi config set gitea:runnerJobCapacity 0 \
+  && pulumi config set gitea:runnerArmMaxNodes 0 \
   && pulumi up                                            # 1. deletes the pods AND their PVC disks
 pulumi config set gitea:runnersEnabled false && pulumi up # 2. deletes the cluster, NAT, subnet, IP
 ```
