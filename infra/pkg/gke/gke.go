@@ -58,6 +58,9 @@ const (
 	HeavyPoolValue = "heavy"
 	// OpsPoolValue marks the pool release-engine Jobs run on (package ops).
 	OpsPoolValue = "ops"
+	// ArmPoolValue marks the arm64 pool, which only `runs-on: docker-arm64`
+	// job pods select and tolerate (package runner).
+	ArmPoolValue = "arm64"
 )
 
 type Cluster struct {
@@ -70,6 +73,8 @@ type Cluster struct {
 	HeavyPool *container.NodePool
 	// OpsPool holds release-engine Jobs and nothing else (package ops).
 	OpsPool *container.NodePool
+	// ArmPool is nil when gitea:runnerArmMaxNodes is 0.
+	ArmPool *container.NodePool
 	NodeSA  *serviceaccount.Account
 }
 
@@ -248,9 +253,9 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 	// burst node fails just the jobs on it.
 	var burst *container.NodePool
 	if cfg.RunnerBurstMaxNodes > 0 {
-		burst, err = taintedPool(ctx, "gitea-runners-burst-pool", BurstPoolValue,
-			cfg.Zone, cfg.RunnerMachineType, cfg.RunnerBurstSpot, cfg.RunnerBurstMaxNodes,
-			cluster, nodeSA, opts, nodeRole)
+		burst, err = taintedPool(ctx, "gitea-runners-burst-pool", BurstPoolValue, cfg.Zone,
+			nodeConfig(nodeSA, cfg.RunnerMachineType, cfg.RunnerBurstSpot), cfg.RunnerBurstMaxNodes,
+			cluster, opts, nodeRole)
 		if err != nil {
 			return nil, err
 		}
@@ -262,9 +267,9 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 	// small.
 	var heavy *container.NodePool
 	if cfg.RunnerHeavyMaxNodes > 0 {
-		heavy, err = taintedPool(ctx, "gitea-runners-heavy-pool", HeavyPoolValue,
-			cfg.Zone, cfg.RunnerHeavyMachineType, false, cfg.RunnerHeavyMaxNodes,
-			cluster, nodeSA, opts, nodeRole)
+		heavy, err = taintedPool(ctx, "gitea-runners-heavy-pool", HeavyPoolValue, cfg.Zone,
+			nodeConfig(nodeSA, cfg.RunnerHeavyMachineType, false), cfg.RunnerHeavyMaxNodes,
+			cluster, opts, nodeRole)
 		if err != nil {
 			return nil, err
 		}
@@ -276,13 +281,36 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 	// serialized anyway. The taint keeps CI pods off it, so a compromised CI
 	// node never shares a kubelet -- or the node authorizer's view of tokens
 	// -- with a pod holding the release identity.
-	ops, err := taintedPool(ctx, "gitea-runners-ops-pool", OpsPoolValue,
-		cfg.Zone, cfg.OpsMachineType, false, 1, cluster, nodeSA, opts, nodeRole)
+	ops, err := taintedPool(ctx, "gitea-runners-ops-pool", OpsPoolValue, cfg.Zone,
+		nodeConfig(nodeSA, cfg.OpsMachineType, false), 1, cluster, opts, nodeRole)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Cluster{Cluster: cluster, NodePool: pool, BurstPool: burst, HeavyPool: heavy, OpsPool: ops, NodeSA: nodeSA}, nil
+	// Native linux/arm64 builds, for `runs-on: docker-arm64`: Axion (C4A), the
+	// only Arm series in this zone. Spot: a node exists only while a job runs,
+	// and a preempted one fails just that job, which is re-run (nothing else
+	// runs here, unlike the burst pool, which hosts no runner either but is on
+	// demand by default). C4A takes no Persistent Disk, so the boot disk is Hyperdisk
+	// Balanced -- and larger than the other pools', because each job's own
+	// dockerd keeps its images and build layers there (an emptyDir). GKE taints
+	// Arm nodes kubernetes.io/arch=arm64:NoSchedule on top of the pool's own
+	// taint, so GKE's own Deployments can never land here either. A job that
+	// escapes to one of these nodes shares a kubelet with other arm64 jobs and
+	// GKE's DaemonSets, never with the runners or the ops pool.
+	var arm *container.NodePool
+	if cfg.RunnerArmMaxNodes > 0 {
+		nc := nodeConfig(nodeSA, cfg.RunnerArmMachineType, true)
+		nc.DiskType = pulumi.String("hyperdisk-balanced")
+		nc.DiskSizeGb = pulumi.Int(50)
+		arm, err = taintedPool(ctx, "gitea-runners-arm64-pool", ArmPoolValue, cfg.Zone,
+			nc, cfg.RunnerArmMaxNodes, cluster, opts, nodeRole)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Cluster{Cluster: cluster, NodePool: pool, BurstPool: burst, HeavyPool: heavy, OpsPool: ops, ArmPool: arm, NodeSA: nodeSA}, nil
 }
 
 // baseCommitment buys the committed use discount gitea:runnerBaseCommitment
@@ -335,15 +363,13 @@ func baseCommitment(ctx *pulumi.Context, cfg *config.Config, opts pulumi.Resourc
 // and scaling it down never takes anything a running job depends on.
 func taintedPool(
 	ctx *pulumi.Context,
-	name, poolValue, zone, machineType string,
-	spot bool,
+	name, poolValue, zone string,
+	nc *container.NodePoolNodeConfigArgs,
 	maxNodes int,
 	cluster *container.Cluster,
-	nodeSA *serviceaccount.Account,
 	opts pulumi.ResourceOption,
 	nodeRole pulumi.Resource,
 ) (*container.NodePool, error) {
-	nc := nodeConfig(nodeSA, machineType, spot)
 	// Labels and taints are part of the pool's node template, which is what
 	// lets the autoscaler scale it up from zero for a pod that tolerates or
 	// selects them.

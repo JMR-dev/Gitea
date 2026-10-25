@@ -4,11 +4,15 @@
 Run: python3 -m unittest discover -s scripts/cicd   (make ci-check runs it)
 """
 import argparse
+import contextlib
 import datetime
+import hashlib
 import io
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -73,6 +77,11 @@ class GoCache(unittest.TestCase):
                       D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.27.0")):
             self.assertNotEqual(n, other)
 
+    def test_name_changes_with_the_pinned_tools(self):
+        n = D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.26.9")
+        with mock.patch.dict(D.TOOLS, {"pulumi": ("https://x/pulumi-v9.tar.gz", "0" * 64, "pulumi")}):
+            self.assertNotEqual(D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.26.9"), n)
+
     def test_newest_object_ignores_the_total_line(self):
         ls = ("  10  2026-10-20T01:00:00Z  gs://b/infra-go-cache-aaaa.tar\n"
               "  20  2026-10-24T01:00:00Z  gs://b/infra-go-cache-bbbb.tar\n"
@@ -96,6 +105,43 @@ class GoCache(unittest.TestCase):
         self.assertEqual(self.saves("up", hit=True), [])
         self.assertEqual(self.saves("up", hit=False),
                          [["tar", "-cf", mock.ANY], ["gcloud", "storage", "cp"]])
+
+
+class Tools(unittest.TestCase):
+    URL = "https://x/tool.tar.gz"
+
+    def fetch(self, sha):
+        """fetch_tools with one tool whose download is its own URL's bytes:
+        (the error or None, PATH afterwards, the commands it ran)."""
+        dest = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest)
+        body = lambda url, timeout: contextlib.nullcontext(io.BytesIO(url.encode()))
+        with mock.patch.dict(D.TOOLS, {"tool": (self.URL, sha, "tool/bin")}, clear=True), \
+                mock.patch.dict(os.environ, {"PATH": "/usr/bin"}), \
+                mock.patch.object(D.urllib.request, "urlopen", side_effect=body), \
+                mock.patch.object(D, "run") as run, redirect_stdout(io.StringIO()):
+            try:
+                D.fetch_tools(dest)
+                err = None
+            except D.Failed as e:
+                err = e
+            return err, os.environ["PATH"], [c.args[0][:2] for c in run.call_args_list], dest
+
+    def test_a_checked_download_goes_first_on_path(self):
+        err, path, ran, dest = self.fetch(hashlib.sha256(self.URL.encode()).hexdigest())
+        self.assertIsNone(err)
+        self.assertEqual(path, os.path.join(dest, "tool/bin") + os.pathsep + "/usr/bin")
+        self.assertEqual(ran, [["tar", "-xzf"]])
+
+    def test_a_wrong_checksum_is_never_unpacked(self):
+        err, path, ran, _ = self.fetch("0" * 64)
+        self.assertIn("not the pinned", str(err))
+        self.assertEqual((path, ran), ("/usr/bin", []))
+
+    def test_the_pins_are_https_and_sha256(self):
+        for url, sha, _ in D.TOOLS.values():
+            self.assertTrue(url.startswith("https://"), url)
+            self.assertRegex(sha, r"^[0-9a-f]{64}$")
 
 
 class SshKeys(unittest.TestCase):

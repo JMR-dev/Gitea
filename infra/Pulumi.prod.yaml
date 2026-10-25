@@ -70,6 +70,11 @@ config:
   # leave free. 3 / 24Gi leaves room for GKE's DaemonSets and the pre-pull one.
   gitea:runnerHeavyCpu: "3"
   gitea:runnerHeavyMemory: 24Gi
+  # `runs-on: docker-arm64` jobs build linux/arm64 images natively: each job is
+  # a pod with its own rootless Docker daemon, on a Spot c4a-standard-2 (Axion)
+  # node scaled from zero to runnerArmMaxNodes, one job per node. Its own small
+  # runner on the base node hands them out. 0 removes the pool and the runner.
+  gitea:runnerArmMaxNodes: "2"
   # `runs-on: docker` jobs (docker build, Docker actions) run on the
   # Docker-in-Docker runner: one pod per base node (pod anti-affinity), each
   # running up to runnerCapacity jobs at once. The base pool is

@@ -62,11 +62,14 @@ availableSecrets:
 
 steps:
   - id: deploy
-    # Pinned by digest: Pulumi, Go, Python and gcloud in one image, which is
-    # what one process doing all of it needs.
-    name: pulumi/pulumi:3.266.0@sha256:d7ac1d7a8e502e784db4dd637f0d499ecdfef7f1bb81e8ece214c9b564361c59
+    # Pinned by digest: Google's gcloud image (Python, gcloud, git, ssh, the
+    # GKE auth plugin), which Cloud Build's workers have cached -- it pulls in
+    # about a second, where pulumi/pulumi took ~100 s from Docker Hub. Even
+    # uncached, a gcloud image pulled in 35-42 s (2026-10-25). --fetch-tools
+    # adds the pinned, checksummed Go and Pulumi CLI (TOOLS in infra_deploy.py).
+    name: gcr.io/google.com/cloudsdktool/google-cloud-cli:589.0.0@sha256:2c7b0a3d24236ab5f0c1f768c82000f523ed999f4c677dd311785b313ccb76bd
     entrypoint: python3
-    args: [scripts/cicd/infra_deploy.py, "${_MODE}"]
+    args: [scripts/cicd/infra_deploy.py, "${_MODE}", --fetch-tools]
     secretEnv: [PULUMI_CONFIG_PASSPHRASE]
     # This step declares env:, so it does NOT receive automapSubstitutions.
     # infra_deploy.py reads all of its inputs from the environment, so list
