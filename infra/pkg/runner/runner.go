@@ -433,9 +433,9 @@ func rule(resource string, verbs ...string) *rbacv1.PolicyRuleArgs {
 // short-lived token from the caller's own application-default credentials each
 // time Pulumi connects. So the acting identity is whoever runs Pulumi -- cb-infra
 // on a deploy, cb-infra-preview on a pull-request preview -- and no token sits in
-// state for a reader of the state to replay as a deployer. The pinned
-// pulumi/pulumi image ships the plugin, and scripts/cicd/infra_deploy.py puts the
-// SDK bin dir on PATH; a workstation needs google-cloud-cli-gke-gcloud-auth-plugin.
+// state for a reader of the state to replay as a deployer. The deploy step's
+// gcloud image (cloudbuild/infra.yaml) has the plugin on PATH; a workstation
+// needs google-cloud-cli-gke-gcloud-auth-plugin.
 func provider(ctx *pulumi.Context, gk *gke.Cluster) (*kubernetes.Provider, error) {
 	// Only the cluster's endpoint is needed, read from its own output (from
 	// state at preview). No token is fetched, so the provider no longer depends
