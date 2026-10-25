@@ -335,8 +335,13 @@ class Ops:
         reads as YAML). All the SSH options are here, none in ansible.cfg:
         ssh takes the first value it is given for each, so two places would
         quietly disagree."""
-        proxy = shlex.join(["gcloud", "compute", "start-iap-tunnel", "%h", "22", "--listen-on-stdin",
-                            f"--zone={self.a.zone}", f"--project={self.a.project}", "--verbosity=warning"])
+        # env -u PYTHONPATH: ansible-core is on PYTHONPATH (ansible_env), and
+        # gcloud, on its own bundled Python, would import that cryptography
+        # over its own and crash before the tunnel opened (seen in Cloud
+        # Build's gcloud image).
+        proxy = shlex.join(["env", "-u", "PYTHONPATH", "gcloud", "compute", "start-iap-tunnel", "%h", "22",
+                            "--listen-on-stdin", f"--zone={self.a.zone}", f"--project={self.a.project}",
+                            "--verbosity=warning"])
         host = {
             "ansible_host": self.a.vm,
             "ansible_user": self.ssh_user,

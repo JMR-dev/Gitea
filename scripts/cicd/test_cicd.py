@@ -530,8 +530,9 @@ class EngineConnection(unittest.TestCase):
         self.assertEqual(host["ansible_python_interpreter"], "/usr/bin/python3")
         self.assertIn("ControlPersist=60m", host["ansible_ssh_args"])
         args = dict(a.split("=", 1) for a in __import__("shlex").split(host["ansible_ssh_common_args"]) if a != "-o")
-        self.assertEqual(args["ProxyCommand"], "gcloud compute start-iap-tunnel %h 22 --listen-on-stdin "
-                                               "--zone=z --project=p --verbosity=warning")
+        # gcloud must not see ansible-core's PYTHONPATH (write_inventory).
+        self.assertEqual(args["ProxyCommand"], "env -u PYTHONPATH gcloud compute start-iap-tunnel %h 22 "
+                                               "--listen-on-stdin --zone=z --project=p --verbosity=warning")
         self.assertEqual(args["ControlPath"], os.path.join(o.cp_dir, "%h"))
         self.assertEqual(args["UserKnownHostsFile"], os.path.join(o.work, "known_hosts"))
         self.assertEqual(args["StrictHostKeyChecking"], "accept-new")
