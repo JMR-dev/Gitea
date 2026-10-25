@@ -74,7 +74,11 @@ config:
   # a pod with its own rootless Docker daemon, on a Spot c4a-standard-2 (Axion)
   # node scaled from zero to runnerArmMaxNodes, one job per node. Its own small
   # runner on the base node hands them out. 0 removes the pool and the runner.
-  gitea:runnerArmMaxNodes: "2"
+  # 18, so a fan-out of image builds (watchtower's daily 05:00 UTC rebuild)
+  # runs at once. The ceiling, not the usual size. At 18 it needs 36 C4A vCPUs
+  # and 900 GB of Hyperdisk Balanced in us-east1 and counts towards the
+  # project's all-regions CPU quota: see docs/runners.md before raising it.
+  gitea:runnerArmMaxNodes: "18"
   # `runs-on: docker` jobs (docker build, Docker actions) run on the
   # Docker-in-Docker runner: one pod per base node (pod anti-affinity), each
   # running up to runnerCapacity jobs at once. The base pool is

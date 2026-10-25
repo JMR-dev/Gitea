@@ -408,9 +408,12 @@ func validate(c *Config) error {
 		if !quantity.MatchString(c.RunnerHeavyMemory) {
 			return fmt.Errorf("gitea:runnerHeavyMemory %q is not a Kubernetes quantity (e.g. 12Gi)", c.RunnerHeavyMemory)
 		}
-		if c.RunnerArmMaxNodes < 0 || c.RunnerArmMaxNodes > 4 {
+		if c.RunnerArmMaxNodes < 0 || c.RunnerArmMaxNodes > 18 {
 			// A cost guard, like the others; also the arm runner's capacity.
-			return fmt.Errorf("gitea:runnerArmMaxNodes %d must be between 0 and 4", c.RunnerArmMaxNodes)
+			// 18 lets a daily fan-out of arm64 image builds run at once. The
+			// project's quotas, not this, may be what holds it lower
+			// (docs/runners.md).
+			return fmt.Errorf("gitea:runnerArmMaxNodes %d must be between 0 and 18", c.RunnerArmMaxNodes)
 		}
 		if c.RunnerArmMaxNodes > 0 && !armMachine.MatchString(c.RunnerArmMachineType) {
 			// The pool's Hyperdisk boot disk is what C4A requires, and the job
