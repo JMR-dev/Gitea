@@ -375,7 +375,9 @@ deadline):
 
 A path B rollback loses whatever was written during the soak, and a later push
 can then make the GitHub push mirror force-push those commits away. Pause the
-mirror before a manual data rollback.
+mirror before a manual data rollback. Those writes are not gone at once: the
+replaced tree stays in `/var/lib/gitea/.pre-restore-<stamp>` for 7 days (see
+below).
 
 ### Roll back to a previous image
 
@@ -419,12 +421,19 @@ images, so the cleanup policy never deletes them.
 6. Start the timers and gitea.
 
 This keeps the Pulumi-managed `gitea-data` disk, so there is no state drift.
-Delete `.pre-restore-*` once you know what went wrong.
+
+Each `.pre-restore-<stamp>` is a full copy of the data, and every D4 drill
+leaves one. The engine's backup removes those older than 7 days, right after
+its own snapshot (`make ops-backup`, and the backup in every infra deploy and
+path A release; a path B release, which takes no snapshot there, does not). Its
+log and manifest (`pre_restore_removed`) list what went. A removed copy is
+still in that snapshot and in the daily ones taken while it was on the disk,
+for 14 days more. Delete one sooner by hand once you know what went wrong.
 
 ### Backups and the restore drill
 
 ```bash
-make ops-backup          # dump + config tarball + exports + online snapshot
+make ops-backup          # dump + config tarball + exports + online snapshot; prunes week-old .pre-restore-*
 make ops-drill-restore   # newest snapshot AND newest dump each boot a working Gitea
 ```
 

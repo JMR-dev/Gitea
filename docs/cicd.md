@@ -196,7 +196,10 @@ never ran either.
 automatic runs, and the pending `cloudbuild/drill-*` statuses show what's due.
 D4 needs a window, because it really stops Gitea and restores its disk. **Run
 D4 before the next Gitea major or Alpine minor bump** regardless: that's the
-path whose only way back is a data restore.
+path whose only way back is a data restore. Each D4 leaves the replaced tree
+on the data disk as `/var/lib/gitea/.pre-restore-<stamp>`, a full copy of the
+data; the engine's backup removes it once it is a week old
+(`docs/runbook.md`, "Restore the data disk from a snapshot").
 
 ### Turning automation on, and off
 
@@ -373,3 +376,6 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-10-24 | D3 image fail-verify (Path A) | 550d155 | `46984fca` | PASS: image code `515c803` attested; promoted, rolled back to `:previous` |
 | 2026-10-24 | D4 image fail-after-migrate (Path B) | 550d155 | `0d7cd5a0` | PASS: image code `515c803`; restored from `gitea-data-pre-release-20261024t225431z`, drill marker absent; down ~22:54–23:09 UTC |
 | 2026-10-25 | D5 infra fail-verify (gcloud image, fetched tools, plugin cache) | 246882f | `2b8fa2d0` | PASS: infra code `405d4d7` attested; image pull 1.2 s (was 96–114 s), new cache object +493 MB of plugins; 8.7 min |
+| 2026-10-25 | D5 infra fail-verify (prune week-old `.pre-restore` trees) | 639575d | `85a32d57` | PASS: infra code `dd70fec` attested; the backup's prune found 0 of 2 trees older than 7 days; 8.5 min |
+| 2026-10-25 | D3 image fail-verify (Path A) | 639575d | `667106d1` | PASS: image code `e8a8e86` attested; promoted, rolled back to `:previous`. A first submission from a git worktree (`450d7883`) failed at `resolve-gitea` before any release: `.gcloudignore`'s `.git/` skips only a directory, so the worktree's `.git` file was uploaded |
+| 2026-10-25 | D4 image fail-after-migrate (Path B) | 639575d | `960c42dc` | PASS: image code `e8a8e86`; restored from `gitea-data-pre-release-20261025t153628z`, drill marker absent; down 15:39–15:41 and 15:47–15:49 UTC (10 s probes), about 3.5 min in all |

@@ -249,8 +249,9 @@ step_marker_check() { [[ -e "${DATA}/.drill-$1" ]] && echo present || echo absen
 #
 # The current contents are moved aside (same filesystem, so instant) rather
 # than deleted: they are the evidence of what went wrong, and if the copy fails
-# halfway, nothing is lost and it can simply be re-run. Delete
-# /var/lib/gitea/.pre-restore-* by hand once things are understood.
+# halfway, nothing is lost and it can simply be re-run. Each one is a full copy
+# of the data, so a later backup removes it after a week (pre-restore-remove);
+# delete one sooner by hand once things are understood.
 #
 # The host has no rsync, unzip or sqlite3; our own gitea image carries all
 # three for exactly this, so TOOL_IMAGE is any image this repo built. It runs
@@ -293,6 +294,27 @@ step_restore_sync() {
         die "restored tree does not match the snapshot (old contents kept in ${keep})"
     fi
     log "restored ${DATA} (${have} files, inventory matches the snapshot); the replaced contents are in ${keep}"
+}
+
+# pre-restore-list: the trees restore-sync moved aside, one name a line.
+step_pre_restore_list() {
+    find "${DATA}" -mindepth 1 -maxdepth 1 -type d -name '.pre-restore-*' -printf '%f\n' | sort
+}
+
+# pre-restore-remove NAME...: delete those trees. gitea_ops.py decides which
+# (older than a week, after a snapshot that still holds them); this only
+# refuses anything that is not exactly such a tree directly under DATA.
+step_pre_restore_remove() {
+    local name
+    for name in "$@"; do
+        [[ "${name}" =~ ^\.pre-restore-[0-9]{8}T[0-9]{6}Z$ ]] || die "not a pre-restore tree: ${name}"
+        if [[ ! -d "${DATA}/${name}" || -L "${DATA}/${name}" ]]; then
+            log "${DATA}/${name} is not a directory (gone already?); skipped"
+            continue
+        fi
+        rm -rf --one-file-system -- "${DATA:?}/${name}"
+        log "removed ${DATA}/${name}"
+    done
 }
 
 # Starts the isolated test instance on DATA_DIR. --network none: a restored

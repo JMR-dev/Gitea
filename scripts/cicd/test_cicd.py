@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s scripts/cicd   (make ci-check runs it)
 """
 import argparse
 import contextlib
+import datetime
 import hashlib
 import io
 import os
@@ -166,6 +167,46 @@ class SshKeys(unittest.TestCase):
             d.prune_ssh_keys()  # a rollback's second sync
         removed = [c.args[0][-1] for c in run.call_args_list if "remove" in c.args[0]]
         self.assertEqual(removed, ["--key=never", "--key=expired", "--key=bare"])
+
+
+class PreRestore(unittest.TestCase):
+    NOW = datetime.datetime(2026, 10, 31, 4, 0, tzinfo=datetime.timezone.utc)
+
+    def test_only_week_old_trees_named_exactly_so(self):
+        names = [".pre-restore-20261023T230921Z",   # 7d 4h old
+                 ".pre-restore-20261024T230540Z",   # 6d 5h old
+                 ".pre-restore-20261024T040000Z",   # exactly 7 days: kept
+                 ".pre-restore-20261313T000000Z",   # no such date
+                 ".pre-restore-20261001T000000Z/../data", ".pre-restore-", "data", ""]
+        self.assertEqual(O.stale_pre_restore(names, self.NOW), [".pre-restore-20261023T230921Z"])
+        self.assertEqual(O.stale_pre_restore([], self.NOW), [])
+
+    def prune(self, listing, fail=False):
+        ops = O.Ops(argparse.Namespace(region="r", project="p", repo="gitea", cmd="backup", dry_run=False))
+        calls = []
+
+        def vm(step, *args, mutate=True):
+            calls.append((step, *args))
+            if fail:
+                raise subprocess.CalledProcessError(255, ["vm-steps", step])
+            return listing if step == "pre-restore-list" else ""
+        with mock.patch.object(ops, "vm", side_effect=vm), mock.patch.object(O, "utcnow", return_value=self.NOW), \
+                redirect_stderr(io.StringIO()):
+            ops.prune_pre_restore()
+        return calls, ops.manifest.get("pre_restore_removed")
+
+    def test_removes_the_old_ones_and_records_them(self):
+        calls, removed = self.prune(".pre-restore-20261023T230921Z\n.pre-restore-20261024T230540Z\n")
+        self.assertEqual(calls, [("pre-restore-list",), ("pre-restore-remove", ".pre-restore-20261023T230921Z")])
+        self.assertEqual(removed, [".pre-restore-20261023T230921Z"])
+
+    def test_nothing_old_means_no_remove(self):
+        self.assertEqual(self.prune(".pre-restore-20261030T000000Z\n"), ([("pre-restore-list",)], None))
+        self.assertEqual(self.prune(""), ([("pre-restore-list",)], None))
+
+    def test_a_vm_error_never_fails_the_backup(self):
+        calls, removed = self.prune("", fail=True)
+        self.assertEqual((calls, removed), ([("pre-restore-list",)], None))
 
 
 class Gate(unittest.TestCase):
