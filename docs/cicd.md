@@ -372,3 +372,4 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-10-24 | D5 infra fail-verify (SSH key expiry) | 550d155 | `d53fd2fa` | PASS: infra code `4d6036d` attested; cleared 22 stale OS Login keys (gitea-release) and 8 (cb-infra), and SSH worked again; 10.5 min |
 | 2026-10-24 | D3 image fail-verify (Path A) | 550d155 | `46984fca` | PASS: image code `515c803` attested; promoted, rolled back to `:previous` |
 | 2026-10-24 | D4 image fail-after-migrate (Path B) | 550d155 | `0d7cd5a0` | PASS: image code `515c803`; restored from `gitea-data-pre-release-20261024t225431z`, drill marker absent; down ~22:54–23:09 UTC |
+| 2026-10-25 | D5 infra fail-verify (gcloud image, fetched tools, plugin cache) | 246882f | `2b8fa2d0` | PASS: infra code `405d4d7` attested; image pull 1.2 s (was 96–114 s), new cache object +493 MB of plugins; 8.7 min |
