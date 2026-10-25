@@ -11,10 +11,15 @@
   4. guard: a replacement or deletion of the VM, a disk, a bucket, the
      cluster, an address or a DNS record needs approval; anything else goes
   5. backup: the release engine's backup Job (dump, config tarball, online
-     snapshot) plus a `pulumi stack export`. From step 3 to the end, a
-     placeholder pod holds the ops pool's node, so this Job and step 7's both
-     start on a warm node with the engine image already pulled
-  6. pulumi up, then the VM config sync
+     snapshot -- a consistent one when an approved change replaces something)
+     plus a `pulumi stack export`. From step 3 to the end, a placeholder pod
+     holds the ops pool's node, so this Job and step 7's both start on a warm
+     node with the engine image already pulled
+  6. pulumi up, then the VM config (vm_sync): the tree being applied decides
+     how. With vm/bootstrap.sh the VM pulls its own config, so the sync is
+     `systemctl start gitea-config-sync` over SSH; with vm/ansible/site.yml
+     the playbook is pushed over the same IAP SSH. A replaced VM is waited
+     for first: SSH, then boot, then (after its config) HTTPS
   7. verify: the release engine's status checks, then a preview that must show
      nothing left to change
   8. on success, this commit's tree becomes last-good; on a failure in 6-7, the
@@ -24,6 +29,11 @@ A rollback is a re-apply, not an undo: a replaced VM is replaced again, and
 data is never restored here (scripts/ops/gitea_ops.py rollback does that, by
 hand). Log lines starting GITEA_INFRA_ROLLBACK and GITEA_INFRA_ROLLBACK_FAILED
 feed the alerting in cicd/pkg/alerting.
+
+`vm-check` and `vm-apply` run only the playbook (`--check --diff`, or for
+real) against --vm from --tree: the pre-cutover proof against prod, and the
+rehearsal VM. A tree with vm/ansible also has its checks run by `preview` and
+`up` (ansible_checks).
 
 Everything comes from the environment Cloud Build maps its substitutions into;
 see cloudbuild/infra.yaml.
@@ -110,6 +120,51 @@ LOCK_WAIT = 45 * 60
 LOCK_STALE = 4 * 3600
 GO_CACHE_PREFIX = "infra-go-cache-"
 SSH_KEY_TTL = "1h"  # as scripts/ops/gitea_ops.py: the sync's OS Login key
+ANSIBLE_DIR = os.path.join("vm", "ansible")
+PROD_VM = "gitea-vm"  # vm-apply refuses it without --approved
+SSH_WAIT = 10 * 60    # a just-created VM: IAP, sshd and the OS Login agent come up
+BOOT_WAIT = 15 * 60   # then systemd finishes booting
+HTTPS_WAIT = 10 * 60  # then, after its config, Caddy gets a certificate
+
+
+def tree_kind(src):
+    """How a tree's VM config reaches the VM: "legacy" while it has
+    vm/bootstrap.sh (the VM's startup script, which pulls the config itself),
+    "ansible" once it has vm/ansible/site.yml instead, None for neither. A
+    rollback can re-apply a tree of either kind, so this is asked of the tree
+    being applied, never of ROOT."""
+    if os.path.isfile(os.path.join(src, "vm", "bootstrap.sh")):
+        return "legacy"
+    if os.path.isfile(os.path.join(src, ANSIBLE_DIR, "site.yml")):
+        return "ansible"
+    return None
+
+
+def nftables_restarts(src):
+    """Lines in the tree's playbook that restart, reload or stop nftables. On
+    EL the unit's ExecReload and ExecStop flush the whole ruleset -- netavark's
+    DNAT and fail2ban's bans with it -- so the firewall is only ever loaded
+    with `nft -f` (vm/bootstrap.sh setup_nftables). Returns "path:line" strings."""
+    bad, base = [], os.path.join(src, ANSIBLE_DIR)
+    for d, _, files in os.walk(base):
+        for f in files:
+            if not f.endswith((".yml", ".yaml", ".j2", ".sh")) and "." in f:
+                continue
+            p = os.path.join(d, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    lines = fh.read().splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if "systemctl" in s and "nftables" in s and any(w in s.split() for w in ("restart", "reload", "stop", "try-restart", "reload-or-restart")):
+                    bad.append(f"{os.path.relpath(p, src)}:{i + 1}")
+                if s.split("#")[0].strip() in ("name: nftables", "name: nftables.service"):
+                    near = " ".join(lines[max(0, i - 4): i + 5])
+                    if any(f"state: {st}" in near for st in ("restarted", "reloaded", "stopped")):
+                        bad.append(f"{os.path.relpath(p, src)}:{i + 1}")
+    return bad
 
 
 def log(msg):
@@ -462,11 +517,160 @@ class Deploy:
         if r.returncode != 0:
             raise Failed(f"gitea_ops.py {engine_args[-1] if engine_args else ''} failed (exit {r.returncode})")
 
-    def sync(self):
+    def ssh(self, command, *, check=True, capture=False):
+        return run(["gcloud", "compute", "ssh", self.a.vm, f"--zone={self.a.zone}", f"--project={self.a.app_project}",
+                    "--tunnel-through-iap", "--quiet", f"--ssh-key-expire-after={SSH_KEY_TTL}",
+                    "--command", command], check=check, capture=capture)
+
+    def instance_id(self):
+        """The VM's numeric id, or "" if there is none. A different id after
+        `pulumi up` means the VM was replaced."""
+        r = run(["gcloud", "compute", "instances", "describe", self.a.vm, f"--zone={self.a.zone}",
+                 f"--project={self.a.app_project}", "--format=value(id)"], check=False, capture=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def prime_ssh(self, wait):
+        """One SSH that registers this run's OS Login key (good for SSH_KEY_TTL),
+        records the VM's host key in gcloud's known-hosts file under
+        compute.<instance id>, and returns the OS Login user -- what Ansible's
+        own SSH then uses. Done before every playbook run, since a run can
+        outlive a key. A VM that was just created refuses for a while (IAP
+        4003, connection refused, publickey until the guest agent is up), so
+        with `wait` this retries for SSH_WAIT."""
         self.prune_ssh_keys()
-        run(["gcloud", "compute", "ssh", self.a.vm, f"--zone={self.a.zone}", f"--project={self.a.app_project}",
-             "--tunnel-through-iap", "--quiet", f"--ssh-key-expire-after={SSH_KEY_TTL}", "--command",
-             "sudo systemctl start gitea-config-sync.service && sudo journalctl -u gitea-config-sync -n 40 --no-pager"])
+        deadline = time.time() + (SSH_WAIT if wait else 0)
+        while True:
+            r = self.ssh("id -un", check=False, capture=True)
+            user = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+            if user:
+                return user
+            if time.time() >= deadline:
+                raise Failed(f"cannot SSH to {self.a.vm}: {(r.stderr or '').strip()[-400:]}")
+            log(f"{self.a.vm} not reachable over SSH yet; retrying")
+            time.sleep(15)
+
+    def wait_booted(self):
+        """Until systemd has finished booting. degraded counts: one failed unit
+        must not stop the config that may fix it."""
+        r = self.ssh(f"timeout {BOOT_WAIT} systemctl is-system-running --wait; true", check=False, capture=True)
+        state = (r.stdout or "").strip().splitlines()[-1:] or [""]
+        if state[0] not in ("running", "degraded"):
+            raise Failed(f"{self.a.vm} did not finish booting: {state[0] or r.stderr.strip()[-300:]}")
+        log(f"{self.a.vm} is up ({state[0]})")
+
+    def vm_sync(self, src, replaced=False):
+        """Apply the VM config of the tree at src (see tree_kind)."""
+        kind = tree_kind(src)
+        if kind is None:
+            raise Failed(f"{src} has neither vm/bootstrap.sh nor {ANSIBLE_DIR}/site.yml: no way to configure the VM")
+        self.prime_ssh(wait=replaced)
+        self.wait_booted()
+        if kind == "legacy":
+            # The startup script (vm/bootstrap.sh in full mode) installs
+            # gitea-config-sync.service; on a VM that was just created it is
+            # still running, and starting the sync before it finishes either
+            # fails (no such unit) or races it. Once it has finished, the unit
+            # is there or never will be (it skips the units when the secrets
+            # are unreadable).
+            self.ssh(f"timeout {BOOT_WAIT} sh -c 'while [ \"$(systemctl show -p ActiveState --value "
+                     "google-startup-scripts.service)\" = activating ]; do sleep 10; done' && "
+                     "{ [ -f /etc/systemd/system/gitea-config-sync.service ] || "
+                     "{ echo 'the startup script finished without installing gitea-config-sync.service' >&2; "
+                     "exit 1; }; }")
+            self.ssh("sudo systemctl start gitea-config-sync.service && "
+                     "sudo journalctl -u gitea-config-sync -n 40 --no-pager")
+            return
+        self.playbook(src, check=False)
+
+    # --- Ansible (the VM config of a tree with vm/ansible) ----------------------
+
+    def ansible_env(self, src):
+        """ansible-core, installed from the tree's own hash-locked requirements
+        into a directory keyed on that file -- outside the tree, which is what
+        save_last_good archives -- and the environment that runs it. A
+        rollback's tree may pin a different version, hence per tree. pip, not
+        a venv: the deploy image's Python has no ensurepip; --target also keeps
+        Debian's externally-managed marker out of it."""
+        req = os.path.join(src, ANSIBLE_DIR, "requirements.txt")
+        with open(req, "rb") as f:
+            target = os.path.join(self.tmp, "ansible-" + hashlib.sha256(f.read()).hexdigest()[:16])
+        if not os.path.isdir(os.path.join(target, "bin")):
+            run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+                 "--root-user-action=ignore", "--no-cache-dir", "--require-hashes", "--only-binary=:all:", "--no-deps",
+                 "--target", target, "-r", req])
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (target, env.get("PYTHONPATH", "")) if p)
+        env["PATH"] = os.path.join(target, "bin") + os.pathsep + env.get("PATH", "")
+        env.update({
+            # Ansible ignores an ansible.cfg in a world-writable directory,
+            # and Cloud Build's /workspace can be one: name it explicitly.
+            "ANSIBLE_CONFIG": os.path.join(src, ANSIBLE_DIR, "ansible.cfg"),
+            "ANSIBLE_HOME": os.path.join(self.tmp, "ansible-home"),
+            "ANSIBLE_LOCAL_TEMP": os.path.join(self.tmp, "ansible-tmp"),
+            "LC_ALL": "C.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        return env
+
+    def playbook(self, src, *, check):
+        """site.yml against --vm, over the IAP SSH that prime_ssh just set up.
+        An apply is idempotent, so one failure is retried once (usually a
+        package mirror) before the deploy gives up and rolls back."""
+        user = self.prime_ssh(wait=False)
+        env = self.ansible_env(src)
+        env.update({"GITEA_VM": self.a.vm, "GITEA_ZONE": self.a.zone, "GITEA_PROJECT": self.a.app_project,
+                    "GITEA_SSH_USER": user, "GITEA_INSTANCE_ID": self.instance_id()})
+        base = os.path.join(src, ANSIBLE_DIR)
+        cmd = ["ansible-playbook", "-i", os.path.join(base, "inventory.yml"), os.path.join(base, "site.yml"), "--diff"]
+        if check:
+            cmd.append("--check")
+        for attempt in (1, 2):
+            if run(cmd, cwd=base, env=env, check=False).returncode == 0:
+                return
+            if check or attempt == 2:
+                raise Failed(f"ansible-playbook {'--check ' if check else ''}against {self.a.vm} failed")
+            log("ansible-playbook failed; retrying once")
+            self.prime_ssh(wait=False)
+
+    def ansible_checks(self, src):
+        """What a tree's playbook must pass before it goes anywhere near the VM:
+        the nftables rule above, a syntax check, and the tree's own tests
+        (vm/ansible/tests/check: the golden renders). Run by preview and by up
+        before the backup, so a broken playbook fails a PR, not a deploy."""
+        if not os.path.isdir(os.path.join(src, ANSIBLE_DIR)):
+            return
+        bad = nftables_restarts(src)
+        if bad:
+            raise Failed("the playbook restarts, reloads or stops nftables (flushes every ruleset; "
+                         "load it with `nft -f`): " + ", ".join(bad))
+        env = self.ansible_env(src)
+        # Syntax only: the inventory's values are never used.
+        env.update({"GITEA_VM": "syntax-check", "GITEA_ZONE": "z", "GITEA_PROJECT": "p",
+                    "GITEA_SSH_USER": "u", "GITEA_INSTANCE_ID": "0"})
+        base = os.path.join(src, ANSIBLE_DIR)
+        run(["ansible-playbook", "--syntax-check", "-i", os.path.join(base, "inventory.yml"),
+             os.path.join(base, "site.yml")], cwd=base, env=env)
+        tests = os.path.join(base, "tests", "check")
+        if os.path.isfile(tests):
+            run([tests], cwd=base, env=env)
+
+    def wait_https(self):
+        """After a replaced VM's config: until Gitea answers through Caddy with
+        a certificate that verifies -- DNS-01 issuance takes a minute or two --
+        so the release engine's verify does not fail on a cert still coming."""
+        url = self.a.gitea_url.rstrip("/") + "/api/healthz"
+        deadline, last = time.time() + HTTPS_WAIT, None
+        while True:
+            try:
+                with urllib.request.urlopen(url, timeout=15) as r:
+                    if r.status == 200:
+                        log(f"{url} answers with a valid certificate")
+                        return
+            except OSError as e:  # includes TLS and HTTP errors
+                last = e
+            if time.time() >= deadline:
+                raise Failed(f"{url} not healthy {HTTPS_WAIT // 60} min after the VM was replaced: {last!r}")
+            time.sleep(15)
 
     def prune_ssh_keys(self):
         """Every build has a fresh HOME, so the sync's SSH registers a new OS
@@ -492,9 +696,17 @@ class Deploy:
 
     def apply(self, src, label):
         infra = self.prepare(src)
+        before = self.instance_id()
         self.applied = True
         self.pulumi("up", "--yes", "--diff", cwd=infra)
-        self.sync()
+        # `pulumi up` returns once a new VM is RUNNING, long before it boots.
+        after = self.instance_id()
+        replaced = after != before
+        if replaced:
+            log(f"{self.a.vm} was replaced (instance {before or 'none'} -> {after or 'none'})")
+        self.vm_sync(src, replaced)
+        if replaced:
+            self.wait_https()
         self.ops("verify")
         left = leftover_changes(self.preview_json(infra))
         if left:
@@ -525,6 +737,7 @@ class Deploy:
     # --- modes ------------------------------------------------------------------
 
     def preview(self):
+        self.ansible_checks(ROOT)
         infra = self.prepare(ROOT)
         self.pulumi("preview", "--diff", cwd=infra)
         gate = run([sys.executable, os.path.join(HERE, "release_gate.py"), "check", "infra",
@@ -557,7 +770,10 @@ class Deploy:
                 if not self.a.approved:
                     raise Failed(f"needs approval, not deployed: {listing}")
                 log(f"approved destructive changes: {listing}")
-            self.ops("--yes", "backup")
+            self.ansible_checks(ROOT)
+            # A replacement is the one change whose rollback can need the data
+            # disk as it was: snapshot it with Gitea stopped, not online.
+            self.ops("--yes", "backup", *(["--snapshot", "consistent"] if risky else []))
             exp = self.pulumi("stack", "export", cwd=infra, capture=True)
             run(["gcloud", "storage", "cp", "-",
                  f"gs://{self.a.app_project}-gitea-backups/config/{self.stamp}-infra/stack.json"], stdin=exp.stdout)
@@ -584,11 +800,38 @@ class Deploy:
             self.unwarm_ops()
             self.unlock()
 
+    def vm(self, check):
+        """vm-check / vm-apply: only the playbook, from --tree, against --vm.
+        An apply to prod outside a deploy needs --approved, and holds the infra
+        lock (when there is a state bucket) so it never overlaps a deploy."""
+        src = os.path.abspath(self.a.tree or ROOT)
+        if tree_kind(src) != "ansible":
+            if not check and tree_kind(src) == "legacy":
+                # The rollback rehearsal: the old tree's config sync, waited for.
+                self.vm_sync(src, replaced=True)
+                return 0
+            raise Failed(f"{src} has no {ANSIBLE_DIR}/site.yml")
+        self.ansible_checks(src)
+        if check:
+            self.playbook(src, check=True)
+            return 0
+        if self.a.vm == PROD_VM and not self.a.approved:
+            raise Failed(f"vm-apply to {PROD_VM} needs --approved (a deploy applies it by itself)")
+        if self.lockurl:
+            self.lock()
+        try:
+            self.playbook(src, check=False)
+        finally:
+            self.unlock()
+        return 0
+
 
 def main():
     e = os.environ.get
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["preview", "up"])
+    p.add_argument("mode", choices=["preview", "up", "vm-check", "vm-apply"])
+    p.add_argument("--tree", default=e("_TREE", ""), help="vm-check/vm-apply: the tree whose playbook runs "
+                   "(default: this checkout)")
     p.add_argument("--sha", default=e("_SHA") or e("COMMIT_SHA", ""))
     p.add_argument("--build-id", default=e("BUILD_ID", "local"))
     p.add_argument("--app-project", default=e("_APP_PROJECT", "gitea-496920"))
@@ -611,6 +854,8 @@ def main():
         if a.fetch_tools:
             fetch_tools(tempfile.mkdtemp(prefix="infra-tools-"))
         d = Deploy(a)
+        if a.mode in ("vm-check", "vm-apply"):
+            sys.exit(d.vm(check=a.mode == "vm-check"))
         sys.exit(d.preview() if a.mode == "preview" else d.up())
     except Failed as err:
         log(f"FAILED: {err}")

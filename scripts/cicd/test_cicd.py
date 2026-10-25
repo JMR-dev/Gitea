@@ -169,6 +169,108 @@ class SshKeys(unittest.TestCase):
         self.assertEqual(removed, ["--key=never", "--key=expired", "--key=bare"])
 
 
+class VmConfig(unittest.TestCase):
+    """How a tree's VM config is applied: the legacy pull, or the playbook."""
+
+    def tree(self, *files, content=""):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        for f in files:
+            p = os.path.join(root, f)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as fh:
+                fh.write(content)
+        return root
+
+    def deploy(self, **kw):
+        a = dict(mode="up", state_bucket="", vm="gitea-vm", zone="z", app_project="p", approved=False,
+                 tree="", gitea_url="https://gitea.example")
+        a.update(kw)
+        return D.Deploy(argparse.Namespace(**a))
+
+    def test_the_tree_decides_and_bootstrap_wins(self):
+        self.assertEqual(D.tree_kind(self.tree("vm/bootstrap.sh")), "legacy")
+        self.assertEqual(D.tree_kind(self.tree("vm/ansible/site.yml")), "ansible")
+        self.assertEqual(D.tree_kind(self.tree("vm/bootstrap.sh", "vm/ansible/site.yml")), "legacy")
+        self.assertIsNone(D.tree_kind(self.tree("vm/quadlets/x")))
+
+    def test_nftables_is_only_ever_loaded_never_restarted(self):
+        bad_unit = "- systemd_service:\n    name: nftables\n    state: restarted\n"
+        bad_shell = "- command: systemctl reload nftables\n"
+        good = "- systemd_service:\n    name: nftables\n    state: started\n    enabled: true\n- command: nft -f x\n"
+        self.assertEqual(len(D.nftables_restarts(self.tree("vm/ansible/roles/f/tasks/main.yml", content=bad_unit))), 1)
+        self.assertEqual(len(D.nftables_restarts(self.tree("vm/ansible/handlers.yml", content=bad_shell))), 1)
+        self.assertEqual(D.nftables_restarts(self.tree("vm/ansible/roles/f/tasks/main.yml", content=good)), [])
+
+    def test_sync_follows_the_tree(self):
+        d = self.deploy()
+        with mock.patch.object(d, "prime_ssh"), mock.patch.object(d, "wait_booted"), \
+                mock.patch.object(d, "ssh") as ssh, mock.patch.object(d, "playbook") as pb:
+            d.vm_sync(self.tree("vm/bootstrap.sh"))
+            self.assertIn("systemctl start gitea-config-sync.service", ssh.call_args_list[-1].args[0])
+            self.assertIn("google-startup-scripts.service", ssh.call_args_list[0].args[0])
+            pb.assert_not_called()
+            ssh.reset_mock()
+            d.vm_sync(self.tree("vm/ansible/site.yml"))
+            pb.assert_called_once()
+            ssh.assert_not_called()
+            with self.assertRaises(D.Failed):
+                d.vm_sync(self.tree("vm/x"))
+
+    def applied(self, ids):
+        d = self.deploy()
+        with mock.patch.object(d, "prepare", return_value="/infra"), mock.patch.object(d, "pulumi"), \
+                mock.patch.object(d, "instance_id", side_effect=ids), mock.patch.object(d, "vm_sync") as sync, \
+                mock.patch.object(d, "wait_https") as https, mock.patch.object(d, "ops"), \
+                mock.patch.object(d, "preview_json", return_value={"steps": []}), redirect_stdout(io.StringIO()):
+            d.apply("/src", "deploy")
+        return sync.call_args.args, https.called
+
+    def test_a_new_instance_id_is_a_replacement_and_waits_for_https(self):
+        self.assertEqual(self.applied(["1", "2"]), (("/src", True), True))
+        self.assertEqual(self.applied(["1", "1"]), (("/src", False), False))
+
+    def test_priming_retries_only_when_told_to_wait(self):
+        d = self.deploy()
+        no = subprocess.CompletedProcess([], 255, stdout="", stderr="4003: failed to connect")
+        yes = subprocess.CompletedProcess([], 0, stdout="sa_123\n", stderr="")
+        clock = iter(range(0, 10_000, 15))
+        with mock.patch.object(d, "prune_ssh_keys"), mock.patch.object(d, "ssh", side_effect=[no, no, yes]), \
+                mock.patch.object(D.time, "time", side_effect=lambda: next(clock)), \
+                mock.patch.object(D.time, "sleep"), redirect_stdout(io.StringIO()):
+            self.assertEqual(d.prime_ssh(wait=True), "sa_123")
+        with mock.patch.object(d, "prune_ssh_keys"), mock.patch.object(d, "ssh", return_value=no), \
+                self.assertRaises(D.Failed):
+            d.prime_ssh(wait=False)
+
+    def test_controller_installs_hash_locked_outside_the_tree_once(self):
+        src = self.tree("vm/ansible/requirements.txt", content="ansible-core==1 --hash=sha256:00\n")
+        d = self.deploy()
+        def pip(cmd, **kw):
+            os.makedirs(os.path.join(cmd[cmd.index("--target") + 1], "bin"), exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0)
+        with mock.patch.object(D, "run", side_effect=pip) as run:
+            env = d.ansible_env(src)
+            d.ansible_env(src)
+        self.assertEqual(run.call_count, 1)
+        cmd = run.call_args.args[0]
+        self.assertIn("--require-hashes", cmd)
+        self.assertTrue(cmd[cmd.index("--target") + 1].startswith(d.tmp))
+        self.assertEqual(env["ANSIBLE_CONFIG"], os.path.join(src, "vm", "ansible", "ansible.cfg"))
+
+    def test_vm_apply_to_prod_needs_approval(self):
+        src = self.tree("vm/ansible/site.yml")
+        d = self.deploy(mode="vm-apply", tree=src)
+        with mock.patch.object(d, "ansible_checks"), mock.patch.object(d, "playbook") as pb, \
+                self.assertRaises(D.Failed):
+            d.vm(check=False)
+        pb.assert_not_called()
+        d = self.deploy(mode="vm-apply", tree=src, vm="gitea-rehearsal")
+        with mock.patch.object(d, "ansible_checks"), mock.patch.object(d, "playbook") as pb:
+            self.assertEqual(d.vm(check=False), 0)
+        pb.assert_called_once_with(src, check=False)
+
+
 class PreRestore(unittest.TestCase):
     NOW = datetime.datetime(2026, 10, 31, 4, 0, tzinfo=datetime.timezone.utc)
 
