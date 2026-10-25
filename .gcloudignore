@@ -3,6 +3,7 @@
 # Without this file gcloud would fall back to .gitignore alone, and a local
 # checkout's untracked files (editor and agent settings) would be uploaded.
 .gcloudignore
-.git/
+# No trailing slash: in a git worktree .git is a file, not a directory.
+.git
 .claude/
 #!include:.gitignore
