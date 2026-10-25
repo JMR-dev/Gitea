@@ -74,6 +74,30 @@ def stale_ssh_keys(listing, now_usec):
             if int((k.get("value") or {}).get("expirationTimeUsec") or 0) < now_usec]
 VERSION_LABEL = "org.opencontainers.image.version"
 ALPINE_LABEL = "dev.jasonmross.alpine.minor"
+# How long a tree a data restore moved aside (/var/lib/gitea/.pre-restore-
+# <stamp>, vm-steps.sh restore-sync) stays on the data disk. Each is a full
+# copy of Gitea's data, and every D4 drill leaves one, so a backup removes the
+# older ones once its own snapshot exists. That snapshot, and each daily one
+# taken while the tree was there, keeps it for 14 days more.
+PRE_RESTORE_DAYS = 7
+
+
+def stale_pre_restore(names, now, days=PRE_RESTORE_DAYS):
+    """The names in vm-steps.sh pre-restore-list output whose stamp is older
+    than `days`. A name not exactly .pre-restore-<stamp> is never one."""
+    cutoff = now - datetime.timedelta(days=days)
+    out = []
+    for n in names:
+        m = re.fullmatch(r"\.pre-restore-(\d{8}T\d{6}Z)", n)
+        if not m:
+            continue
+        try:
+            at = datetime.datetime.strptime(m[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+        except ValueError:  # digits, but no date (month 13)
+            continue
+        if at < cutoff:
+            out.append(n)
+    return out
 
 
 class Abort(Exception):
@@ -373,6 +397,24 @@ class Ops:
         elif snapshot == "online":
             self.snapshot("backup")
         self.prune_snapshots()
+        if snapshot != "none":
+            self.prune_pre_restore()
+
+    def prune_pre_restore(self):
+        """Remove the trees earlier data restores moved aside, once they are a
+        week old (stale_pre_restore). Only from a backup that has just taken a
+        snapshot, which still holds them. Housekeeping: the backup is already
+        complete, so a failure here is a warning, not a failed backup."""
+        try:
+            names = self.vm("pre-restore-list", mutate=False).split()
+            old = stale_pre_restore(names, utcnow())
+            if old:
+                self.vm("pre-restore-remove", *old)
+                self.manifest["pre_restore_removed"] = old
+            log(f"pre-restore: {len(old)} of {len(names)} moved-aside data tree(s) older than "
+                f"{PRE_RESTORE_DAYS} days{': ' + ' '.join(old) if old else ''}")
+        except subprocess.CalledProcessError as e:
+            log(f"WARNING: could not prune .pre-restore-* trees ({e}); they stay on the data disk")
 
     # -- checks -------------------------------------------------------------
 

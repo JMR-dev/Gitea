@@ -196,7 +196,10 @@ never ran either.
 automatic runs, and the pending `cloudbuild/drill-*` statuses show what's due.
 D4 needs a window, because it really stops Gitea and restores its disk. **Run
 D4 before the next Gitea major or Alpine minor bump** regardless: that's the
-path whose only way back is a data restore.
+path whose only way back is a data restore. Each D4 leaves the replaced tree
+on the data disk as `/var/lib/gitea/.pre-restore-<stamp>`, a full copy of the
+data; the engine's backup removes it once it is a week old
+(`docs/runbook.md`, "Restore the data disk from a snapshot").
 
 ### Turning automation on, and off
 
