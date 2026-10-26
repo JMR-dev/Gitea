@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Writes tests/golden/*/ from each fixture.yml the way vm/bootstrap.sh
-rendered it -- envsubst with its exact variable lists and derived values,
-and its gitea-backup heredoc run through bash -- so tests/check proves the
-playbook writes the same bytes the bash did.
+"""The cutover's parity proof, kept for the record: writes tests/golden/*/
+from each fixture.yml the way vm/bootstrap.sh rendered it -- envsubst with
+its exact variable lists and derived values, and its gitea-backup heredoc
+run through bash -- so tests/check proved the playbook writes the same bytes
+the bash did. It knows only the templates and variables bootstrap.sh had:
+after a template or variable change, rewrite the goldens with `make goldens`
+(tests/check --update) instead.
 
 The bash is gone from the tree (this playbook replaced it), so it is read
 from git at BOOTSTRAP_REV (default c5df517, a main commit that has it).
-Needs PyYAML (the ansible-core install has it) and gettext's envsubst. Run
-it when a fixture is added; the goldens are committed.
+Needs PyYAML (the ansible-core install has it) and gettext's envsubst.
 """
 import os
 import subprocess
