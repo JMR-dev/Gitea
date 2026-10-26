@@ -528,8 +528,10 @@ unavailable -- check `gcloud secrets versions list gitea-internal-token`.
 The VM has no startup script: the playbook (`vm/ansible`) configures it, and
 what it sets up persists across reboots. A VM created outside a deploy (a
 manual `pulumi up`, say) is inert until the playbook runs: `make up` runs
-`pulumi up` and then `make vm-apply`. `make vm-apply` needs only gcloud with
-IAP and OS Login on the project -- no Pulumi, no passphrase.
+`pulumi up` and then `make vm-apply`. `make vm-apply` needs only gcloud (IAP
+and OS Login on the project) and python3 with pip, which installs the pinned
+ansible-core -- no Pulumi, no passphrase: the Makefile reads the project, region
+and zone from `infra/Pulumi.prod.yaml` itself.
 
 ---
 

@@ -1,10 +1,14 @@
 # Convenience wrappers. Everything here is also runnable by hand; nothing in the
 # deployment depends on make.
 
-PROJECT ?= $(shell cd infra && pulumi config get gcp:project 2>/dev/null)
-REGION  ?= $(shell cd infra && pulumi config get gcp:region 2>/dev/null || echo us-east1)
+# From the prod stack's config file, read directly: no Pulumi CLI, login or
+# passphrase, so the break-glass targets (vm-apply, ssh, ops-*) work from any
+# checkout with gcloud. `pulumi config get` came back empty without a login.
+STACK_CONFIG = infra/Pulumi.prod.yaml
+PROJECT ?= $(shell awk '/^  gcp:project:/ {print $$2}' $(STACK_CONFIG) 2>/dev/null)
+REGION  ?= $(or $(shell awk '/^  gcp:region:/ {print $$2}' $(STACK_CONFIG) 2>/dev/null),us-east1)
 # -b, matching the default in infra/pkg/config: us-east1 has no -a zone.
-ZONE    ?= $(shell cd infra && pulumi config get gitea:zone 2>/dev/null || echo $(REGION)-b)
+ZONE    ?= $(or $(shell awk '/^  gitea:zone:/ {print $$2}' $(STACK_CONFIG) 2>/dev/null),$(REGION)-b)
 VM      ?= gitea-vm
 # The GKE runner cluster (docs/runners.md). kubectl targets name the context
 # explicitly, so they never act on whatever cluster happens to be current.
