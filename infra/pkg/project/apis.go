@@ -29,6 +29,8 @@ var services = []string{
 	// Ungated, unlike the runner cluster itself: enabling an API costs nothing,
 	// and scripts/bootstrap.sh enables the same list.
 	"container.googleapis.com",
+	// package telemetry's topic and subscription. Ungated for the same reason.
+	"pubsub.googleapis.com",
 }
 
 // EnableAPIs returns resources every other package should depend on, so nothing

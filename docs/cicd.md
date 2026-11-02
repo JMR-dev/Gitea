@@ -40,7 +40,7 @@ whose permissions have been proven for real.
 | Account | Runs | Holds |
 |---|---|---|
 | `cb-launcher` | the deploy, gated and rebuild triggers' own build | submit builds as `cb-infra` and `cb-image`, the source bucket |
-| `cb-infra` | `cloudbuild/infra.yaml` for main | the app project roles Pulumi needs (`cicd/pkg/identity`) |
+| `cb-infra` | `cloudbuild/infra.yaml` for main | the app project roles Pulumi needs (`cicd/pkg/identity`), including `roles/logging.configWriter` and `roles/pubsub.admin` while `gitea-cicd:watchtowerReader` is set |
 | `cb-image` | `cloudbuild/image.yaml` for main | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`), read and add (never replace) drill passes |
 | `cb-launcher-preview` | the preview trigger's own build | submit builds as the two below **only**, the source bucket |
 | `cb-infra-preview` | a PR's `cloudbuild/infra.yaml` | `roles/dns.reader` + `roles/browser` on the app project, read the app stack's state, its passphrase, read drill passes |
@@ -268,6 +268,50 @@ secret `inputs.kubeconfig`.
    - a delivery with a bad signature gets 401 (`curl -X POST -H 'X-Gitea-Event: push' -d '{}' <webhookUrl>`);
    - `build-status` without a token gets 403.
 8. The drills, then automation (above).
+
+## Logs and metrics to Watchtower
+
+Watchtower, our observability stack, pulls the two functions' logs and this
+project's metrics. Cloud Run has no host for an agent, so a sink feeds a topic
+and Watchtower reads it. All of it follows one setting,
+`gitea-cicd:watchtowerReader` (`cicd/pkg/telemetry`). Unset, nothing is created.
+
+| Piece | Name |
+|---|---|
+| Sink, with a unique writer identity, granted publish on the topic alone | `watchtower-ci` |
+| Topic | `watchtower-logs` |
+| Pull subscription: ack 60 s, 7 days' buffer, never expires | `watchtower-logs-pull` |
+| Custom role | `watchtowerMetricsReader` |
+
+**Sent:** `gitea-webhook` and `build-status`, `run.googleapis.com/stderr` (their
+`slog`) and `run.googleapis.com/requests`.
+
+**Not sent:** `cloudaudit`, which carries the owner's email; the builds' logs,
+which hold whatever a deploy printed; `run.googleapis.com/varlog/system`. The
+filter is an allow-list, so a log nobody has thought about stays out.
+
+**Scrubbing is Watchtower's.** Request logs carry `httpRequest.remoteIp` and
+`userAgent`, and the webhook's "author … is not allowed" line carries a login.
+Watchtower's pull scrubs them before storing anything.
+
+**The reader,** `watchtower-gcp-reader@watchtower-observe`, gets
+`roles/pubsub.subscriber` on the subscription, and on the project a custom role
+with only `monitoring.timeSeries.list`, `monitoring.metricDescriptors.list` and
+`monitoring.monitoredResourceDescriptors.list`. Not `roles/monitoring.viewer`,
+which also reads the notification channel that holds the owner's email. The app
+project has the same set: see [runners.md](runners.md).
+
+**The order matters, because this stack is what lets `cb-infra` deploy the app
+project's half:**
+
+1. `make ci-up` from the commit that sets the value. This stack's half, and
+   `cb-infra`'s two roles.
+2. Merge. `infra/` changed, so the merge's infra deploy creates the app project's
+   half. Without step 1 that deploy fails on the sink and re-applies last-good.
+
+**To turn it off,** the other way round: unset `gitea:watchtowerReader` and let
+that deploy delete the app project's half while `cb-infra` still has the roles,
+then unset `gitea-cicd:watchtowerReader` and `make ci-up`.
 
 ## Break-glass
 

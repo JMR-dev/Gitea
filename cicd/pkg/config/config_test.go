@@ -38,6 +38,7 @@ func TestValidate(t *testing.T) {
 		"no email":                           {func(c *Config) { c.OperatorEmail = "" }, true, "is required"},
 		"email in clear":                     {func(c *Config) {}, false, "must be set with --secret"},
 		"not an address":                     {func(c *Config) { c.OperatorEmail = "Op <op@example.com>" }, true, "bare email"},
+		"reader not a service account":       {func(c *Config) { c.WatchtowerReader = "someone@example.net" }, true, "not a service account"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := valid()

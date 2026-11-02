@@ -58,6 +58,11 @@ type Config struct {
 	// so nothing reaches prod except by hand. It stays off until drills D1-D6
 	// have passed (docs/cicd.md).
 	AutoDeploy bool
+
+	// WatchtowerReader is the service account our observability stack reads
+	// this project's logs and metrics as. Unset, package telemetry creates
+	// nothing and cb-infra gets no telemetry roles (docs/cicd.md).
+	WatchtowerReader string
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -77,6 +82,8 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		Authors:         strings.Fields(strings.ReplaceAll(c.Get("allowedAuthors"), ",", " ")),
 		OperatorEmail:   c.Get("operatorEmail"),
 		AutoDeploy:      c.GetBool("autoDeploy"),
+
+		WatchtowerReader: c.Get("watchtowerReader"),
 	}
 	applyDefaults(cfg)
 	return cfg, validate(cfg, ctx.IsConfigSecret("gitea-cicd:operatorEmail"))
@@ -149,6 +156,9 @@ func validate(c *Config, emailIsSecret bool) error {
 	if a, err := mail.ParseAddress(c.OperatorEmail); err != nil || a.Address != c.OperatorEmail {
 		// Never echoed: it is a secret.
 		return fmt.Errorf("gitea-cicd:operatorEmail is not a bare email address")
+	}
+	if r := c.WatchtowerReader; r != "" && (!strings.HasSuffix(r, ".iam.gserviceaccount.com") || strings.Count(r, "@") != 1) {
+		return fmt.Errorf("gitea-cicd:watchtowerReader %q is not a service account email", r)
 	}
 	return nil
 }

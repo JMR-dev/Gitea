@@ -1,8 +1,11 @@
 package identity
 
 import (
+	"slices"
 	"strings"
 	"testing"
+
+	"gitea-cicd/pkg/config"
 )
 
 // cb-infra-preview runs branches nobody has reviewed. Anything here that can
@@ -24,10 +27,21 @@ func TestInfraPreviewRolesOnlyRead(t *testing.T) {
 		case "viewer", "editor", "owner":
 			t.Errorf("%s is a primitive role; too broad for a preview (reads every bucket's objects)", r)
 		}
-		for _, deploy := range infraRoles {
+		for _, deploy := range slices.Concat(infraRoles, telemetryInfraRoles) {
 			if r == deploy {
 				t.Errorf("%s is one of cb-infra's deploy roles", r)
 			}
 		}
+	}
+}
+
+// With gitea-cicd:watchtowerReader unset, cb-infra holds what it always did.
+func TestTelemetryRolesFollowTheGate(t *testing.T) {
+	if got := appInfraRoles(&config.Config{}); !slices.Equal(got, infraRoles) {
+		t.Errorf("unset: got %v", got)
+	}
+	got := appInfraRoles(&config.Config{WatchtowerReader: "r@p.iam.gserviceaccount.com"})
+	if !slices.Equal(got, slices.Concat(infraRoles, []string{"roles/logging.configWriter", "roles/pubsub.admin"})) {
+		t.Errorf("set: got %v", got)
 	}
 }

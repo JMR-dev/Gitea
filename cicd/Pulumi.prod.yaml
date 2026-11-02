@@ -3,4 +3,8 @@ config:
   gitea-cicd:operatorEmail:
     secure: v1:besKx2rc6+y/sl8H:Gw246eSEXqZhskpw4oVUdutwBq4NW6eO5pOrBBNtruYzqjAS7Kdv
   gitea-cicd:autoDeploy: "true"
+  # Who our observability stack reads logs and metrics as: turns on
+  # cicd/pkg/telemetry, and cb-infra's roles for infra/pkg/telemetry
+  # (docs/cicd.md). An account's name, not a secret.
+  gitea-cicd:watchtowerReader: watchtower-gcp-reader@watchtower-observe.iam.gserviceaccount.com
 encryptionsalt: v1:Zo+Jp87wgqg=:v1:EQH4T8jJqY4LDtc5:FJNdXjUE8hfQogim2WHhjRXtYHrnNg==
