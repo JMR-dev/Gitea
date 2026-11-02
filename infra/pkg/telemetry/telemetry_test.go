@@ -12,6 +12,7 @@ import (
 
 	"gitea-infra/pkg/config"
 	"gitea-infra/pkg/gke"
+	"gitea-infra/pkg/network"
 	"gitea-infra/pkg/ops"
 	"gitea-infra/pkg/runner"
 )
@@ -19,13 +20,29 @@ import (
 const testReader = "reader@example-project.iam.gserviceaccount.com"
 
 // container is a log entry in the fields the filter reads. Its namespace is ""
-// for the node logs GKE files under k8s_container with none.
+// for the node logs GKE files under k8s_container with none. Its container is
+// the runner's, so a case that leaves it out says something about the rest.
 func container(cluster, namespace, logID string) map[string]string {
 	return map[string]string{
 		"resource.type":                  "k8s_container",
 		"resource.labels.cluster_name":   cluster,
 		"resource.labels.namespace_name": namespace,
+		"resource.labels.container_name": runner.ContainerName,
 		"log_id":                         logID,
+	}
+}
+
+func namedContainer(name, logID string) map[string]string {
+	e := container(gke.Name, runner.Namespace, logID)
+	e["resource.labels.container_name"] = name
+	return e
+}
+
+func nat(gateway, logID string) map[string]string {
+	return map[string]string{
+		"resource.type":                "nat_gateway",
+		"resource.labels.gateway_name": gateway,
+		"log_id":                       logID,
 	}
 }
 
@@ -65,7 +82,7 @@ func TestLogFilterIncludes(t *testing.T) {
 		"job pod events":       pod(gke.Name, runner.JobsNamespace, "events"),
 		"arm64 job pod events": pod(gke.Name, runner.ArmJobsNamespace, "events"),
 		"the autoscaler":       clusterLog(autoscaler),
-		"NAT":                  other("nat_gateway", natFlows),
+		"NAT":                  nat(network.RunnerNATName, natFlows),
 	} {
 		if !matches(t, LogFilter(), e) {
 			t.Errorf("%s: left out, should be sent", name)
@@ -97,14 +114,21 @@ func TestLogFilterExcludes(t *testing.T) {
 		"data access on the cluster": clusterLog(dataAccess),
 		"audit on a runner":          container(gke.Name, runner.Namespace, audit),
 		"audit on a job pod":         pod(gke.Name, runner.JobsNamespace, audit),
-		"audit on the NAT":           other("nat_gateway", audit),
+		"audit on the NAT":           nat(network.RunnerNATName, audit),
 		"audit on the project":       other("project", audit),
 		"audit on GKE":               other("gke_cluster", audit),
 
 		"serial console":        other("gce_instance", serial),
 		"cluster events":        clusterLog("events"),
 		"the VM's stdout":       other("gce_instance", "stdout"),
-		"NAT type, another log": other("nat_gateway", "stdout"),
+		"NAT type, another log": nat(network.RunnerNATName, "stdout"),
+
+		// The one gateway and the one container, however alike the rest.
+		"another NAT gateway":         nat("not-ours", natFlows),
+		"a NAT with no gateway label": other("nat_gateway", natFlows),
+		"a sidecar beside a runner":   namedContainer("sidecar", "stdout"),
+		"a runner pod's dockerd":      namedContainer("dockerd", "stderr"),
+		"no container label":          namedContainer("", "stdout"),
 
 		// Node logs, under k8s_container with no namespace.
 		"guest agent":  container(gke.Name, "", "GCEGuestAgent"),
@@ -135,14 +159,16 @@ func TestLogFilterGolden(t *testing.T) {
 
 // recorder is a Pulumi mock that keeps what the program registers.
 type recorder struct {
-	mu  sync.Mutex
-	got map[string]resource.PropertyMap
+	mu   sync.Mutex
+	got  map[string]resource.PropertyMap
+	deps map[string][]string
 }
 
 func (r *recorder) NewResource(a pulumi.MockResourceArgs) (string, resource.PropertyMap, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.got[a.TypeToken] = a.Inputs
+	r.deps[a.TypeToken] = a.RegisterRPC.GetDependencies()
 	state := a.Inputs.Copy()
 	id := a.Name + "-id"
 	switch a.TypeToken {
@@ -160,16 +186,34 @@ func (r *recorder) Call(a pulumi.MockCallArgs) (resource.PropertyMap, error) {
 	return a.Args, nil
 }
 
-func run(t *testing.T, cfg *config.Config) map[string]resource.PropertyMap {
+func record(t *testing.T, cfg *config.Config) *recorder {
 	t.Helper()
-	r := &recorder{got: map[string]resource.PropertyMap{}}
+	r := &recorder{got: map[string]resource.PropertyMap{}, deps: map[string][]string{}}
 	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
 		return New(ctx, cfg, nil)
 	}, pulumi.WithMocks("p", "s", r))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return r.got
+	return r
+}
+
+func run(t *testing.T, cfg *config.Config) map[string]resource.PropertyMap {
+	t.Helper()
+	return record(t, cfg).got
+}
+
+// A deployer without the telemetry roles fails on the topic. The custom role must
+// wait for it, or the rollback soft-deletes a role whose ID is then unusable from
+// 7 to 37 days later.
+func TestCustomRoleWaitsForTopicAndSink(t *testing.T) {
+	deps := strings.Join(record(t, &config.Config{Project: "p", WatchtowerReader: testReader}).
+		deps["gcp:projects/iAMCustomRole:IAMCustomRole"], " ")
+	for _, want := range []string{"gcp:pubsub/topic:Topic", "gcp:logging/projectSink:ProjectSink"} {
+		if !strings.Contains(deps, want) {
+			t.Errorf("custom role doesn't wait for %s; it waits for: %q", want, deps)
+		}
+	}
 }
 
 func TestUnsetCreatesNothing(t *testing.T) {

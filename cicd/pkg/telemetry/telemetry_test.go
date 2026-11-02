@@ -89,14 +89,16 @@ func TestLogFilterGolden(t *testing.T) {
 
 // recorder is a Pulumi mock that keeps what the program registers.
 type recorder struct {
-	mu  sync.Mutex
-	got map[string]resource.PropertyMap
+	mu   sync.Mutex
+	got  map[string]resource.PropertyMap
+	deps map[string][]string
 }
 
 func (r *recorder) NewResource(a pulumi.MockResourceArgs) (string, resource.PropertyMap, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.got[a.TypeToken] = a.Inputs
+	r.deps[a.TypeToken] = a.RegisterRPC.GetDependencies()
 	state := a.Inputs.Copy()
 	id := a.Name + "-id"
 	switch a.TypeToken {
@@ -114,16 +116,33 @@ func (r *recorder) Call(a pulumi.MockCallArgs) (resource.PropertyMap, error) {
 	return a.Args, nil
 }
 
-func run(t *testing.T, cfg *config.Config) map[string]resource.PropertyMap {
+func record(t *testing.T, cfg *config.Config) *recorder {
 	t.Helper()
-	r := &recorder{got: map[string]resource.PropertyMap{}}
+	r := &recorder{got: map[string]resource.PropertyMap{}, deps: map[string][]string{}}
 	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
 		return New(ctx, cfg, nil)
 	}, pulumi.WithMocks("p", "s", r))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return r.got
+	return r
+}
+
+func run(t *testing.T, cfg *config.Config) map[string]resource.PropertyMap {
+	t.Helper()
+	return record(t, cfg).got
+}
+
+// If the topic or the sink fails, the custom role must not have been created: the
+// rollback would soft-delete it, and its ID is unusable from 7 to 37 days later.
+func TestCustomRoleWaitsForTopicAndSink(t *testing.T) {
+	deps := strings.Join(record(t, &config.Config{Project: "p", WatchtowerReader: testReader}).
+		deps["gcp:projects/iAMCustomRole:IAMCustomRole"], " ")
+	for _, want := range []string{"gcp:pubsub/topic:Topic", "gcp:logging/projectSink:ProjectSink"} {
+		if !strings.Contains(deps, want) {
+			t.Errorf("custom role doesn't wait for %s; it waits for: %q", want, deps)
+		}
+	}
 }
 
 func TestUnsetCreatesNothing(t *testing.T) {

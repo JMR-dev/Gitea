@@ -26,6 +26,10 @@ const (
 	RunnerPodsCIDR      = "10.24.0.0/20"
 	RunnerServicesRange = "gitea-runners-services"
 	RunnerServicesCIDR  = "10.28.0.0/22"
+
+	// RunnerNATName is the runner subnet's Cloud NAT gateway. package telemetry's
+	// log sink allows this gateway alone.
+	RunnerNATName = "gitea-runners-nat"
 )
 
 type Network struct {
@@ -186,7 +190,7 @@ func runnerNetwork(ctx *pulumi.Context, cfg *config.Config, net *compute.Network
 	}
 
 	nat, err := compute.NewRouterNat(ctx, "gitea-runners-nat", &compute.RouterNatArgs{
-		Name:                pulumi.String("gitea-runners-nat"),
+		Name:                pulumi.String(RunnerNATName),
 		Router:              router.Name,
 		Region:              pulumi.String(cfg.Region),
 		NatIpAllocateOption: pulumi.String("MANUAL_ONLY"),

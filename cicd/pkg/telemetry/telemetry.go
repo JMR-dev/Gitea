@@ -70,7 +70,10 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) error 
 	sub, err := pubsub.NewSubscription(ctx, SubscriptionName, &pubsub.SubscriptionArgs{
 		Project: project, Name: pulumi.String(SubscriptionName), Topic: topic.ID(),
 		AckDeadlineSeconds: pulumi.Int(60),
-		// A week of buffer, so a Watchtower outage loses nothing.
+		// Buffers for 7 days while Watchtower isn't pulling. Not lossless once it
+		// is: Alloy acknowledges a message when it hands it to its queue, so a
+		// restart during an outage loses what's queued, about 10 MiB per node, and
+		// Loki can refuse entries more than about an hour behind their stream.
 		MessageRetentionDuration: pulumi.String("604800s"),
 		// Never expire: a quiet month must not delete the subscription.
 		ExpirationPolicy: &pubsub.SubscriptionExpirationPolicyArgs{Ttl: pulumi.String("")},
@@ -103,13 +106,16 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) error 
 	}, opts); err != nil {
 		return err
 	}
+	// After the topic and the sink, as in infra/pkg/telemetry: if either fails, the
+	// role isn't created only to be deleted. That only soft-deletes a custom role,
+	// and from 7 to 37 days after, its ID can't be used again.
 	role, err := projects.NewIAMCustomRole(ctx, "watchtower-metrics-reader", &projects.IAMCustomRoleArgs{
 		Project:     project,
 		RoleId:      pulumi.String(metricsRoleID),
 		Title:       pulumi.String("Watchtower metrics reader"),
 		Description: pulumi.String("List Cloud Monitoring series and descriptors; no channels, no alert policies"),
 		Permissions: pulumi.ToStringArray(metricsPermissions),
-	}, opts)
+	}, opts, pulumi.DependsOn([]pulumi.Resource{topic, sink}))
 	if err != nil {
 		return err
 	}

@@ -28,7 +28,7 @@ fmt: ## Format Go sources
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
 .PHONY: check
 check: ci-check ## Build and vet both Pulumi programs and the relay, test them, and syntax-check the scripts
-	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/telemetry
+	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/runner ./pkg/telemetry
 	bash -n vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
 	@command -v shellcheck >/dev/null && shellcheck -S warning vm/bootstrap.sh scripts/bootstrap.sh scripts/ops/vm-steps.sh || echo "shellcheck not installed -- skipped"

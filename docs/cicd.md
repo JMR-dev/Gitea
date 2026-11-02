@@ -291,8 +291,9 @@ which hold whatever a deploy printed; `run.googleapis.com/varlog/system`. The
 filter is an allow-list, so a log nobody has thought about stays out.
 
 **Scrubbing is Watchtower's.** Request logs carry `httpRequest.remoteIp` and
-`userAgent`, and the webhook's "author … is not allowed" line carries a login.
-Watchtower's pull scrubs them before storing anything.
+`userAgent`. The webhook's "author … is not allowed" and "pusher … is not allowed"
+lines carry a login, and "head is in owner/repo" and "delivery for …" name a fork's
+owner or another repo. Watchtower's pull scrubs all of them before storing anything.
 
 **The reader,** `watchtower-gcp-reader@watchtower-observe`, gets
 `roles/pubsub.subscriber` on the subscription, and on the project a custom role
@@ -307,11 +308,17 @@ project's half:**
 1. `make ci-up` from the commit that sets the value. This stack's half, and
    `cb-infra`'s two roles.
 2. Merge. `infra/` changed, so the merge's infra deploy creates the app project's
-   half. Without step 1 that deploy fails on the sink and re-applies last-good.
+   half. Without step 1 that deploy fails on the topic, before it reaches the sink
+   or the custom role, and re-applies last-good.
 
 **To turn it off,** the other way round: unset `gitea:watchtowerReader` and let
 that deploy delete the app project's half while `cb-infra` still has the roles,
 then unset `gitea-cicd:watchtowerReader` and `make ci-up`.
+
+Deleting the custom role only soft-deletes it. For 7 days it can be undeleted.
+From 7 to 37 days after deletion `watchtowerMetricsReader` can't be used again in
+that project, so turning this back on in that window needs a new role ID
+(`metricsRoleID` in `pkg/telemetry`).
 
 ## Break-glass
 

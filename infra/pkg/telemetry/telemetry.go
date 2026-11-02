@@ -19,6 +19,7 @@ import (
 
 	"gitea-infra/pkg/config"
 	"gitea-infra/pkg/gke"
+	"gitea-infra/pkg/network"
 	"gitea-infra/pkg/runner"
 )
 
@@ -58,13 +59,15 @@ func LogFilter() string {
 	return strings.Join([]string{
 		`(resource.type="k8s_container" AND ` + cluster +
 			` AND resource.labels.namespace_name="` + runner.Namespace + `"` +
+			` AND resource.labels.container_name="` + runner.ContainerName + `"` +
 			` AND (log_id("stdout") OR log_id("stderr")))`,
 		`(resource.type="k8s_pod" AND ` + cluster +
 			` AND resource.labels.namespace_name=("` + runner.JobsNamespace + `" OR "` + runner.ArmJobsNamespace + `")` +
 			` AND log_id("events"))`,
 		`(resource.type="k8s_cluster" AND ` + cluster +
 			` AND log_id("container.googleapis.com/cluster-autoscaler-visibility"))`,
-		`(resource.type="nat_gateway" AND log_id("compute.googleapis.com/nat_flows"))`,
+		`(resource.type="nat_gateway" AND resource.labels.gateway_name="` + network.RunnerNATName + `"` +
+			` AND log_id("compute.googleapis.com/nat_flows"))`,
 	}, " OR ")
 }
 
@@ -89,7 +92,10 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) error 
 	sub, err := pubsub.NewSubscription(ctx, SubscriptionName, &pubsub.SubscriptionArgs{
 		Project: project, Name: pulumi.String(SubscriptionName), Topic: topic.ID(),
 		AckDeadlineSeconds: pulumi.Int(60),
-		// A week of buffer, so a Watchtower outage loses nothing.
+		// Buffers for 7 days while Watchtower isn't pulling. Not lossless once it
+		// is: Alloy acknowledges a message when it hands it to its queue, so a
+		// restart during an outage loses what's queued, about 10 MiB per node, and
+		// Loki can refuse entries more than about an hour behind their stream.
 		MessageRetentionDuration: pulumi.String("604800s"),
 		// Never expire: a quiet month must not delete the subscription.
 		ExpirationPolicy: &pubsub.SubscriptionExpirationPolicyArgs{Ttl: pulumi.String("")},
@@ -122,13 +128,17 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) error 
 	}, opts); err != nil {
 		return err
 	}
+	// After the topic and the sink. A deployer without the telemetry roles fails
+	// on the topic, but iam.roleAdmin would still let it create this, and the
+	// rollback would then delete it: that only soft-deletes a custom role, and
+	// from 7 to 37 days after, its ID can't be used again.
 	role, err := projects.NewIAMCustomRole(ctx, "watchtower-metrics-reader", &projects.IAMCustomRoleArgs{
 		Project:     project,
 		RoleId:      pulumi.String(metricsRoleID),
 		Title:       pulumi.String("Watchtower metrics reader"),
 		Description: pulumi.String("List Cloud Monitoring series and descriptors; no channels, no alert policies"),
 		Permissions: pulumi.ToStringArray(metricsPermissions),
-	}, opts)
+	}, opts, pulumi.DependsOn([]pulumi.Resource{topic, sink}))
 	if err != nil {
 		return err
 	}
