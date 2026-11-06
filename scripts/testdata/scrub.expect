@@ -1,0 +1,42 @@
+keep:122 sudo[4567]: root : TTY=pts/0 ; PWD=/root ; USER=root ; COMMAND=[REDACTED-COMMAND]
+keep:300 sudo[4567]: root : TTY=pts/0 ; PWD=/srv/app ; USER=svc ; ENV=[REDACTED-COMMAND]
+keep:301 sudo[4567]: root : TTY=unknown ; PWD=/ ; USER=svc ; GROUP=adm ; TSID=00000A ; ENV=[REDACTED-COMMAND]
+keep:302 sudo[4567]: root : (command continued)[REDACTED-COMMAND]
+keep:303 sudo[4567]: root : TTY=pts/1 ; PWD=/srv/app ; USER=root ; COMMAND=[REDACTED-COMMAND]
+keep:310 sudo: pam_unix(sudo:session): session opened for user root(uid=0) by fixture(uid=[REDACTED-UID])
+keep:311 sudo: pam_unix(sudo:auth): authentication failure; logname=fixture uid=[REDACTED-UID] euid=[REDACTED-UID] tty=/dev/pts/0 ruser=fixture rhost= user=fixture
+keep:312 systemd[1]: Started User Manager for UID [REDACTED-UID].
+keep:313 systemd[1]: Created slice user-[REDACTED-UID].slice - User Slice.
+keep:314 podman[3120]: stat /run/user/[REDACTED-UID]/containers: no such file
+keep:315 app[1]: uid=[REDACTED-UID] is the shortest that goes
+keep:316 systemd[1]: Started user@[REDACTED-UID].service - User Manager for UID [REDACTED-UID].
+keep:317 systemd[1]: Starting user-runtime-dir@[REDACTED-UID].service - User Runtime Directory /run/user/[REDACTED-UID]...
+keep:318 systemd[1]: user@[REDACTED-UID].service: Consumed 1.234s CPU time.
+keep:320 pushed with [REDACTED-TOKEN] now
+keep:321 called with [REDACTED-TOKEN] now # nosemgrep: generic.secrets.security.detected-google-oauth-access-token.detected-google-oauth-access-token
+keep:322 signed by [REDACTED-TOKEN] now
+keep:324 authorized ssh-ed25519 [REDACTED-SSH-KEY] now
+keep:325 authorized ssh-rsa [REDACTED-SSH-KEY] now
+keep:326 authorized ecdsa-sha2-nistp256 [REDACTED-SSH-KEY] now
+keep:327 two parts [REDACTED-JWT] now # nosemgrep: generic.secrets.security.detected-jwt-token.detected-jwt-token
+keep:328 five parts [REDACTED-JWT] now # nosemgrep: generic.secrets.security.detected-jwt-token.detected-jwt-token
+keep:329 five parts [REDACTED-JWT] now
+keep:330 sshd[99]: key SHA1:[REDACTED-FINGERPRINT]
+keep:331 sshd[99]: key SHA-256:[REDACTED-FINGERPRINT]
+keep:332 tls[99]: cert SHA1:[REDACTED-FINGERPRINT]
+{"fixture":"keep:c11","level":"info","ts":1793019000.1,"logger":"http.log.access.log0","msg":"handled request","request":{"remote_ip":"[REDACTED-IP]","remote_port":"51234","client_ip":"[REDACTED-IP]","proto":"HTTP/2.0","method":"GET","host":"gitea.example.test","uri":"/api/v1/repos/example-org/infra/raw/README.md?token=[REDACTED-SECRET]","headers":{"User-Agent":["git/2.47.3"],"Authorization":[REDACTED-CREDENTIAL],"Cookie":[REDACTED-COOKIE]}},"bytes_read":0,"duration":0.02,"size":1024,"status":200,"resp_headers":{"Server":["Caddy"],"Set-Cookie":[REDACTED-COOKIE]}}
+{"fixture":"keep:c15","level":"info","ts":1793019002.3,"logger":"http.log.access.log0","msg":"handled request","request":{"remote_ip":"[REDACTED-IP]","remote_port":"40400","client_ip":"[REDACTED-IP]","proto":"HTTP/1.1","method":"GET","host":"gitea.example.test","uri":"/metrics","headers":{"User-Agent":["curl/8.11.1"]}},"bytes_read":0,"duration":0.0001,"size":0,"status":404,"resp_headers":{"Server":["Caddy"]}}
+keep:g01 2026/11/06 14:02:11 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for [REDACTED-USER] from [REDACTED-IP]:0: user does not exist [uid: 0, name: [REDACTED-USER]]
+keep:g02 2026/11/06 14:02:12 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for [REDACTED-USER] from [REDACTED-IP]:0: Email address does not exist [email: [REDACTED-EMAIL]]
+keep:g05 2026/11/06 14:02:15 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for [REDACTED-USER] from [REDACTED-IP]:0: user does not exist [uid: 0, name: [REDACTED-USER]]
+keep:g06 2026/11/06 14:02:16 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for [REDACTED-USER] from [REDACTED-IP]:0: user does not exist [uid: 0, name: [REDACTED-USER]]
+keep:g08 2026/11/06 14:02:18 services/auth/basic.go:150:Verify() [E] UserSignIn: user's password is invalid [uid: 3, name: [REDACTED-USER]]
+keep:g09 2026/11/06 14:02:19 routers/web/auth/oauth.go:212:SignInOAuthCallback() [W] Attempted OAuth2 login [REDACTED-USER] from [REDACTED-IP]:0
+keep:g10 2026/11/06 14:02:20 routers/web/auth/2fa.go:88:TwoFactorPost() [W] Failed two-factor authentication attempt for [REDACTED-USER] from [REDACTED-IP]:0
+keep:g11 2026/11/06 14:03:01 HTTPRequest [I] router: completed GET /api/v1/repos/search?q=infra&token=[REDACTED-SECRET] for [REDACTED-IP]:0, 200 OK in 4.1ms @ repo/repo.go:120(repo.Search)
+keep:g13 2026/11/06 14:03:03 HTTPRequest [I] router: completed GET /example-org/infra.rss?TOKEN=[REDACTED-SECRET]&page=1 for [REDACTED-IP]:0, 200 OK in 9.0ms @ feed/feed.go:41(feed.ShowRepoFeed)
+keep:g14 2026/11/06 14:03:04 HTTPRequest [I] router: completed GET /user/login?redirect_to=%2Fapi%2Fv1%2Fuser%3Ftoken%3D[REDACTED-SECRET] for [REDACTED-IP]:0, 200 OK in 3.2ms @ auth/auth.go:173(auth.SignIn)
+keep:g16 2026/11/06 14:04:01 modules/ssh/ssh.go:241:publicKeyHandler() [W] Unknown public key: SHA256:[REDACTED-FINGERPRINT] from [REDACTED-IP]:48236
+keep:g18 sshd-session[4321]: Accepted publickey for [REDACTED-USER] from [REDACTED-IP] port 51234 ssh2: ED25519 SHA256:[REDACTED-FINGERPRINT]
+keep:g19 sudo[4400]: [REDACTED-USER] : TTY=pts/0 ; PWD=/home/[REDACTED-USER] ; USER=root ; COMMAND=[REDACTED-COMMAND]
+keep:g20 wg-quick[812]: [#] ip -4 address add [REDACTED-IP]/32 dev wg-watchtower

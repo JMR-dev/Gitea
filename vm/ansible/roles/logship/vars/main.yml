@@ -1,0 +1,13 @@
+# The names vm/config/config.alloy.tmpl and vm/quadlets/alloy.* use (their
+# ${VAR}s), besides DOMAIN from roles/app/vars/main.yml. tests/render.yml loads
+# this same file.
+
+# Grafana Alloy, the version watchtower's contract pins (v1.21.3), as tag plus
+# the digest of its multi-arch index, as the blog and SilverBullet pin it.
+# Bumped by hand, never auto-updated; vm/ansible/tests/check pins the same
+# release's binary for `alloy validate` and the scrub test (TOOLS there).
+ALLOY_IMAGE: docker.io/grafana/alloy:v1.21.3@sha256:8ab871206bd2d8f89277f53abffee5f452a293980788d52f85fa183a87a505a4
+
+# The systemd-journal group, which Alloy reads the journal through: looked up
+# on the VM by tasks/main.yml.
+JOURNAL_GID: "{{ logship_journal_gid }}"

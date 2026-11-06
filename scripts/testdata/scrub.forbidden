@@ -1,0 +1,57 @@
+LEAK[0-9]
+192\.0\.2\.
+198\.51\.100\.
+10\.0\.0\.5
+2001:db8
+fe80::1
+ ::1\b
+Zm9vOmJhcg
+@example\.com
+@mail\.example\.org
+%40leak
+sam_sample
+sa_1234567890123
+4111111111111111
+5500-0000
+378282246310005
+3f2504e0
+7c9e6679
+eyJhbGci
+"transaction"
+078051120
+00:1a:2b
+Matched Data
+203\.0\.113\.
+10\.89\.10\.
+pat_example
+SHA256:[^[]
+MD5:[^[]
+fake\]LEAK
+8675309
+8675301
+31415926
+271828
+42424242
+"[A-Za-z_-]*([Cc]ookie|[Aa]uthorization)": *\[?"
+\\"[A-Za-z_-]*([Cc]ookie|[Pp]assword|[Tt]oken|[Ss]ession|[Kk]ey)\\": *(\[\\"|\\")
+2001:0db8
+2a01
+192-0-2-
+198-51-100-
+2001%3A
+josé
+o'\[
+a!\[
+bob smith
+%2540
+u0040
+service\.gov
+07805112[0-9]
+uid=1000000000
+314159265[0-9]
+@1000000000
+fakeUSER
+correct horse
+leak\.example\.net
+35\.235\.
+10\.8\.0\.

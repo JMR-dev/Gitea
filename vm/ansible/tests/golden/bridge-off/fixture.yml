@@ -12,6 +12,9 @@ runner_egress_ip: 34.26.149.196
 backup_bucket: example-project-gitea-backups
 caddy_mode: bridge
 runner_token_present: true
+# A dummy watchtower peer, as in bridge-on, with another journal gid.
+watchtower_peer_secret: projects/example-observe/secrets/wireguard-example-peer
+logship_journal_gid: "991"
 secrets:
   GITEA_SECRET_KEY: k3
   GITEA_INTERNAL_TOKEN: t3

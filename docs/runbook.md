@@ -229,6 +229,10 @@ Until it passes, run `make build` manually to pick up base-image security fixes.
 |---|---|---|
 | gitea | 105 MB | 375 MB |
 | caddy + Coraza + full CRS | 50 MB | 51 MB |
+| alloy (telemetry, capped) | not yet measured | 256 MiB at most |
+
+Alloy, the telemetry shipper, is capped at 256 MiB (`--memory`, with
+`GOMEMLIMIT=200MiB` under it), so an OOM kills it and not Gitea.
 
 The WAF is not the memory story — CRS costs about 50 MB and does not grow under
 load. Git subprocesses are: `index-pack` and `gc` scale with what is being
@@ -555,6 +559,58 @@ make vm-apply      # apply it
 If app.ini was not rendered, the run fails saying which Gitea secret was
 unavailable -- check `gcloud secrets versions list gitea-internal-token`.
 
+### Telemetry to watchtower
+
+The VM ships its journal and its metrics to watchtower (our Loki and Mimir,
+watchtower-observability-stack, whose `docs/client-telemetry.md` is the
+contract) as agent peer `gitea-vm`, 10.8.0.130: a WireGuard tunnel,
+`wg-watchtower`, to 10.8.0.0/24 only, dialled out, and Grafana Alloy pushing
+through it. Labels `service="gitea"`, `host="gitea-vm"`, `env="production"`.
+
+- **Logs:** every unit's journal, Gitea and Caddy included, scrubbed by
+  `vm/config/config.alloy.tmpl`'s `loki.process "scrub"` (watchtower's shared
+  block plus Gitea's own: the name at a failed sign-in, `?token=`). Nothing on
+  watchtower scrubs. Coraza's audit records stay on the VM, in
+  `/var/log/caddy/coraza-audit.log` (`docs/waf.md`).
+- **Metrics,** every 60 s: the host (`job="integrations/unix"`), Alloy
+  (`alloy`), Caddy's `:2020` site (`caddy`), Gitea's `/metrics` on
+  127.0.0.1:3000 (`gitea`; Caddy answers `/metrics` from outside with a 404),
+  and a probe of `https://<domain>/api/healthz` from the VM (`blackbox`).
+- **The switch** is `gitea:watchtowerPeerSecret`, the resource name of the
+  secret holding the peer config in watchtower's project
+  (`projects/watchtower-observe/secrets/wireguard-gitea-vm-peer`). It becomes
+  instance metadata `watchtower-peer-secret`, and the playbook's role `tunnel`
+  reads the secret on the VM as `gitea-vm@`, the one identity granted it, so
+  the private key never reaches a deploy's log. Watchtower's deploy creates
+  the peer and its secret; the rehearsal VM never gets the metadata.
+- **When it stops:** only no metadata, or a missing or empty secret, takes the
+  tunnel and Alloy down (a warning; their config goes, the `alloy-data`
+  volume and its journal cursor stay). Any other failure to read it (network,
+  Secret Manager, token, permission denied, a config that fails the checks)
+  warns and leaves them running as they are. A deleted secret reads as
+  permission denied to `gitea-vm@`, so **to revoke the peer, delete its client
+  in wg-easy**.
+- **Nothing comes in over the tunnel:** `vm/nftables/gitea.nft` drops anything
+  on `wg-watchtower` that isn't a reply, at prerouting (before the containers'
+  DNAT) and in input.
+- **Never a failed deploy:** a start that fails and the deploy check (Alloy's
+  `/-/ready`, then a handshake within 2 minutes) only warn. A change to Alloy
+  or the tunnel restarts only them, never Gitea or Caddy.
+
+On the VM:
+
+```bash
+make ssh
+systemctl status alloy wg-quick@wg-watchtower
+# the handshake time only: the first field is the peer's public key
+sudo wg show wg-watchtower latest-handshakes | awk '{ print $2 }'
+curl -fsS http://127.0.0.1:12345/-/ready
+sudo journalctl -u alloy --since -1h
+```
+
+In Grafana (watchtower), the contract's "Verification" queries with
+`host="gitea-vm"`, the PII ones over the first hour of real traffic.
+
 ### Configuring a VM by hand (break-glass)
 
 The VM has no startup script: the playbook (`vm/ansible`) configures it, and
@@ -577,4 +633,5 @@ and zone from `infra/Pulumi.prod.yaml` itself.
   migration. Worth doing well before SQLite write contention shows up.
 - **Wildcard certificate** for `*.gitea.jasonmross.dev` — trivial now that
   DNS-01 works.
-- **Ops Agent** for metrics dashboards and log-based alerts.
+- **Ops Agent** for metrics dashboards and log-based alerts. Superseded by the
+  telemetry to watchtower (above), whose alerts come with watchtower's own.

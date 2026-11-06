@@ -25,12 +25,29 @@ table inet gitea_filter
 delete table inet gitea_filter
 
 table inet gitea_filter {
+	# The watchtower tunnel (wg-watchtower, vm/ansible role tunnel) is outbound
+	# only: Alloy pushes through it, and nothing may come in over it but the
+	# replies. Without these, the rules below that name no interface would take
+	# ICMP, and 80, 443 and 2222 on the host network, from the tunnel too, and a
+	# connection DNAT'd to a container (Gitea's 2222, Caddy on the bridge)
+	# never reaches input at all. So new connections from it are dropped here,
+	# at prerouting, before netavark's DNAT (dstnat, -100) and after conntrack
+	# (-200), and in input as well, in case this chain is ever lost. iifname,
+	# not iif: the interface exists only while the tunnel is up.
+	chain prerouting {
+		type filter hook prerouting priority -150; policy accept;
+
+		iifname "wg-watchtower" ct state established,related accept comment "replies to Alloy"
+		iifname "wg-watchtower" counter drop comment "nothing comes in over the watchtower tunnel"
+	}
+
 	chain input {
 		type filter hook input priority filter; policy drop;
 
 		iif "lo" accept comment "loopback"
 		ct state established,related accept
 		ct state invalid drop
+		iifname "wg-watchtower" counter drop comment "nothing comes in over the watchtower tunnel"
 
 		meta l4proto icmp accept comment "IPv4 ICMP"
 		meta l4proto ipv6-icmp accept comment "IPv6 ICMP / NDP"

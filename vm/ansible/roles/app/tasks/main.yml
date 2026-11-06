@@ -7,6 +7,31 @@
     state: directory
   loop: [/etc/gitea, /etc/caddy, /etc/containers/systemd]
 
+# Coraza's audit log (the Caddyfile's SecAuditLog) holds whole requests, so it
+# stays on this host, in a directory only Caddy's user (1000, the image's and
+# the quadlet's) can read, relabelled for the container by the quadlet's :Z,
+# and rotated by logrotate. Never the journal, which role logship ships. Before
+# the Caddyfile and the quadlet, so Caddy never restarts without it.
+- name: Caddy's audit log directory
+  ansible.builtin.file:
+    path: /var/log/caddy
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0700"
+
+- name: Rotate the audit log
+  ansible.builtin.copy:
+    src: "{{ vm_src }}/logrotate/coraza-audit"
+    dest: /etc/logrotate.d/coraza-audit
+    mode: "0644"
+
+- name: logrotate runs daily
+  ansible.builtin.systemd_service:
+    name: logrotate.timer
+    enabled: true
+    state: started
+
 # Pulled here, on a VM that has neither, so the network probe below can run on
 # the very first pass; normally the quadlets and podman-auto-update pull.
 - name: Images present?

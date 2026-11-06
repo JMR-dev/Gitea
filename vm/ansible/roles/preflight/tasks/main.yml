@@ -39,6 +39,10 @@
     runner_egress_ip: "{{ metadata_raw.json['runner-egress-ip'] | default('') }}"
     # The rehearsal VM reads gitea-rehearsal-* instead of prod's secrets.
     secret_prefix: "{{ metadata_raw.json['gitea-secret-prefix'] | default('', true) or 'gitea' }}"
+    # The watchtower peer's secret, by resource name (gitea:watchtowerPeerSecret),
+    # never its value; role tunnel reads it on the VM. Absent: no telemetry.
+    # scripts/rehearsal.sh leaves it off the rehearsal VM.
+    watchtower_peer_secret: "{{ metadata_raw.json['watchtower-peer-secret'] | default('') | trim }}"
   no_log: true
 
 - name: Check the inputs

@@ -112,4 +112,10 @@ config:
   # infra/pkg/telemetry (docs/runners.md). cb-infra can only apply this after
   # `make ci-up` from the same commit has given it the roles.
   gitea:watchtowerReader: watchtower-gcp-reader@watchtower-observe.iam.gserviceaccount.com
+  # The VM's own logs and metrics go to watchtower over its VPN, as agent peer
+  # gitea-vm: this names the secret holding the peer's WireGuard config, in
+  # watchtower's project, which only gitea-vm@ may read (the VM reads it
+  # itself; this program never does). A name, never a value. Unset, the VM has
+  # no tunnel and no Alloy (docs/runbook.md, "Telemetry to watchtower").
+  gitea:watchtowerPeerSecret: projects/watchtower-observe/secrets/wireguard-gitea-vm-peer
 encryptionsalt: v1:pIXPmM64Bzc=:v1:0pkb4B2RVM5LFu2v:ZEPaG4RB9ySlpmaHkaBy8v6FQ3paHg==

@@ -1,0 +1,189 @@
+# Grafana Alloy (vm/quadlets/alloy.container, vm/config/config.alloy.tmpl)
+# ships this host's journal and metrics to watchtower through the tunnel (role
+# tunnel). It follows the tunnel's state: up renders and starts it; off and
+# down stop it and remove its unit and config (the alloy-data volume and its
+# journal cursor stay); keep changes nothing.
+#
+# Its handler is its own (site.yml, "alloy changed"): nothing here restarts
+# Gitea or Caddy, and nothing of theirs restarts Alloy. Telemetry never fails a
+# deploy: a start that fails and the deploy check below only warn.
+
+- name: The journal's group
+  ansible.builtin.getent:
+    database: group
+    key: systemd-journal
+  when: tunnel_state == 'up'
+
+# EL keeps journal files 0640 root:systemd-journal, so the image's own
+# non-root user (473) plus this group can read them.
+- name: Journal access for Alloy
+  ansible.builtin.set_fact:
+    logship_journal_gid: "{{ ansible_facts.getent_group['systemd-journal'][1] }}"
+  when: tunnel_state == 'up'
+
+# journald makes /var/log/journal root:root when it creates it (role base turns
+# the persistent journal on), and the systemd-journal group with its ACLs only
+# arrives from systemd-tmpfiles at the next boot. Until then Alloy, which reads
+# through that group, opens no journal file and still reports healthy with no
+# lines: the blog VM did exactly that on 2026-11-03. This does now what that
+# boot would do, and Alloy restarts so that it opens the files it can now read.
+# A VM that has booted since is left alone.
+- name: The journal directory's group
+  ansible.builtin.stat:
+    path: /var/log/journal
+  register: logship_journal_dir
+  when: tunnel_state == 'up'
+
+- name: Journal group access, as the next boot's systemd-tmpfiles would set it
+  ansible.builtin.command:
+    argv: [systemd-tmpfiles, --create, --prefix=/var/log/journal]
+  when:
+    - tunnel_state == 'up'
+    - logship_journal_dir.stat.exists
+    - logship_journal_dir.stat.gr_name != 'systemd-journal'
+  changed_when: true
+  notify: alloy changed
+
+- name: Alloy's config directory
+  ansible.builtin.file:
+    path: /etc/gitea/alloy
+    state: directory
+    mode: "0755"
+  when: tunnel_state == 'up'
+
+- name: Alloy's config
+  ansible.builtin.template:
+    src: "{{ vm_src }}/config/config.alloy.tmpl"
+    dest: /etc/gitea/alloy/config.alloy
+    mode: "0644"
+    variable_start_string: "${"
+    variable_end_string: "}"
+  when: tunnel_state == 'up'
+  notify: alloy changed
+
+- name: Alloy's quadlets
+  ansible.builtin.template:
+    src: "{{ vm_src }}/quadlets/{{ item }}"
+    dest: /etc/containers/systemd/{{ item }}
+    mode: "0644"
+    variable_start_string: "${"
+    variable_end_string: "}"
+  loop: [alloy.container, alloy-data.volume]
+  register: logship_units
+  when: tunnel_state == 'up'
+  notify: alloy changed
+
+# Generated now, not by the handler, so the start below finds the unit.
+- name: Generate Alloy's unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: logship_units is changed
+
+# Pulled ahead, so a slow first pull isn't the first start's, inside its
+# timeout. A failed pull is left to the start, which pulls again.
+- name: Pull the Alloy image
+  ansible.builtin.command:
+    argv: [podman, pull, --quiet, "{{ ALLOY_IMAGE }}"]
+  changed_when: false
+  failed_when: false
+  when:
+    - tunnel_state == 'up'
+    - not ansible_check_mode
+
+# Quadlet units have no enable: [Install] takes effect at the daemon-reload.
+# Not under --check, where a first deploy has no unit yet.
+- name: Alloy running
+  ansible.builtin.systemd_service:
+    name: alloy.service
+    state: started
+  register: logship_start
+  failed_when: false
+  when:
+    - tunnel_state == 'up'
+    - not ansible_check_mode
+
+- name: Warn when Alloy won't start
+  ansible.builtin.debug:
+    msg: "WARN: alloy.service did not start: {{ logship_start.msg | default('') }} -- see: journalctl -u alloy"
+  when:
+    - logship_start is not skipped
+    - logship_start.state | default('') != 'started'
+
+- name: No peer, no Alloy
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+  loop: [alloy.service, alloy-data-volume.service]
+  failed_when: false
+  when: tunnel_state in ['off', 'down']
+
+# The alloy-data volume itself stays: its journal cursor is where shipping
+# resumes once there is a peer again.
+- name: No peer, no Alloy unit or config
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/containers/systemd/alloy.container
+    - /etc/containers/systemd/alloy-data.volume
+    - /etc/gitea/alloy/config.alloy
+  register: logship_removed
+  when: tunnel_state in ['off', 'down']
+
+- name: Forget Alloy's unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: logship_removed is changed
+
+- name: Apply Alloy changes now
+  ansible.builtin.meta: flush_handlers
+
+# The deploy check, warn only: both started, and what comes next depends on
+# watchtower's side too, whose outage must not stop a deploy of Gitea. Alloy
+# first (its UI, on loopback), then the tunnel. Not under --check, where
+# nothing was started to check.
+- name: Alloy is ready
+  ansible.builtin.uri:
+    url: http://127.0.0.1:12345/-/ready
+  register: logship_ready
+  until: logship_ready.status | default(0) == 200
+  retries: 24
+  delay: 5
+  failed_when: false
+  when:
+    - tunnel_state == 'up'
+    - not ansible_check_mode
+
+- name: Warn when Alloy is not ready
+  ansible.builtin.debug:
+    msg: "WARN: Alloy did not answer /-/ready within 2 minutes -- see: journalctl -u alloy"
+  when:
+    - logship_ready is not skipped
+    - logship_ready.status | default(0) != 200
+
+# The handshake time only: `wg show` prints it beside the peer's public key,
+# which stays out of the result (and so out of the run's -vvv log).
+- name: The tunnel has a handshake
+  ansible.builtin.shell: |
+    set -o pipefail
+    wg show wg-watchtower latest-handshakes | awk '{ print $2 }' | sort -n | tail -n 1
+  args:
+    executable: /bin/bash
+  register: logship_handshake
+  until: logship_handshake.stdout | default('0') | int > 0
+  retries: 24
+  delay: 5
+  changed_when: false
+  failed_when: false
+  when:
+    - tunnel_state == 'up'
+    - not ansible_check_mode
+
+- name: Warn when the tunnel has no handshake
+  ansible.builtin.debug:
+    msg: >-
+      WARN: no WireGuard handshake with watchtower within 2 minutes, so nothing ships -- see:
+      journalctl -u wg-quick@wg-watchtower, and peer gitea-vm in wg-easy
+  when:
+    - logship_handshake is not skipped
+    - logship_handshake.stdout | default('0') | int == 0

@@ -115,5 +115,14 @@ RUN_RETENTION_DAYS      = 400
 [cron.update_checker]
 ENABLED = false
 
+[metrics]
+; Prometheus metrics at /metrics, for Alloy (vm/quadlets/alloy.container),
+; which scrapes them on the host's loopback (127.0.0.1:3000, the only place
+; gitea.container publishes HTTP) and ships them to watchtower. No TOKEN: from
+; outside, Caddy answers /metrics with a 404 before it reaches Gitea
+; (vm/config/Caddyfile.tmpl). Counts only: the per-repository and per-label
+; issue metrics stay off, as they name repositories.
+ENABLED = true
+
 [ui]
 DEFAULT_THEME = gitea-auto

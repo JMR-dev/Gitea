@@ -11,6 +11,11 @@
   become: true
   vars:
     vm_src: "{{ playbook_dir }}/.."
+  # tunnel and logship (the telemetry to watchtower) come last: after the
+  # firewall's ruleset, which drops anything coming in over the tunnel, is
+  # loaded (app's flush), and after Gitea and Caddy have their config, so their
+  # slow first run (wireguard-tools, a 200 MiB image pull) never holds those
+  # back. Their handlers are their own, and never restart Gitea or Caddy.
   roles:
     - preflight
     - base
@@ -18,6 +23,8 @@
     - firewall
     - helpers
     - app
+    - tunnel
+    - logship
 
   # All the handlers live here, so they run in this order -- Ansible runs
   # notified handlers in definition order: units are reloaded before the
@@ -27,6 +34,20 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
       listen: [units changed, gitea config changed]
+
+    # Role base's persistent journal. Restarting journald keeps every
+    # service's stdout stream (systemd holds them in its fd store), and the
+    # flush moves what is in /run/log/journal to /var/log/journal.
+    - name: Restart journald
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+      listen: journald config changed
+
+    - name: Flush the journal to disk
+      ansible.builtin.command: journalctl --flush
+      changed_when: true
+      listen: journald config changed
 
     - name: Restart gitea
       ansible.builtin.systemd_service:
@@ -58,3 +79,31 @@
     - name: Reload fail2ban
       ansible.builtin.shell: systemctl reload fail2ban || systemctl restart fail2ban
       changed_when: true
+
+    # The telemetry's own (roles tunnel and logship), listened for under names
+    # nothing of Gitea's or Caddy's notifies. Restart, not `wg syncconf`: a
+    # changed Address or Endpoint needs wg-quick. Warn-only, like the rest of
+    # the telemetry: role logship's deploy check says whether it came up. Not
+    # under --check, where a first deploy has no unit to restart.
+    - name: Restart the watchtower tunnel
+      ansible.builtin.systemd_service:
+        name: wg-quick@wg-watchtower.service
+        state: restarted
+      failed_when: false
+      when:
+        - tunnel_state | default('') == 'up'
+        - not ansible_check_mode
+      listen: watchtower tunnel changed
+
+    # Also on a tunnel change, so Alloy reconnects at once rather than after
+    # its backoff.
+    - name: Restart alloy
+      ansible.builtin.systemd_service:
+        name: alloy.service
+        state: restarted
+        daemon_reload: true
+      failed_when: false
+      when:
+        - tunnel_state | default('') == 'up'
+        - not ansible_check_mode
+      listen: [watchtower tunnel changed, alloy changed]

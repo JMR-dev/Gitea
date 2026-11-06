@@ -9,6 +9,7 @@
       - gettext  # envsubst, for files/gitea-render-secrets
       - policycoreutils-python-utils
       - xfsprogs
+      - logrotate  # Coraza's audit log, vm/logrotate/coraza-audit
     state: present
     lock_timeout: 600  # dnf-makecache can hold the lock on a first boot
 
@@ -101,6 +102,28 @@
 - name: Apply swappiness
   ansible.builtin.command: sysctl -q -p /etc/sysctl.d/90-gitea-swappiness.conf
   when: swappiness is changed
+
+# The AlmaLinux GCE image keeps the journal in /run, so a reboot -- the weekly
+# window, or dnf-automatic's -- loses it. Persistent, so a reboot keeps what led
+# up to it, and Alloy (role logship) resumes from a journal cursor, which only
+# means something on disk. Capped well under the 20 GB boot disk: the journal
+# is not the archive (watchtower is), and fail2ban reads only its last hours.
+- name: journald's drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"
+
+- name: Persistent journal
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/50-gitea.conf
+    content: |
+      # Managed by the playbook (vm/ansible, role base).
+      [Journal]
+      Storage=persistent
+      SystemMaxUse=500M
+    mode: "0644"
+  notify: journald config changed
 
 # Netavark keeps its rules in a dedicated `netavark` nftables table, which is
 # what makes coexistence with our own table workable. Changing this with

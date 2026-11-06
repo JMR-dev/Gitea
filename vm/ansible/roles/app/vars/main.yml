@@ -31,10 +31,16 @@ GITEA_UPSTREAM: "{{ '127.0.0.1:3000' if caddy_mode == 'host' else 'gitea:3000' }
 CADDY_NETWORK: "{{ 'host' if caddy_mode == 'host' else 'gitea.network' }}"
 CADDY_PUBLISH_PORTS: "{{ caddy_publish_host if caddy_mode == 'host' else caddy_publish_bridge }}"
 CADDY_SYSCTL: "{{ caddy_sysctl_host if caddy_mode == 'host' else caddy_sysctl_bridge }}"
+# Where the Caddyfile's :2020 metrics site listens: loopback on the host
+# network; on the bridge, inside the container, published on the host's
+# loopback only (the last PublishPort below).
+CADDY_METRICS_BIND: "{{ 'bind 127.0.0.1' if caddy_mode == 'host' else caddy_metrics_bind_bridge }}"
+caddy_metrics_bind_bridge: "# bridge: caddy.container publishes this on the host's loopback only"
 caddy_publish_bridge: |-
   PublishPort=80:80
   PublishPort=443:443
   PublishPort=443:443/udp
+  PublishPort=127.0.0.1:2020:2020
 caddy_publish_host: "# Network=host: ports are bound directly, publishing would be invalid."
 caddy_sysctl_bridge: Sysctl=net.ipv4.ip_unprivileged_port_start=0
 caddy_sysctl_host: "# Network=host: podman rejects net.* sysctls; set on the host instead."

@@ -6,11 +6,26 @@
 #   coraza_waf     -- OWASP Coraza with the Core Rule Set embedded in the binary
 {
 	# no ACME contact address: secret gitea-acme-email was unreadable at render time
+	# The quadlet's health check polls this. Loopback only, and never
+	# published: the admin API can rewrite the whole config.
 	admin 127.0.0.1:2019
+	# HTTP request metrics for every site. They are served only by the :2020
+	# site below.
+	metrics
 	# Required by coraza-caddy: Caddy has no built-in ordering for a third-party
 	# directive, and the WAF must run before anything that could act on the
 	# request. Applies inside handle blocks too.
 	order coraza_waf first
+}
+
+# Prometheus metrics for Alloy (vm/config/config.alloy.tmpl), which scrapes
+# 127.0.0.1:2020 from the host. Plain HTTP, since the site has no host name,
+# and never reachable from outside: on the host network it binds loopback; on
+# the bridge it listens inside the container and caddy.container publishes it
+# on the host's loopback only. No log directive, so scrapes are not logged.
+:2020 {
+	bind 127.0.0.1
+	metrics
 }
 
 git.example.test {
@@ -68,6 +83,20 @@ Disallow: /*/*/_
 Disallow: /api/
 Disallow: /user/
 ` 200
+	}
+
+	# ---------------------------------------------------------------------
+	# Gitea's Prometheus metrics (app.ini [metrics]) are for Alloy on this
+	# host, which reads them on loopback, never through here. Gitea serves
+	# them with no token, so they stop here. /metrics/* too, in case a
+	# trailing slash or more ever reaches the same handler: "metrics" is a
+	# name Gitea reserves (models/user), so no user or organisation lives
+	# under it. Caddy matches the cleaned path in any case (//metrics,
+	# /METRICS, /./metrics).
+	# ---------------------------------------------------------------------
+	@gitea_metrics path /metrics /metrics/*
+	handle @gitea_metrics {
+		respond 404
 	}
 
 	# ---------------------------------------------------------------------
@@ -141,7 +170,7 @@ Disallow: /user/
 			SecRequestBodyLimitAction ProcessPartial
 
 			# RelevantOnly, not On. Auditing every request would pour the full
-			# request volume into journald and then into Cloud Logging.
+			# request volume into the audit log.
 			SecAuditEngine RelevantOnly
 
 			# The default relevant-status is ^(?:5|4(?!04)), which audits every
@@ -153,7 +182,12 @@ Disallow: /user/
 			# useful.
 			SecAuditLogRelevantStatus "^(?:5[0-9]{2}|403)$"
 
-			SecAuditLog /dev/stdout
+			# A record holds the whole request: headers, cookies, bodies. So it
+			# goes to a file on this host (/var/log/caddy, mounted by
+			# caddy.container, rotated by vm/logrotate/coraza-audit), never to
+			# the journal, which Alloy ships to watchtower. fail2ban's WAF jail
+			# reads Caddy's error lines in the journal, not this.
+			SecAuditLog /var/log/caddy/coraza-audit.log
 			SecAuditLogFormat json
 			SecAuditLogParts ABIJDEFHZ
 			`

@@ -15,28 +15,58 @@ defines it, so a new variable fails here with what to add, not as an Ansible
 tests/make-goldens the way vm/bootstrap.sh rendered, which proved the cutover
 byte for byte; from then on --update is how they change.
 
+Once the goldens match, the telemetry to watchtower is checked too (not under
+--update): `alloy fmt --test` and `alloy validate` on every fixture's rendered
+Alloy config, its scrub rules over scripts/testdata/scrub.log
+(scripts/check-alloy-scrub.sh), the watchtower peer script over made-up
+configs (scripts/check-peer-config.sh), and role tunnel's state over every
+case (tests/tunnel-state.yml). Alloy and jq are downloaded, pinned and checked
+against their sha256 (TOOLS), into ~/.cache/gitea-vm-checks.
+
 Run with ansible-core on PATH (`make goldens` and `make ansible-check` do).
 """
 import argparse
 import difflib
+import hashlib
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
+import zipfile
 
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ANSIBLE = os.path.dirname(HERE)
 VM = os.path.dirname(ANSIBLE)
+ROOT = os.path.dirname(VM)
 SECRETS = {"app.ini": ["GITEA_SECRET_KEY", "GITEA_INTERNAL_TOKEN", "GITEA_OAUTH2_JWT_SECRET", "GITEA_LFS_JWT_SECRET"],
            "Caddyfile": ["CADDY_EMAIL"]}
 # The directories whose files are rendered with ${ } delimiters.
 TEMPLATED = ["config", "quadlets", "nftables", "fail2ban/jail.d"]
-VARS_FILES = ["roles/app/vars/main.yml", "roles/firewall/vars/main.yml"]
+VARS_FILES = ["roles/app/vars/main.yml", "roles/firewall/vars/main.yml", "roles/logship/vars/main.yml"]
 HELPER = "roles/app/files/gitea-render-secrets"
 VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# The tools the telemetry checks run, for linux x86_64 (the deploy image and a
+# workstation): name -> (url, the sha256 its release publishes, the member to
+# take from a zip or None). Alloy is the version watchtower's contract pins
+# (v1.21.3, as in vm/quadlets/alloy.container), from the release's SHA256SUMS;
+# jq, which scripts/check-alloy-scrub.sh reads Alloy's log with and the deploy
+# image lacks, from its release's sha256sum.txt. Bump both here by hand.
+TOOLS = {
+    "alloy": ("https://github.com/grafana/alloy/releases/download/v1.21.3/alloy-linux-amd64.zip",
+              "50d23af2d0f98c00beac6ce9a365693e60f87fb76b6cad6fe1d161e80588af6d", "alloy-linux-amd64"),
+    "jq": ("https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64",
+           "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f", None),
+}
+ALLOY_CONFIG = "config.alloy"  # the rendered name of vm/config/config.alloy.tmpl
+SCRUB_FIXTURE = os.path.join(ROOT, "scripts", "testdata", "scrub.log")
 
 
 def check_variables():
@@ -97,6 +127,88 @@ def render(fixture, out):
     return True
 
 
+def fetch_tools():
+    """TOOLS, each downloaded once and checked against its pinned sha256, in a
+    cache directory named for the pins; returns that directory."""
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
+        raise SystemExit(f"tests/check: the telemetry checks need linux x86_64 (TOOLS), not "
+                         f"{platform.system()} {platform.machine()}")
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    pins = hashlib.sha256("".join(sha for _, sha, _ in TOOLS.values()).encode()).hexdigest()[:16]
+    bindir = os.path.join(cache, "gitea-vm-checks", pins)
+    os.makedirs(bindir, exist_ok=True)
+    for name, (url, sha, member) in TOOLS.items():
+        dst = os.path.join(bindir, name)
+        if os.path.isfile(dst):
+            continue
+        # Streamed to disk and hashed on the way: Alloy is ~570 MB unpacked.
+        download = dst + ".download"
+        for attempt in range(3):
+            try:
+                h = hashlib.sha256()
+                with urllib.request.urlopen(url, timeout=120) as r, open(download, "wb") as fh:
+                    for chunk in iter(lambda: r.read(1 << 20), b""):
+                        h.update(chunk)
+                        fh.write(chunk)
+                break
+            except OSError as e:
+                if attempt == 2:
+                    raise SystemExit(f"tests/check: could not download {url}: {e}")
+                time.sleep(10)
+        if h.hexdigest() != sha:
+            os.remove(download)
+            raise SystemExit(f"tests/check: {url} has sha256 {h.hexdigest()}, not the pinned {sha}")
+        tmp = dst + ".tmp"
+        if member:
+            with zipfile.ZipFile(download) as zf, zf.open(member) as src, open(tmp, "wb") as fh:
+                shutil.copyfileobj(src, fh, 1 << 20)
+            os.remove(download)
+        else:
+            os.replace(download, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+    return bindir
+
+
+def telemetry_checks():
+    """The rendered Alloy configs, the scrub rules and the peer script; returns
+    what failed. Run on the goldens, which the caller has just proved are
+    exactly what renders."""
+    env = dict(os.environ)
+    env["PATH"] = fetch_tools() + os.pathsep + env.get("PATH", "")
+    failures = []
+
+    def run(what, cmd):
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        print(r.stdout, end="")
+        if r.returncode != 0:
+            print(r.stderr[-3000:], end="")
+            failures.append(what)
+
+    goldens = sorted(os.listdir(os.path.join(HERE, "golden")))
+    for name in goldens:
+        golden = os.path.join(HERE, "golden", name, ALLOY_CONFIG + ".golden")
+        with tempfile.TemporaryDirectory() as t:
+            # Alloy reads a file by its .alloy name.
+            cfg = os.path.join(t, ALLOY_CONFIG)
+            shutil.copyfile(golden, cfg)
+            run(f"{name}: alloy fmt", ["alloy", "fmt", "--test", cfg])
+            run(f"{name}: alloy validate", ["alloy", "validate", cfg])
+    # The scrub block renders the same from every fixture: it has no ${VAR}.
+    run("scrub rules", [os.path.join(ROOT, "scripts", "check-alloy-scrub.sh"),
+                        os.path.join(HERE, "golden", goldens[0], ALLOY_CONFIG + ".golden"), SCRUB_FIXTURE])
+    run("peer script", ["bash", os.path.join(ROOT, "scripts", "check-peer-config.sh")])
+    # Role tunnel's state over every case; quiet unless it fails.
+    r = subprocess.run(["ansible-playbook", "-i", "localhost,", os.path.join(HERE, "tunnel-state.yml")],
+                       env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout[-3000:], r.stderr[-3000:], sep="\n")
+        failures.append("tunnel state")
+    else:
+        print("tunnel state: role tunnel comes to the right state in every case")
+    return failures
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--update", action="store_true", help="rewrite the goldens from what renders now")
@@ -143,8 +255,13 @@ def main():
         return 1
     if a.update:
         print(f"tests/check: wrote {written} goldens; review `git diff vm/ansible/tests/golden`")
-    else:
-        print(f"tests/check: {checked} rendered files match their goldens")
+        return 0
+    print(f"tests/check: {checked} rendered files match their goldens")
+    failures = telemetry_checks()
+    if failures:
+        print("telemetry check failures: " + ", ".join(failures))
+        return 1
+    print("tests/check: the Alloy configs validate, the scrub rules hold, the peer script judges right")
     return 0
 
 

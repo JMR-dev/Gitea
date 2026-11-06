@@ -15,6 +15,7 @@
       loop:
         - ../roles/app/vars/main.yml
         - ../roles/firewall/vars/main.yml
+        - ../roles/logship/vars/main.yml
 
     - name: Output directory
       ansible.builtin.file:
@@ -49,6 +50,12 @@
         - {src: quadlets/caddy-config.volume, dest: caddy-config.volume}
         - {src: nftables/gitea.nft, dest: nftables.conf}
         - {src: fail2ban/jail.d/gitea.local, dest: gitea.local}
+        # Role logship's, rendered on the VM only with a watchtower peer: the
+        # fixtures' peer is a dummy, and the peer config itself is never
+        # rendered by Ansible (role tunnel's script installs it on the VM).
+        - {src: config/config.alloy.tmpl, dest: config.alloy}
+        - {src: quadlets/alloy.container, dest: alloy.container}
+        - {src: quadlets/alloy-data.volume, dest: alloy-data.volume}
 
     - name: The backup script
       ansible.builtin.template:

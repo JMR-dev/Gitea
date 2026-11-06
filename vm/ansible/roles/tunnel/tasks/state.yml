@@ -1,0 +1,30 @@
+# tunnel_state, which this role and role logship act on, and tunnel_why, the
+# reason a warning gives: from the metadata (watchtower_peer_secret), whether
+# wireguard-tools is there (tunnel_dnf, tunnel_tools) and the peer script's
+# answer (tunnel_peer). tasks/main.yml says what each state does.
+# tests/tunnel-state.yml runs this over every case (vm/ansible/tests/check).
+#
+# Only the script's own words decide up, down or off; anything it didn't say
+# cleanly (it failed, said nothing, or said something else) is keep.
+- name: The peer script's answer
+  ansible.builtin.set_fact:
+    tunnel_line: >-
+      {{ '' if tunnel_peer is skipped else (tunnel_peer.stdout_lines | default([], true) + [''])[0] }}
+
+- name: The tunnel's state, for this role and role logship
+  ansible.builtin.set_fact:
+    tunnel_state: >-
+      {{ 'off' if watchtower_peer_secret | length == 0
+         else 'keep' if tunnel_tools.rc | default(0) != 0
+         else 'keep' if tunnel_peer.rc | default(1) != 0
+         else (tunnel_line.split(' ') | first) if (tunnel_line.split(' ') | first) in ['up', 'off', 'down', 'keep']
+         else 'keep' }}
+    tunnel_why: >-
+      {{ 'wireguard-tools is not installable (' ~ (tunnel_dnf.msg | default('')) ~ ')'
+           if watchtower_peer_secret | length > 0 and tunnel_tools.rc | default(0) != 0
+         else 'the peer script failed (rc ' ~ (tunnel_peer.rc | default('?')) ~ ')'
+           if watchtower_peer_secret | length > 0 and tunnel_peer.rc | default(1) != 0
+         else tunnel_line.split(' ', 1)[1] if (tunnel_line.split(' ') | first) == 'keep' and ' ' in tunnel_line
+         else 'the peer script gave no answer this playbook knows'
+           if watchtower_peer_secret | length > 0 and (tunnel_line.split(' ') | first) not in ['up', 'off', 'down', 'keep']
+         else '' }}
