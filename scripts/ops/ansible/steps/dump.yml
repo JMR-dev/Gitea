@@ -1,0 +1,7 @@
+# dump GS_URL: a gitea dump streamed straight to Cloud Storage.
+# Bash: step_dump in files/gitea-ops-lib.sh.
+- name: dump (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'dump'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

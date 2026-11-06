@@ -1,0 +1,7 @@
+# restarts UNIT: systemd's restart counter, compared before/after a soak.
+- name: NRestarts of {{ step_args[0] }}
+  ansible.builtin.command:
+    argv: [systemctl, show, "{{ step_args[0] }}", -p, NRestarts, --value]
+    expand_argument_vars: false
+  register: step_result
+  changed_when: false

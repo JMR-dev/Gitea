@@ -1,0 +1,7 @@
+# start UNIT. Blocks until the quadlet's Notify=healthy fires or
+# TimeoutStartSec runs out, so its exit status is the health verdict.
+- name: Start {{ step_args[0] }}
+  ansible.builtin.command:
+    argv: [systemctl, start, "{{ step_args[0] }}"]
+    expand_argument_vars: false
+  register: step_result

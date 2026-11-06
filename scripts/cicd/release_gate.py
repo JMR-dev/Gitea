@@ -44,23 +44,53 @@ import urllib.request
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
+# The release engine: gitea_ops.py, its Job launcher, and every file of its
+# VM steps (scripts/ops/ansible). Each one is code a rollback runs, so each is
+# named here, literally -- test_cicd.py checks none is missing.
+ENGINE = [
+    "scripts/ops/ansible/ansible.cfg",
+    "scripts/ops/ansible/files/gitea-ops-lib.sh",
+    "scripts/ops/ansible/ops.yml",
+    "scripts/ops/ansible/requirements.in",
+    "scripts/ops/ansible/requirements.txt",
+    "scripts/ops/ansible/steps/auto-update.yml",
+    "scripts/ops/ansible/steps/config-tarball.yml",
+    "scripts/ops/ansible/steps/dump.yml",
+    "scripts/ops/ansible/steps/inventory.yml",
+    "scripts/ops/ansible/steps/journal-errors.yml",
+    "scripts/ops/ansible/steps/marker-check.yml",
+    "scripts/ops/ansible/steps/marker.yml",
+    "scripts/ops/ansible/steps/migrate.yml",
+    "scripts/ops/ansible/steps/pause-timers.yml",
+    "scripts/ops/ansible/steps/pre-restore-list.yml",
+    "scripts/ops/ansible/steps/pre-restore-remove.yml",
+    "scripts/ops/ansible/steps/pull.yml",
+    "scripts/ops/ansible/steps/restart-if-not.yml",
+    "scripts/ops/ansible/steps/restarts.yml",
+    "scripts/ops/ansible/steps/restore-sync.yml",
+    "scripts/ops/ansible/steps/restore-test-dump.yml",
+    "scripts/ops/ansible/steps/restore-test-snapshot.yml",
+    "scripts/ops/ansible/steps/resume-timers.yml",
+    "scripts/ops/ansible/steps/running-digest.yml",
+    "scripts/ops/ansible/steps/selftest.yml",
+    "scripts/ops/ansible/steps/start.yml",
+    "scripts/ops/ansible/steps/stop.yml",
+    "scripts/ops/gitea_ops.py",
+    "scripts/ops/launch_job.py",
+]
 # Every file whose code decides what a release or a rollback does. Keep in
 # step with cicd/relay's ReleasePaths, which flags a push touching any of them.
 FILES = {
     "image": [
         "cloudbuild/image.yaml",
         "scripts/cicd/release_gate.py",
-        "scripts/ops/gitea_ops.py",
-        "scripts/ops/launch_job.py",
-        "scripts/ops/vm-steps.sh",
+        *ENGINE,
     ],
     "infra": [
         "cloudbuild/infra.yaml",
         "scripts/cicd/infra_deploy.py",
         "scripts/cicd/release_gate.py",
-        "scripts/ops/gitea_ops.py",
-        "scripts/ops/launch_job.py",
-        "scripts/ops/vm-steps.sh",
+        *ENGINE,
     ],
 }
 DRILLS = {"image": ["fail-verify", "fail-after-migrate"], "infra": ["fail-verify"]}

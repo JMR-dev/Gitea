@@ -1,0 +1,7 @@
+# restore-sync TOOL_IMAGE: replace /var/lib/gitea with the attached snapshot copy.
+# Bash: step_restore_sync in files/gitea-ops-lib.sh.
+- name: restore-sync (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'restore-sync'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

@@ -1,0 +1,7 @@
+# config-tarball GS_URL: the host's rendered config, streamed to Cloud Storage.
+# Bash: step_config_tarball in files/gitea-ops-lib.sh.
+- name: config-tarball (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'config-tarball'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result
