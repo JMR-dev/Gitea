@@ -112,6 +112,11 @@ type Config struct {
 	// release-engine Jobs: the CI project's cb-image@ (cicd/, the
 	// imageServiceAccount output). Space- or comma-separated emails.
 	OpsLaunchers []string
+
+	// WatchtowerReader is the service account our observability stack reads
+	// this project's logs and metrics as. Unset, package telemetry creates
+	// nothing (docs/runners.md).
+	WatchtowerReader string
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -161,6 +166,8 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 
 		OpsMachineType: c.Get("opsMachineType"),
 		OpsLaunchers:   strings.Fields(strings.ReplaceAll(c.Get("opsLaunchers"), ",", " ")),
+
+		WatchtowerReader: c.Get("watchtowerReader"),
 	}
 
 	// Both meant something else before the node pool was split into base and
@@ -340,6 +347,9 @@ func validate(c *Config) error {
 	}
 	if len(c.OpsLaunchers) > 0 && !c.RunnersEnabled {
 		return fmt.Errorf("gitea:opsLaunchers needs gitea:runnersEnabled: the Jobs run on the runner cluster")
+	}
+	if r := c.WatchtowerReader; r != "" && (!strings.HasSuffix(r, ".iam.gserviceaccount.com") || strings.Count(r, "@") != 1) {
+		return fmt.Errorf("gitea:watchtowerReader %q is not a service account email", r)
 	}
 	for _, f := range strings.Fields(c.Fail2banIgnore) {
 		// Values only, never echoed: this one is a secret. fail2ban would

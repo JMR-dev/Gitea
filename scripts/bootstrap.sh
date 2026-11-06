@@ -54,7 +54,8 @@ gcloud services enable --project="${PROJECT}" \
     iamcredentials.googleapis.com \
     oslogin.googleapis.com \
     cloudresourcemanager.googleapis.com \
-    container.googleapis.com
+    container.googleapis.com \
+    pubsub.googleapis.com
 
 # ---------------------------------------------------------------------------
 log "creating Pulumi state bucket gs://${STATE_BUCKET}"

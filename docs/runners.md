@@ -240,6 +240,53 @@ same IP. So the VM adds that address to `ignoreip`, using instance metadata
 banned, which is acceptable under the threat model above. The same metadata
 value also carries the secret `gitea:fail2banIgnore`, the operator's own addresses.
 
+## Logs and metrics to Watchtower
+
+Watchtower, our observability stack, pulls the cluster's logs and this project's
+metrics, as `gitea:watchtowerReader`, `watchtower-gcp-reader@watchtower-observe`.
+Nothing runs in the cluster for it: the base node has no headroom, and a VPN key
+here would be in reach of `docker` jobs. A sink, `watchtower-ci`, feeds the topic
+`watchtower-logs`, and Watchtower reads `watchtower-logs-pull`
+(`infra/pkg/telemetry`). Unset, none of this exists, except the
+`pubsub.googleapis.com` API, which like the others is always on.
+
+| Sent | Why |
+|---|---|
+| `k8s_container` in cluster `gitea-runners`, namespace `gitea-runner` only, container `runner` only, `stdout` and `stderr` | The runners' own log |
+| `k8s_pod` `events` from `gitea-jobs` and `gitea-jobs-arm64` | A job pod started, was evicted, or failed to schedule |
+| `container.googleapis.com/cluster-autoscaler-visibility` | Why a pool did or did not scale |
+| `nat_gateway` `gitea-runners-nat` only, `compute.googleapis.com/nat_flows` | Port exhaustion; the NAT logs only errors (`infra/pkg/network`) |
+
+| Not sent | Why |
+|---|---|
+| `cloudaudit` | It carries the owner's email. It shares `k8s_cluster` with the autoscaler's log, so that clause names its log, not its type |
+| Job output: containers in `gitea-jobs` and `gitea-jobs-arm64` | Whatever a job printed |
+| `kube-system`, `gmp-system` | GKE's own, and most of the volume |
+| `gitea-ops` | The release engine's Jobs |
+| The serial console, and the node logs GKE files under `k8s_container` with no namespace (`GCEGuestAgent` and the like) | Not CI's, and a boot log can hold anything |
+
+The filter is an allow-list, so a log nobody has thought about stays out. Its
+tests are in `infra/pkg/telemetry`, and it is written out in
+`infra/pkg/telemetry/testdata/log-filter.txt`.
+
+Job output doesn't appear in the runners' own logs, as far as a read-only check
+on 2026-11-02 can show. Across about 21,400 runner lines over 18 days, including
+1,314 task starts, looking for `go: downloading`, docker build steps, `Cloning into`,
+environment dumps and shell traces found none. The same checks on 25,000 lines of
+the CI project's Cloud Build logs found 3,968 `go: downloading`, 310 build steps and
+992 shell traces, so those three do find job output where there is some; the other
+two found none there either, and prove less. Not every line is a record: about
+360 aren't `time=… level=… msg=…`, among them the 148 on `stdout`, which fall in 17
+distinct minutes, as startup output would.
+
+That holds at `log.level: info`, which a test in `infra/pkg/runner` pins. Measure
+again before moving a runner to `debug`.
+
+The reader's access here is `roles/pubsub.subscriber` on the subscription and a
+custom role with two `monitoring.*.list` permissions, as in the CI project.
+Setting it up and turning it off go in an order across the two stacks: see *Logs
+and metrics to Watchtower* in [cicd.md](cicd.md).
+
 ## Turning it on
 
 1. Re-run `scripts/bootstrap.sh <project-id>`. It is idempotent, and on an

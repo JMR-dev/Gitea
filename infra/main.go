@@ -24,6 +24,7 @@ import (
 	"gitea-infra/pkg/runner"
 	"gitea-infra/pkg/secrets"
 	"gitea-infra/pkg/storage"
+	"gitea-infra/pkg/telemetry"
 )
 
 // The vm/ tree -- the playbook (vm/ansible) and the files it installs -- lives
@@ -126,6 +127,10 @@ func main() {
 		}
 		eng, err := ops.New(ctx, cfg, cluster, k8s, accounts.VM, repo, buckets.Backup, apis)
 		if err != nil {
+			return err
+		}
+		// Nothing unless gitea:watchtowerReader is set.
+		if err := telemetry.New(ctx, cfg, apis); err != nil {
 			return err
 		}
 

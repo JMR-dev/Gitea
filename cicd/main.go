@@ -19,6 +19,7 @@ import (
 	"gitea-cicd/pkg/relay"
 	"gitea-cicd/pkg/schedule"
 	"gitea-cicd/pkg/storage"
+	"gitea-cicd/pkg/telemetry"
 	"gitea-cicd/pkg/triggers"
 )
 
@@ -54,6 +55,10 @@ func main() {
 			return err
 		}
 		if err := alerting.New(ctx, cfg, apis); err != nil {
+			return err
+		}
+		// Nothing unless gitea-cicd:watchtowerReader is set.
+		if err := telemetry.New(ctx, cfg, apis); err != nil {
 			return err
 		}
 

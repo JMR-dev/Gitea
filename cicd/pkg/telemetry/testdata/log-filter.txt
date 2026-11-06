@@ -1,0 +1,1 @@
+resource.type="cloud_run_revision" AND resource.labels.service_name=("gitea-webhook" OR "build-status") AND (log_id("run.googleapis.com/stderr") OR log_id("run.googleapis.com/requests"))

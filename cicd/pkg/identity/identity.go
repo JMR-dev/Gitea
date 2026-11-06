@@ -41,6 +41,8 @@
 package identity
 
 import (
+	"slices"
+
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/artifactregistry"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/projects"
 	"github.com/pulumi/pulumi-gcp/sdk/v9/go/gcp/secretmanager"
@@ -91,6 +93,24 @@ var infraRoles = []string{
 	"roles/iap.tunnelResourceAccessor",
 	"roles/compute.osAdminLogin",
 	"roles/logging.logWriter",
+}
+
+// telemetryInfraRoles are what cb-infra adds for infra/pkg/telemetry, and only
+// while gitea-cicd:watchtowerReader is set: the sink (logging.configWriter), and
+// the topic, the subscription and their IAM (pubsub.admin, as no narrower role
+// holds topics.setIamPolicy). Its custom role and that role's grant are covered
+// by iam.roleAdmin and projectIamAdmin above.
+var telemetryInfraRoles = []string{
+	"roles/logging.configWriter",
+	"roles/pubsub.admin",
+}
+
+// appInfraRoles is everything cb-infra gets on the app project.
+func appInfraRoles(cfg *config.Config) []string {
+	if cfg.WatchtowerReader == "" {
+		return infraRoles
+	}
+	return slices.Concat(infraRoles, telemetryInfraRoles)
 }
 
 // InfraPreviewRoles is all cb-infra-preview gets project-wide on the app
@@ -288,7 +308,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 
 	// --- In the app project ---
 
-	for _, role := range infraRoles {
+	for _, role := range appInfraRoles(cfg) {
 		if err := projectRole("app-infra-"+role, cfg.AppProject, role, member(a.Infra)); err != nil {
 			return nil, err
 		}

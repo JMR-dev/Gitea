@@ -36,7 +36,7 @@ SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh 
 	vm/ansible/roles/helpers/files/gitea-reboot-if-needed
 .PHONY: check
 check: ci-check ansible-check ## Build and vet both Pulumi programs and the relay, test them, and check the scripts and the playbook
-	cd infra && go build -o gitea-infra . && go vet ./...
+	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/runner ./pkg/telemetry
 	bash -n $(SHELL_SCRIPTS)
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
 	@command -v shellcheck >/dev/null && shellcheck -S warning $(SHELL_SCRIPTS) || echo "shellcheck not installed -- skipped"

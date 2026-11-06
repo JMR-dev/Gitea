@@ -59,6 +59,9 @@ import (
 const (
 	// Namespace holds both runners.
 	Namespace = "gitea-runner"
+	// ContainerName is every runner pod's runner container. package telemetry's
+	// log sink allows this name alone.
+	ContainerName = "runner"
 	// JobsNamespace holds the pod runner's job pods and nothing else. It is
 	// the only namespace the pod runner's API token can touch, and it does not
 	// admit privileged pods.
@@ -682,6 +685,10 @@ func grantToken(
 
 // runnerYAML renders the parts of config.yaml both runners share. Keys are from
 // the v5.1.0 config.example.yaml; anything not set here keeps its default.
+//
+// A test pins log.level at info: that job output stays out of the runners' own
+// log, and so out of package telemetry's sink, was measured at this level only
+// (docs/runners.md).
 func runnerYAML(capacity int, shutdown string, labels []string) string {
 	var lb strings.Builder
 	for _, l := range labels {
@@ -1287,7 +1294,7 @@ func statefulSet(
 
 					Containers: corev1.ContainerArray{
 						&corev1.ContainerArgs{
-							Name:  pulumi.String("runner"),
+							Name:  pulumi.String(ContainerName),
 							Image: pulumi.String(cfg.RunnerImage()),
 							// Rootless dockerd still needs a privileged container
 							// for its user namespaces and mounts -- but the daemon
@@ -1449,7 +1456,7 @@ func podsStatefulSet(
 
 					Containers: corev1.ContainerArray{
 						&corev1.ContainerArgs{
-							Name:  pulumi.String("runner"),
+							Name:  pulumi.String(ContainerName),
 							Image: pulumi.String(cfg.RunnerPodsImage()),
 							SecurityContext: &corev1.SecurityContextArgs{
 								AllowPrivilegeEscalation: pulumi.Bool(false),

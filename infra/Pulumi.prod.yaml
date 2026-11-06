@@ -108,4 +108,8 @@ config:
   gitea:fail2banIgnore:
     secure: v1:I4zpIUuQgc+d1bnk:7RtbcmBTv+01TGv3CUprnMkbkjCuySvQWgMu0Q==
   gitea:opsLaunchers: cb-image@gitea-ci-781388.iam.gserviceaccount.com
+  # Who our observability stack reads logs and metrics as: turns on
+  # infra/pkg/telemetry (docs/runners.md). cb-infra can only apply this after
+  # `make ci-up` from the same commit has given it the roles.
+  gitea:watchtowerReader: watchtower-gcp-reader@watchtower-observe.iam.gserviceaccount.com
 encryptionsalt: v1:pIXPmM64Bzc=:v1:0pkb4B2RVM5LFu2v:ZEPaG4RB9ySlpmaHkaBy8v6FQ3paHg==
