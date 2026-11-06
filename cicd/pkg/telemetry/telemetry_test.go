@@ -227,7 +227,6 @@ func TestResourcesAndAccess(t *testing.T) {
 	slices.Sort(perms)
 	if !slices.Equal(perms, []string{
 		"monitoring.metricDescriptors.list",
-		"monitoring.monitoredResourceDescriptors.list",
 		"monitoring.timeSeries.list",
 	}) {
 		t.Errorf("custom role permissions: %v", perms)

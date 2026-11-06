@@ -297,8 +297,8 @@ owner or another repo. Watchtower's pull scrubs all of them before storing anyth
 
 **The reader,** `watchtower-gcp-reader@watchtower-observe`, gets
 `roles/pubsub.subscriber` on the subscription, and on the project a custom role
-with only `monitoring.timeSeries.list`, `monitoring.metricDescriptors.list` and
-`monitoring.monitoredResourceDescriptors.list`. Not `roles/monitoring.viewer`,
+with only `monitoring.timeSeries.list` and `monitoring.metricDescriptors.list`,
+the only two calls Alloy's GCP exporter makes. Not `roles/monitoring.viewer`,
 which also reads the notification channel that holds the owner's email. The app
 project has the same set: see [runners.md](runners.md).
 

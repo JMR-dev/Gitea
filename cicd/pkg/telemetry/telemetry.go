@@ -27,11 +27,12 @@ const (
 // metricsPermissions are all the reader gets from Cloud Monitoring. Not
 // roles/monitoring.viewer: that also reads notification channels, and so the
 // owner's email. This project's operator-email channel holds exactly that
-// (package alerting).
+// (package alerting). These two are the only Cloud Monitoring calls Alloy's
+// prometheus.exporter.gcp makes (stackdriver_exporter v0.18.0 in Alloy
+// v1.21.3); check its collector before a new Alloy needs more.
 var metricsPermissions = []string{
 	"monitoring.timeSeries.list",
 	"monitoring.metricDescriptors.list",
-	"monitoring.monitoredResourceDescriptors.list",
 }
 
 // LogFilter is what the sink carries: an allow-list, so a log nobody thought

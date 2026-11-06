@@ -283,7 +283,7 @@ That holds at `log.level: info`, which a test in `infra/pkg/runner` pins. Measur
 again before moving a runner to `debug`.
 
 The reader's access here is `roles/pubsub.subscriber` on the subscription and a
-custom role with three `monitoring.*.list` permissions, as in the CI project.
+custom role with two `monitoring.*.list` permissions, as in the CI project.
 Setting it up and turning it off go in an order across the two stacks: see *Logs
 and metrics to Watchtower* in [cicd.md](cicd.md).
 
