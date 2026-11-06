@@ -163,6 +163,39 @@
     msg: "{{ caddyfile.stdout_lines[1:] }}"
   when: caddyfile is changed and ansible_diff_mode
 
+# Gitea and Caddy (on the bridge) have fixed addresses on the gitea network
+# (vars/main.yml). One that a running container holds can't be taken, and
+# until they had them, podman handed both out in turn, so either may hold the
+# other's now. When either is about to change address, Caddy stops before the
+# restarts below (site.yml's handlers), which then start Gitea, then Caddy,
+# each on its own address. Read before the quadlets change; a container that
+# isn't running holds nothing.
+- name: The containers' addresses now
+  ansible.builtin.command:
+    argv: [podman, container, inspect, "{{ item }}"]
+  loop: [gitea, caddy]
+  register: app_addresses
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Stop Caddy first if either is changing address
+  ansible.builtin.debug:
+    msg: "{{ item.item }} holds {{ app_held }} on the gitea network, not {{ app_wanted }}: Caddy stops before the restarts"
+  loop: "{{ app_addresses.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    app_held: >-
+      {{ (item.stdout | from_json | first).NetworkSettings.Networks.gitea.IPAddress | default('')
+         if item.rc == 0 and item.stdout | length > 0 else '' }}
+    app_wanted: "{{ GITEA_ADDRESS if item.item == 'gitea' else CADDY_ADDRESS }}"
+  when:
+    - app_held | length > 0
+    - app_held != app_wanted
+  changed_when: true
+  notify: container addresses changed
+
 - name: Quadlets
   ansible.builtin.template:
     src: "{{ vm_src }}/quadlets/{{ item }}"

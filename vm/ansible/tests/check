@@ -19,8 +19,8 @@ Once the goldens match, the telemetry to watchtower is checked too (not under
 --update). Everywhere, as they need nothing downloaded:
   - the watchtower peer script over made-up configs (scripts/check-peer-config.sh);
   - role tunnel's state over every case (tests/tunnel-state.yml);
-  - that the metadata guard in the ruleset names Alloy's uid
-    (scripts/check-metadata-guard.sh --static).
+  - that the metadata guard in the ruleset names Alloy's uid and Gitea's
+    address, and not Caddy's (scripts/check-metadata-guard.sh --static).
 In a PR preview, `make check` and by hand, also, failing hard:
   - `alloy fmt --test` and `alloy validate` on every fixture's rendered config;
   - its scrub rules over scripts/testdata/scrub.log and scrub.caddy.log
@@ -256,9 +256,9 @@ def telemetry_checks(mode):
         print("tunnel state: role tunnel comes to the right state in every case")
     goldens = sorted(os.listdir(os.path.join(HERE, "golden")))
     for name in goldens:
-        run(f"{name}: metadata guard", ["bash", os.path.join(ROOT, "scripts", "check-metadata-guard.sh"), "--static",
-                                        os.path.join(HERE, "golden", name, "nftables.conf.golden"),
-                                        os.path.join(HERE, "golden", name, "alloy.container.golden")])
+        run(f"{name}: metadata guard", ["bash", os.path.join(ROOT, "scripts", "check-metadata-guard.sh"), "--static"]
+            + [os.path.join(HERE, "golden", name, f + ".golden")
+               for f in ("nftables.conf", "alloy.container", "gitea.container", "caddy.container")])
 
     if mode == "deploy":
         print("tests/check: a deploy or vm-check/vm-apply: alloy fmt/validate and the scrub rules are skipped "

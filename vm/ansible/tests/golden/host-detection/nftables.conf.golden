@@ -8,7 +8,8 @@
 # rules -- silently breaking all container networking on every reload. We touch
 # exactly one table and nothing else.
 #
-# Equally deliberate: there is NO forward chain here. Netavark manages forward
+# Equally deliberate: the forward chain below has an accept policy and one
+# targeted reject, and must never get a drop policy. Netavark manages forward
 # and nat rules in its own `netavark` table. A drop-policy forward chain in this
 # table would drop container traffic regardless of what netavark allows, because
 # a packet is dropped if any chain drops it.
@@ -96,5 +97,24 @@ table inet gitea_filter {
 
 		meta skuid 473 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept comment "Alloy's DNS"
 		meta skuid 473 ip daddr 169.254.169.254 counter reject with icmpx admin-prohibited comment "Alloy, metadata server"
+	}
+
+	# Gitea keeps off the metadata server too: it faces the internet, and needs
+	# none of the VM's credentials (no cloud storage, mail or GCP API; backups,
+	# registry logins and secrets are done on the host). A bridged container's
+	# traffic is forwarded, so it comes here, from its own address before
+	# netavark's masquerade. Gitea's address is fixed (gitea.container's IP=,
+	# the same 10.89.20.250), and only it is named: Caddy needs the server
+	# for DNS-01, and so does role app's network probe, and the release engine's
+	# one-shot containers have no network at all. Gitea resolves names through
+	# aardvark-dns on the bridge gateway (input, above), which asks upstream as
+	# root on the host, so its DNS is untouched. IPv4 only: the gitea network
+	# and this VM have no IPv6.
+	#
+	# Accept policy, so it only ever takes one thing away: see the header.
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+
+		ip saddr 10.89.20.250 ip daddr 169.254.169.254 counter reject with icmpx admin-prohibited comment "Gitea, metadata server"
 	}
 }

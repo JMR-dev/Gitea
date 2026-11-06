@@ -45,6 +45,19 @@ caddy_publish_host: "# Network=host: ports are bound directly, publishing would 
 caddy_sysctl_bridge: Sysctl=net.ipv4.ip_unprivileged_port_start=0
 caddy_sysctl_host: "# Network=host: podman rejects net.* sysctls; set on the host instead."
 
+# Fixed addresses on the gitea network, .250 for Gitea and .251 for Caddy (the
+# subnet is a /24, which role preflight checks). vm/nftables/gitea.nft keeps
+# Gitea's off the metadata server (roles/firewall/vars/main.yml has the same
+# expression, and scripts/check-metadata-guard.sh checks the two agree).
+# Caddy's is fixed too, so that nothing long-lived on this network takes an
+# address from podman's round-robin allocator, which could hand Gitea's to a
+# container started while Gitea is down. Far from .2, the first address the
+# allocator gives on a fresh VM, where the network probe above takes it.
+GITEA_ADDRESS: "{{ podman_gateway | regex_replace('[0-9]+$', '250') }}"
+CADDY_ADDRESS: "{{ podman_gateway | regex_replace('[0-9]+$', '251') }}"
+CADDY_IP: "{{ caddy_ip_host if caddy_mode == 'host' else 'IP=' ~ CADDY_ADDRESS }}"
+caddy_ip_host: "# Network=host: no address on the gitea network."
+
 # Gitea calls log.Fatal when GITEA_RUNNER_REGISTRATION_TOKEN_FILE names a file
 # it cannot read, so the lines and the file come from one decision: whether
 # the file exists after the runner-token step (docs/runners.md).

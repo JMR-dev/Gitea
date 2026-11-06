@@ -2,6 +2,10 @@
 # tests/render.yml loads this same file.
 PODMAN_SUBNET: "{{ podman_subnet }}"
 PODMAN_GATEWAY: "{{ podman_gateway }}"
+# Gitea's fixed address on the gitea network (gitea.container's IP=), which the
+# ruleset keeps off the metadata server. The same expression as in
+# roles/app/vars/main.yml; scripts/check-metadata-guard.sh checks the two agree.
+GITEA_ADDRESS: "{{ podman_gateway | regex_replace('[0-9]+$', '250') }}"
 # One config value drives both halves: the WAF only blocks in On, and only then
 # is it safe to escalate a WAF verdict into an nftables ban.
 CORAZA_JAIL_ENABLED: "{{ 'true' if waf_mode == 'On' else 'false' }}"

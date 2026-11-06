@@ -24,6 +24,10 @@ AutoUpdate=registry
 PodmanArgs=--authfile=/etc/containers/ar-auth.json
 Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
 Network=host
+# On the bridge, a fixed address, so that it never takes Gitea's from podman's
+# allocator while Gitea is down (gitea.container). Caddy keeps the metadata
+# server: the DNS-01 plugin's credentials come from it.
+# Network=host: no address on the gitea network.
 LogDriver=journald
 
 # Network=host: ports are bound directly, publishing would be invalid.

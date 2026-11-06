@@ -55,11 +55,15 @@
       - image_caddy | length > 0
       - podman_subnet | length > 0
       - podman_gateway | length > 0
+      # A /24 and its .1, as infra/pkg/compute writes them: role app puts Gitea
+      # and Caddy at .250 and .251 of it.
+      - podman_subnet is match('^([0-9]{1,3}[.]){3}0/24$')
+      - podman_gateway == (podman_subnet | regex_replace('0/24$', '1'))
       - waf_mode in ['On', 'DetectionOnly', 'Off']
     fail_msg: >-
       instance metadata is incomplete or invalid (domain, gcp-project, ar-host,
-      image-gitea, image-caddy, podman-subnet, podman-gateway, and waf-mode one
-      of On, DetectionOnly, Off) -- infra/pkg/compute sets these
+      image-gitea, image-caddy, podman-subnet a /24 and podman-gateway its .1,
+      and waf-mode one of On, DetectionOnly, Off) -- infra/pkg/compute sets these
     quiet: true
 
 # A VM whose startup script is vm/bootstrap.sh configures itself at every

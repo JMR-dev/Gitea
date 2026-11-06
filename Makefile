@@ -58,12 +58,13 @@ ansible-check: ## Lint, syntax-check and golden-test the playbook (vm/ansible)
 	python3 -c 'import os, sys, argparse; sys.path[:0] = ["scripts/cicd", "scripts/ops"]; import infra_deploy as D; \
 		D.Deploy(argparse.Namespace(mode="check", state_bucket="")).ansible_checks(os.getcwd())'
 
-# The metadata guard, live: vm/nftables/gitea.nft as rendered, loaded in a
-# throwaway user and network namespace, probed as Alloy's uid and others.
-# tests/check checks only that the rule and the quadlet agree, as the deploy
-# image has no nft and no namespaces. Needs unshare, setpriv, nft, ip, python3.
+# The metadata guard, live: vm/nftables/gitea.nft as rendered, loaded in
+# throwaway user and network namespaces, probed as Alloy's uid and others, and
+# forwarded from Gitea's address, Caddy's and others. tests/check checks only
+# that the rules and the quadlets agree, as the deploy image has no nft and no
+# namespaces. Needs unshare, nsenter, setpriv, nft, ip, python3.
 .PHONY: check-metadata-guard
-check-metadata-guard: ## Load the ruleset in a namespace and check Alloy's uid can't reach the metadata server
+check-metadata-guard: ## Load the ruleset in namespaces and check Alloy and Gitea can't reach the metadata server
 	scripts/check-metadata-guard.sh
 
 # After changing a templated file or a variable: re-render the goldens with the

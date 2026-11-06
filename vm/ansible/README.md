@@ -45,7 +45,8 @@ Once the goldens match, `tests/check` also runs the telemetry checks:
 - everywhere: `scripts/check-peer-config.sh` over the peer script,
   `tests/tunnel-state.yml` over role tunnel's states, and
   `scripts/check-metadata-guard.sh --static`, which checks that the ruleset's
-  metadata guard names the uid `alloy.container` runs as;
+  metadata guard names the uid `alloy.container` runs as and the address
+  `gitea.container` has, and nothing of Caddy's;
 - in a PR preview, `make check` and by hand, failing hard: `alloy fmt --test`
   and `alloy validate` on every rendered `config.alloy`, and its scrub rules
   over `scripts/testdata/scrub.log` and `scrub.caddy.log`
@@ -56,8 +57,9 @@ Once the goldens match, `tests/check` also runs the telemetry checks:
   `infra_deploy.py` was run with (`run_mode()`); `GITEA_CHECK_MODE=strict` or
   `deploy` decides instead.
 
-`make check` also loads the ruleset in a throwaway namespace and probes the
-metadata server as Alloy's uid and others (`make check-metadata-guard`). A new
+`make check` also loads the ruleset in throwaway namespaces and probes the
+metadata server as Alloy's uid and others, and forwarded from Gitea's address,
+Caddy's and others (`make check-metadata-guard`). A new
 scrub rule gets fixture lines in `scripts/testdata`: `keep:`/`same:`/`drop:`
 tagged, made up, and anything that must never ship in `scrub.forbidden`.
 

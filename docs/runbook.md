@@ -559,6 +559,20 @@ make vm-apply      # apply it
 If app.ini was not rendered, the run fails saying which Gitea secret was
 unavailable -- check `gcloud secrets versions list gitea-internal-token`.
 
+### Gitea or Caddy won't start: "requested ip address … is already allocated"
+
+Gitea and Caddy (on the bridge) have fixed addresses on the gitea network,
+`.250` and `.251` of the podman subnet (`IP=` in their quadlets; the ruleset
+keeps Gitea's off the metadata server). Nothing else long-lived joins that
+network, and podman forgets its leases at a reboot, so this should not happen.
+If something started there by hand holds one, find and remove it:
+
+```bash
+sudo podman ps -a --filter network=gitea --format '{{.Names}} {{.Networks}}'
+sudo podman inspect <name> --format '{{.NetworkSettings.Networks.gitea.IPAddress}}'
+sudo podman rm -f <name> && sudo systemctl start gitea caddy
+```
+
 ### Telemetry to watchtower
 
 The VM ships its journal and its metrics to watchtower (our Loki and Mimir,
@@ -594,12 +608,16 @@ through it. Labels `service="gitea"`, `host="gitea-vm"`, `env="production"`.
 - **Nothing comes in over the tunnel:** `vm/nftables/gitea.nft` drops anything
   on `wg-watchtower` that isn't a reply, at prerouting (before the containers'
   DNAT) and in input.
-- **Alloy can't reach the metadata server** but for DNS: the ruleset's output
+- **Alloy and the Gitea container can't reach the metadata server**, so
+  neither, compromised, can take `gitea-vm@`'s token. The ruleset's output
   chain rejects uid 473 (Alloy, `User=473` on the host network) to
-  169.254.169.254, so a compromised Alloy can't take `gitea-vm@`'s token.
-  Every other uid is untouched (Caddy on the host network needs the server for
-  DNS-01). `make check-metadata-guard` proves it in a namespace; a refusal on
-  the VM shows in `sudo nft list chain inet gitea_filter output`'s counter.
+  169.254.169.254 but for DNS. Its forward chain rejects the Gitea container's
+  fixed address on the gitea network (`.250` of the podman subnet,
+  `gitea.container`'s `IP=`). Nothing else is touched: Caddy needs the server
+  for DNS-01, on the bridge (fixed at `.251`) or the host network, and so does
+  role app's network probe. `make check-metadata-guard` proves both in
+  namespaces; a refusal on the VM shows in the counters of
+  `sudo nft list chain inet gitea_filter output` and `… forward`.
 - **Never a failed deploy:** a start that fails and the deploy check (Alloy's
   `/-/ready`, then a handshake within 2 minutes) only warn. A change to Alloy
   or the tunnel restarts only them, never Gitea or Caddy.
