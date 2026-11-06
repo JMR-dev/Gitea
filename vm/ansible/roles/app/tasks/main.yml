@@ -7,6 +7,31 @@
     state: directory
   loop: [/etc/gitea, /etc/caddy, /etc/containers/systemd]
 
+# Coraza's audit log (the Caddyfile's SecAuditLog) holds whole requests, so it
+# stays on this host, in a directory only Caddy's user (1000, the image's and
+# the quadlet's) can read, relabelled for the container by the quadlet's :Z,
+# and rotated by logrotate. Never the journal, which role logship ships. Before
+# the Caddyfile and the quadlet, so Caddy never restarts without it.
+- name: Caddy's audit log directory
+  ansible.builtin.file:
+    path: /var/log/caddy
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0700"
+
+- name: Rotate the audit log
+  ansible.builtin.copy:
+    src: "{{ vm_src }}/logrotate/coraza-audit"
+    dest: /etc/logrotate.d/coraza-audit
+    mode: "0644"
+
+- name: logrotate runs daily
+  ansible.builtin.systemd_service:
+    name: logrotate.timer
+    enabled: true
+    state: started
+
 # Pulled here, on a VM that has neither, so the network probe below can run on
 # the very first pass; normally the quadlets and podman-auto-update pull.
 - name: Images present?
@@ -137,6 +162,39 @@
   ansible.builtin.debug:
     msg: "{{ caddyfile.stdout_lines[1:] }}"
   when: caddyfile is changed and ansible_diff_mode
+
+# Gitea and Caddy (on the bridge) have fixed addresses on the gitea network
+# (vars/main.yml). One that a running container holds can't be taken, and
+# until they had them, podman handed both out in turn, so either may hold the
+# other's now. When either is about to change address, Caddy stops before the
+# restarts below (site.yml's handlers), which then start Gitea, then Caddy,
+# each on its own address. Read before the quadlets change; a container that
+# isn't running holds nothing.
+- name: The containers' addresses now
+  ansible.builtin.command:
+    argv: [podman, container, inspect, "{{ item }}"]
+  loop: [gitea, caddy]
+  register: app_addresses
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Stop Caddy first if either is changing address
+  ansible.builtin.debug:
+    msg: "{{ item.item }} holds {{ app_held }} on the gitea network, not {{ app_wanted }}: Caddy stops before the restarts"
+  loop: "{{ app_addresses.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    app_held: >-
+      {{ (item.stdout | from_json | first).NetworkSettings.Networks.gitea.IPAddress | default('')
+         if item.rc == 0 and item.stdout | length > 0 else '' }}
+    app_wanted: "{{ GITEA_ADDRESS if item.item == 'gitea' else CADDY_ADDRESS }}"
+  when:
+    - app_held | length > 0
+    - app_held != app_wanted
+  changed_when: true
+  notify: container addresses changed
 
 - name: Quadlets
   ansible.builtin.template:

@@ -1,0 +1,12 @@
+# Rendered by the playbook (vm/ansible, role logship) into /etc/containers/systemd/
+#
+# Alloy's storage path: the journal cursor and the metrics WAL. Kept across
+# restarts and tunnel outages, so shipping resumes where it stopped instead of
+# dropping or re-sending lines. It stays when telemetry is turned off, so it
+# picks up where it left off when a peer comes back.
+[Unit]
+Description=Grafana Alloy storage
+
+[Volume]
+VolumeName=alloy-data
+Label=app=gitea

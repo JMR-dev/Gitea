@@ -1,0 +1,128 @@
+# This VM as watchtower's agent peer gitea-vm (watchtower-observability-stack,
+# docs/client-telemetry.md): a split WireGuard tunnel, wg-watchtower, to
+# 10.8.0.0/24 only, dialled out to the hub. Alloy (role logship) pushes the
+# journal and metrics through it. Nothing comes in over it: vm/nftables drops
+# anything on wg-watchtower that isn't a reply.
+#
+# The peer config holds this VM's WireGuard private key. It is fetched, checked
+# and installed on the VM by files/gitea-watchtower-peer, as the VM's own
+# service account (gitea-vm@, the one identity granted the secret), the way
+# role app renders app.ini with gitea-render-secrets: it never reaches the
+# machine running Ansible, this run's output or its -vvv log. The secret's
+# name is instance metadata watchtower-peer-secret (gitea:watchtowerPeerSecret,
+# read by role preflight); the rehearsal VM never has it.
+#
+# What each state does here and in role logship (the script's first word):
+#   up    a config that passed the checks: installed, the tunnel enabled and
+#         started (restarted when the config changed), Alloy rendered and started
+#   off   no metadata: nothing configured, so nothing runs; anything left from
+#         before is stopped and removed
+#   down  the secret, or its latest version, is missing, or its value is empty:
+#         a warning, then the same as off
+#   keep  anything else (the network, Secret Manager, the token,
+#         PERMISSION_DENIED, a config refused by the checks, wireguard-tools not
+#         installable): a warning, and nothing changes, so a bad moment in
+#         Secret Manager never stops the logs. A deleted secret reads as denied
+#         to gitea-vm@ (its access is granted on the secret), so it lands here
+#         too: to revoke this peer, delete its client in wg-easy.
+#
+# Telemetry never fails a deploy: every start and stop below only warns, and
+# role logship's deploy check is warn-only.
+
+- name: WireGuard tools
+  ansible.builtin.dnf:
+    name: wireguard-tools
+    state: present
+    lock_timeout: 600
+  register: tunnel_dnf
+  failed_when: false
+  when: watchtower_peer_secret | length > 0
+
+# Asked of rpm rather than read off the dnf result, which has no one field
+# that says so in every way it can fail. Under --check nothing was installed,
+# so a missing package there is not a reason to keep.
+- name: Are they there?
+  ansible.builtin.command: rpm -q --quiet wireguard-tools
+  register: tunnel_tools
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - watchtower_peer_secret | length > 0
+    - not ansible_check_mode
+
+# no_log: the script prints only its state and a reason in words of its own,
+# but it handles the private key, so nothing of this task is shown at any
+# verbosity. check_mode false: under --check it still reads and checks, and
+# installs nothing (it is passed --check), as gitea-render-secrets does.
+- name: The peer config, fetched, checked and installed on the VM
+  ansible.builtin.script:
+    cmd: >-
+      gitea-watchtower-peer {{ '--check' if ansible_check_mode else '' }}
+      {{ watchtower_peer_secret | quote }}
+  register: tunnel_peer
+  changed_when: (tunnel_peer.stdout_lines | default([], true) + [''])[0] in ['up changed', 'up would-change']
+  failed_when: false
+  check_mode: false
+  no_log: true
+  when:
+    - watchtower_peer_secret | length > 0
+    - tunnel_tools.rc | default(0) == 0
+  notify: watchtower tunnel changed
+
+- name: The tunnel's state
+  ansible.builtin.import_tasks: state.yml
+
+- name: Warn that there is no peer
+  ansible.builtin.debug:
+    msg: >-
+      WARN: {{ watchtower_peer_secret }} is missing or empty: watchtower telemetry is off, and the
+      tunnel and Alloy are stopped and their config removed. Gitea is unaffected.
+  when: tunnel_state == 'down'
+
+- name: Say that no peer is configured
+  ansible.builtin.debug:
+    msg: "no watchtower-peer-secret metadata (gitea:watchtowerPeerSecret unset): no tunnel and no telemetry"
+  when: tunnel_state == 'off'
+
+- name: Warn that the tunnel and Alloy are left as they are
+  ansible.builtin.debug:
+    msg: "WARN: watchtower telemetry left as it is: {{ tunnel_why }}"
+  when: tunnel_state == 'keep'
+
+# Not under --check: a first deploy installed nothing, so the unit's config
+# isn't there to start.
+- name: The tunnel up, and at every boot
+  ansible.builtin.systemd_service:
+    name: wg-quick@wg-watchtower.service
+    enabled: true
+    state: started
+  register: tunnel_start
+  failed_when: false
+  when:
+    - tunnel_state == 'up'
+    - not ansible_check_mode
+
+- name: Warn when the tunnel won't start
+  ansible.builtin.debug:
+    msg: "WARN: wg-quick@wg-watchtower did not start: {{ tunnel_start.msg | default('') }} -- see: journalctl -u wg-quick@wg-watchtower"
+  when:
+    - tunnel_start is not skipped
+    - tunnel_start.state | default('') != 'started'
+
+- name: No peer, no tunnel
+  ansible.builtin.systemd_service:
+    name: wg-quick@wg-watchtower.service
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: tunnel_state in ['off', 'down']
+
+- name: No peer, no tunnel config
+  ansible.builtin.file:
+    path: /etc/wireguard/wg-watchtower.conf
+    state: absent
+  when: tunnel_state in ['off', 'down']
+
+- name: Apply tunnel changes now
+  ansible.builtin.meta: flush_handlers

@@ -1,0 +1,17 @@
+# One case of tests/tunnel-state.yml: role tunnel's state tasks with this
+# case's made-up results, then what they came to.
+- name: Role tunnel's state tasks
+  ansible.builtin.include_tasks: ../roles/tunnel/tasks/state.yml
+  vars:
+    watchtower_peer_secret: "{{ case.secret }}"
+    tunnel_dnf: "{{ case.dnf }}"
+    tunnel_tools: "{{ case.tools }}"
+    tunnel_peer: "{{ case.peer }}"
+
+- name: The state and the reason
+  ansible.builtin.assert:
+    that:
+      - tunnel_state == case.state
+      - tunnel_why == case.why
+    fail_msg: "{{ case.what }}: came to {{ tunnel_state }} ({{ tunnel_why }}), want {{ case.state }} ({{ case.why }})"
+    success_msg: "{{ case.what }}: {{ tunnel_state }}"

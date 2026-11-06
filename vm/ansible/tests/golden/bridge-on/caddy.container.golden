@@ -24,15 +24,25 @@ AutoUpdate=registry
 PodmanArgs=--authfile=/etc/containers/ar-auth.json
 Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
 Network=gitea.network
+# On the bridge, a fixed address, so that it never takes Gitea's from podman's
+# allocator while Gitea is down (gitea.container). Caddy keeps the metadata
+# server: the DNS-01 plugin's credentials come from it.
+IP=10.89.10.251
 LogDriver=journald
 
 PublishPort=80:80
 PublishPort=443:443
 PublishPort=443:443/udp
+PublishPort=127.0.0.1:2020:2020
 
 Volume=/etc/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,Z
 Volume=caddy-data.volume:/data
 Volume=caddy-config.volume:/config
+# Coraza's audit log (SecAuditLog in the Caddyfile): whole requests, so a file
+# on this host, never the journal. The playbook (role app) creates the
+# directory (uid 1000, 0700, so nothing else reads it) and installs its
+# logrotate config (vm/logrotate/coraza-audit).
+Volume=/var/log/caddy:/var/log/caddy:Z
 
 User=1000:1000
 # Caddy binds 80/443 as a non-root user. On the bridge this is a container-local

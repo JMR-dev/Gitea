@@ -1,0 +1,81 @@
+# Rendered by the playbook (vm/ansible, role logship) into /etc/containers/systemd/
+#
+# Grafana Alloy: ships this host's journal (every unit, Gitea and Caddy
+# included, LogDriver=journald) and its metrics -- the host's, Caddy's, Gitea's
+# own, Alloy's and a probe of the public health URL -- to watchtower's Loki and
+# Mimir, through the watchtower WireGuard tunnel (wg-quick@wg-watchtower, role
+# tunnel). Config: vm/config/config.alloy.tmpl, rendered to
+# /etc/gitea/alloy/config.alloy.
+#
+# Not part of Gitea: role logship installs it, and restarts it through a handler
+# of its own, never with Gitea or Caddy, and a change here never restarts them.
+[Unit]
+Description=Grafana Alloy (journal and metrics -> watchtower)
+# No tunnel, no Alloy: watchtower.jasonmross.dev resolves to 10.8.0.1, which
+# exists only inside the tunnel. Without a peer (gitea:watchtowerPeerSecret
+# unset, or its secret missing or empty) roles tunnel and logship remove the
+# tunnel config and this unit; this keeps it from starting at a boot should the
+# tunnel config go missing anyway.
+ConditionPathExists=/etc/wireguard/wg-watchtower.conf
+Wants=wg-quick@wg-watchtower.service network-online.target
+After=wg-quick@wg-watchtower.service network-online.target
+
+[Container]
+ContainerName=alloy
+# Tag plus digest (the multi-arch index), the release watchtower's contract
+# pins. No AutoUpdate=, so podman-auto-update leaves it alone; bump it by hand
+# (roles/logship/vars/main.yml).
+Image=${ALLOY_IMAGE}
+# The host's network, so pushes route through the tunnel interface, and
+# Caddy's metrics (127.0.0.1:2020) and Gitea's (127.0.0.1:3000) are on
+# loopback in either Caddy mode. Alloy's own UI listens on 127.0.0.1:12345 only
+# (Exec= below), and nothing else.
+Network=host
+LogDriver=journald
+Exec=run /etc/alloy/config.alloy --storage.path=/var/lib/alloy/data --server.http.listen-addr=127.0.0.1:12345 --disable-reporting
+
+Volume=/etc/gitea/alloy/config.alloy:/etc/alloy/config.alloy:ro
+# The journal cursor and the WAL, so a restart or a tunnel outage resumes
+# where shipping stopped.
+Volume=alloy-data.volume:/var/lib/alloy/data
+# The persistent journal (role base), read-only. EL keeps its files 0640
+# root:systemd-journal, so the image's own non-root user plus that one group
+# can read them.
+Volume=/var/log/journal:/var/log/journal:ro
+Volume=/etc/machine-id:/etc/machine-id:ro
+# The host's view for prometheus.exporter.unix, read-only. Root-only files
+# stay unreadable: Alloy runs as uid 473 with no capabilities, and app.ini
+# (0400, uid 1000), /var/lib/gitea (0750, uid 1000), the Coraza audit log
+# (/var/log/caddy, 0700, uid 1000) and /etc/wireguard (0700, root) are closed
+# to it. rslave: a mount the host makes after Alloy starts shows up here too.
+Volume=/proc:/host/proc:ro
+Volume=/sys:/host/sys:ro
+Volume=/:/host/root:ro,rslave
+# vm/nftables/gitea.nft keeps this uid off the metadata server, which relies
+# on User=473, the host network and no UserNS= here (vm/ansible/tests/check
+# and scripts/check-metadata-guard.sh check all three).
+User=473
+GroupAdd=${JOURNAL_GID}
+# A confined container cannot read the host journal (container_t has no
+# access to var_log_t); the same exception the blog, SilverBullet and
+# watchtower make for their log shippers.
+SecurityLabelDisable=true
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+
+# An e2-small has 2 GB, and Gitea's git subprocesses need most of it during a
+# push (docs/runbook.md, "Memory on a 2 GB instance"): an OOM kills Alloy, not
+# Gitea. The Go heap target sits under the cap so the collector frees memory
+# before the kernel steps in.
+PodmanArgs=--memory=256m
+Environment=GOMEMLIMIT=200MiB
+
+[Service]
+Restart=always
+RestartSec=30
+# The first start pulls the image, if role logship's pull didn't.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

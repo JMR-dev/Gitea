@@ -97,14 +97,18 @@ CRS will flag some of it.
    ```
    Every warn line ends with `[unique_id "..."]`, which matches
    `.transaction.id` in the JSON audit record — that is how you get the full
-   request for one event:
+   request for one event. The audit records are in a file on the VM,
+   `/var/log/caddy/coraza-audit.log`, rotated daily and kept two weeks
+   (`vm/logrotate/coraza-audit`), never in the journal, which goes to
+   watchtower: a record holds whole requests, cookies and bodies.
    ```bash
-   sudo journalctl CONTAINER_NAME=caddy | grep '"transaction"' \
+   sudo cat /var/log/caddy/coraza-audit.log \
      | jq --arg id '<unique_id>' 'select(.transaction.id==$id)'
    ```
-   Once `wafMode` is `On`, confirmed blocks are simply:
+   Older days are `coraza-audit.log.1` and `coraza-audit.log.<n>.gz`
+   (`zcat`). Once `wafMode` is `On`, confirmed blocks are simply:
    ```bash
-   sudo journalctl CONTAINER_NAME=caddy | grep '"transaction"' \
+   sudo cat /var/log/caddy/coraza-audit.log \
      | jq -c 'select(.transaction.is_interrupted) | {ip:.transaction.client_ip, uri:.transaction.request.uri}'
    ```
    **Gitea 28 replaced Server-Sent Events with a WebSocket** for live updates
@@ -135,7 +139,8 @@ Use ids in the 1,000,000+ range — CRS reserves everything below.
 
 ## Reading the logs
 
-Coraza emits two shapes, both to journald via the `caddy` container:
+Coraza emits two shapes, both to journald via the `caddy` container (its
+audit records go to a file instead, below):
 
 **Individual rule matches** — one per rule, noisy, informational:
 
@@ -173,7 +178,8 @@ audit JSON.
 |---|---|---|
 | `SecResponseBodyAccess` | `Off` | Inspecting responses on a git host costs CPU and catches nothing worth catching. |
 | `SecRequestBodyLimitAction` | `ProcessPartial` | Truncate and inspect rather than reject: a large but legitimate attachment should not 413 because the WAF gave up. |
-| `SecAuditEngine` | `RelevantOnly` | Auditing every request would pour full request volume into journald and then Cloud Logging. |
+| `SecAuditEngine` | `RelevantOnly` | Auditing every request would pour full request volume into the audit log. |
+| `SecAuditLog` | `/var/log/caddy/coraza-audit.log` | A record holds the whole request, cookies and bodies included, so it stays on the VM (rotated daily, two weeks), never in the journal that Alloy ships to watchtower. |
 | `SecAuditLogRelevantStatus` | `^(?:5[0-9]{2}|403)$` | The CRS default audits every `401`, and unauthenticated API and web probes generate those constantly on a public host. Narrowed to real refusals and server errors. |
 
 Note that `RelevantOnly` still audits any transaction that trips a rule,

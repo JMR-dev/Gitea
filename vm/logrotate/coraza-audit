@@ -1,0 +1,17 @@
+# Installed by the playbook (vm/ansible, role app) as /etc/logrotate.d/coraza-audit.
+#
+# Coraza's audit log (SecAuditLog in vm/config/Caddyfile.tmpl): whole requests,
+# kept on this host for two weeks, for the WAF tuning in docs/waf.md.
+# copytruncate: Caddy holds the file open and has no signal to reopen it, and
+# Coraza appends (O_APPEND), so its next write after the truncate lands at the
+# start of the emptied file. No `su`: the directory is uid 1000's and 0700,
+# which logrotate accepts as root.
+/var/log/caddy/coraza-audit.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -30,24 +30,42 @@ fmt: ## Format Go sources
 
 # -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
-# Shell that runs on the VM (shipped by the playbook) or for it.
+# Shell that runs on the VM (shipped by the playbook) or for it, and the
+# telemetry checks' own.
 SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh scripts/rehearsal.sh \
 	vm/ansible/roles/app/files/gitea-render-secrets vm/ansible/roles/helpers/files/gitea-ar-auth \
-	vm/ansible/roles/helpers/files/gitea-reboot-if-needed
+	vm/ansible/roles/helpers/files/gitea-reboot-if-needed vm/ansible/roles/tunnel/files/gitea-watchtower-peer \
+	scripts/check-alloy-scrub.sh scripts/check-peer-config.sh scripts/check-metadata-guard.sh
 .PHONY: check
-check: ci-check ansible-check ## Build and vet both Pulumi programs and the relay, test them, and check the scripts and the playbook
+check: ci-check ansible-check check-metadata-guard ## Build and vet both Pulumi programs and the relay, test them, and check the scripts and the playbook
 	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/runner ./pkg/telemetry
-	bash -n $(SHELL_SCRIPTS)
+	@# One file at a time: `bash -n a b` parses a and hands it b as an argument.
+	for f in $(SHELL_SCRIPTS); do bash -n "$$f" || exit 1; done
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
-	@command -v shellcheck >/dev/null && shellcheck -S warning $(SHELL_SCRIPTS) || echo "shellcheck not installed -- skipped"
+	@# if/else, not `a && b || c`: that reports "not installed" and exits 0 when
+	@# shellcheck runs and finds something, so the check could never fail.
+	@if command -v shellcheck >/dev/null; then shellcheck -S warning $(SHELL_SCRIPTS); \
+	else echo "shellcheck not installed -- skipped"; fi
 
 # The checks a PR preview and a deploy run on vm/ansible (infra_deploy.py's
 # ansible_checks), with the pinned ansible-core: no nftables restart/reload,
-# a syntax check, and the golden renders (vm/ansible/tests/check).
+# a syntax check, the golden renders, and the telemetry checks
+# (vm/ansible/tests/check). Here, as in a PR preview, those include `alloy fmt`
+# and `alloy validate` and the scrub fixture, with Alloy and jq downloaded
+# pinned by sha256; a deploy and vm-check/vm-apply skip those three.
 .PHONY: ansible-check
 ansible-check: ## Lint, syntax-check and golden-test the playbook (vm/ansible)
 	python3 -c 'import os, sys, argparse; sys.path[:0] = ["scripts/cicd", "scripts/ops"]; import infra_deploy as D; \
 		D.Deploy(argparse.Namespace(mode="check", state_bucket="")).ansible_checks(os.getcwd())'
+
+# The metadata guard, live: vm/nftables/gitea.nft as rendered, loaded in
+# throwaway user and network namespaces, probed as Alloy's uid and others, and
+# forwarded from Gitea's address, Caddy's and others. tests/check checks only
+# that the rules and the quadlets agree, as the deploy image has no nft and no
+# namespaces. Needs unshare, nsenter, setpriv, nft, ip, python3.
+.PHONY: check-metadata-guard
+check-metadata-guard: ## Load the ruleset in namespaces and check Alloy and Gitea can't reach the metadata server
+	scripts/check-metadata-guard.sh
 
 # After changing a templated file or a variable: re-render the goldens with the
 # pinned ansible-core, then review `git diff vm/ansible/tests/golden` -- the

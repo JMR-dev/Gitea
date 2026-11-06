@@ -146,6 +146,15 @@ func New(
 		}
 		metadata["runner-egress-ip"] = v
 	}
+	// The watchtower peer's secret, by its resource name in watchtower's
+	// project; the playbook (role tunnel) reads the peer config itself, on the
+	// VM, as this VM's service account. Left out when unset, and so off the
+	// rehearsal VM, which copies this VM's metadata less this key
+	// (scripts/rehearsal.sh): without it the VM takes the tunnel and Alloy
+	// down. Metadata changes in place.
+	if cfg.WatchtowerPeerSecret != "" {
+		metadata["watchtower-peer-secret"] = pulumi.String(cfg.WatchtowerPeerSecret)
+	}
 
 	vm, err := gcpcompute.NewInstance(ctx, "gitea-vm", &gcpcompute.InstanceArgs{
 		Name:        pulumi.String("gitea-vm"),

@@ -16,6 +16,7 @@
 #     new project), the image repository, and in --legacy the config bucket;
 #   - domain rehearsal.invalid, so Caddy never gets a certificate and no DNS
 #     record is touched, and no backup bucket;
+#   - no watchtower-peer-secret, so no tunnel to watchtower and no Alloy;
 #   - a blank 10 GB data disk, never prod data;
 #   - a network tag of its own that opens only SSH from IAP -- prod's tag
 #     would also open 80/443/2222 to the internet.
@@ -87,7 +88,9 @@ up() {
 import json, os, sys
 md = sys.argv[1]
 items = {i["key"]: i.get("value", "") for i in json.load(sys.stdin)["metadata"].get("items", [])}
-for k in ("startup-script", "config-hash"):
+# watchtower-peer-secret: the rehearsal must never join the watchtower VPN as
+# the prod peer (its account cannot read the secret anyway).
+for k in ("startup-script", "config-hash", "watchtower-peer-secret"):
     items.pop(k, None)
 items.update({"domain": "rehearsal.invalid", "backup-bucket": "", "gitea-secret-prefix": "gitea-rehearsal"})
 for k, v in items.items():

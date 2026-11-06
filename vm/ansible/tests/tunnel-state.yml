@@ -1,0 +1,104 @@
+# Runs roles/tunnel/tasks/state.yml over every case role tunnel can meet, with
+# made-up results for the tasks before it (the dnf install, the rpm check, the
+# peer script), and checks the state and the reason each comes to. Only no
+# metadata, or the script's own "down", may take telemetry down; anything the
+# script didn't say cleanly must be keep, which leaves it running. Runs on
+# localhost and touches nothing; tests/check runs it.
+- name: The tunnel's state, case by case
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    secret: projects/example-observe/secrets/wireguard-example-peer
+    skipped: {skipped: true, changed: false}
+    installed: {changed: false, rc: 0}
+    there: {changed: false, rc: 0}
+    cases:
+      - what: no metadata
+        secret: ""
+        dnf: "{{ skipped }}"
+        tools: "{{ skipped }}"
+        peer: "{{ skipped }}"
+        state: "off"
+        why: ""
+      - what: a first config
+        secret: "{{ secret }}"
+        dnf: {changed: true, rc: 0}
+        tools: "{{ there }}"
+        peer: {rc: 0, stdout_lines: [up changed]}
+        state: up
+        why: ""
+      - what: the same config again
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer: {rc: 0, stdout_lines: [up unchanged]}
+        state: up
+        why: ""
+      # Under --check the rpm check doesn't run, and the script says would-change.
+      - what: check mode, a config to install
+        secret: "{{ secret }}"
+        dnf: {changed: true}
+        tools: "{{ skipped }}"
+        peer: {rc: 0, stdout_lines: [up would-change]}
+        state: up
+        why: ""
+      - what: the secret missing or empty
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer: {rc: 0, stdout_lines: [down]}
+        state: down
+        why: ""
+      - what: permission denied
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer:
+          rc: 0
+          stdout_lines: ["keep could not read {{ secret }}: permission denied (a deleted secret reads like this too)"]
+        state: keep
+        why: "could not read {{ secret }}: permission denied (a deleted secret reads like this too)"
+      - what: a refused config
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer: {rc: 0, stdout_lines: ["keep the peer config failed its checks"]}
+        state: keep
+        why: the peer config failed its checks
+      - what: wireguard-tools not installable
+        secret: "{{ secret }}"
+        dnf: {changed: false, msg: No package wireguard-tools available.}
+        tools: {changed: false, rc: 1}
+        peer: "{{ skipped }}"
+        state: keep
+        why: wireguard-tools is not installable (No package wireguard-tools available.)
+      - what: the script failed
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer: {rc: 2, stdout_lines: []}
+        state: keep
+        why: the peer script failed (rc 2)
+      - what: the script said nothing
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer: {rc: 0, stdout_lines: []}
+        state: keep
+        why: the peer script gave no answer this playbook knows
+      - what: the script said something else
+        secret: "{{ secret }}"
+        dnf: "{{ installed }}"
+        tools: "{{ there }}"
+        peer: {rc: 0, stdout_lines: [upside down]}
+        state: keep
+        why: the peer script gave no answer this playbook knows
+  tasks:
+    - name: One case
+      ansible.builtin.include_tasks: tunnel-state-case.yml
+      loop: "{{ cases }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.what }}"

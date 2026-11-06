@@ -8,7 +8,8 @@
 # rules -- silently breaking all container networking on every reload. We touch
 # exactly one table and nothing else.
 #
-# Equally deliberate: there is NO forward chain here. Netavark manages forward
+# Equally deliberate: the forward chain below has an accept policy and one
+# targeted reject, and must never get a drop policy. Netavark manages forward
 # and nat rules in its own `netavark` table. A drop-policy forward chain in this
 # table would drop container traffic regardless of what netavark allows, because
 # a packet is dropped if any chain drops it.
@@ -25,12 +26,29 @@ table inet gitea_filter
 delete table inet gitea_filter
 
 table inet gitea_filter {
+	# The watchtower tunnel (wg-watchtower, vm/ansible role tunnel) is outbound
+	# only: Alloy pushes through it, and nothing may come in over it but the
+	# replies. Without these, the rules below that name no interface would take
+	# ICMP, and 80, 443 and 2222 on the host network, from the tunnel too, and a
+	# connection DNAT'd to a container (Gitea's 2222, Caddy on the bridge)
+	# never reaches input at all. So new connections from it are dropped here,
+	# at prerouting, before netavark's DNAT (dstnat, -100) and after conntrack
+	# (-200), and in input as well, in case this chain is ever lost. iifname,
+	# not iif: the interface exists only while the tunnel is up.
+	chain prerouting {
+		type filter hook prerouting priority -150; policy accept;
+
+		iifname "wg-watchtower" ct state established,related accept comment "replies to Alloy"
+		iifname "wg-watchtower" counter drop comment "nothing comes in over the watchtower tunnel"
+	}
+
 	chain input {
 		type filter hook input priority filter; policy drop;
 
 		iif "lo" accept comment "loopback"
 		ct state established,related accept
 		ct state invalid drop
+		iifname "wg-watchtower" counter drop comment "nothing comes in over the watchtower tunnel"
 
 		meta l4proto icmp accept comment "IPv4 ICMP"
 		meta l4proto ipv6-icmp accept comment "IPv6 ICMP / NDP"
@@ -59,5 +77,44 @@ table inet gitea_filter {
 
 		# Rate-limited logging so a scan cannot fill the disk via journald.
 		limit rate 5/minute burst 10 packets log prefix "nft-drop-in: " level info
+	}
+
+	# Alloy keeps off the metadata server, whose token is this VM's
+	# credentials (gitea-vm@: Gitea's secrets, new versions of them, the
+	# watchtower peer, dns.admin on the zone). Alloy runs on the host network
+	# (vm/quadlets/alloy.container) with no user namespace, so its packets leave
+	# through here under uid 473, and the two numbers have to stay the same:
+	# vm/ansible/tests/check and scripts/check-metadata-guard.sh check it. One
+	# uid and no more: Caddy on the host network (uid 1000) needs the server for
+	# DNS-01, and root for gcloud. A bridged container's traffic is forwarded
+	# and never comes here.
+	#
+	# The same address is GCE's resolver, the one in /etc/resolv.conf, and Alloy
+	# has to look up watchtower and this host's domain, so DNS still goes
+	# through.
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		meta skuid 473 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept comment "Alloy's DNS"
+		meta skuid 473 ip daddr 169.254.169.254 counter reject with icmpx admin-prohibited comment "Alloy, metadata server"
+	}
+
+	# Gitea keeps off the metadata server too: it faces the internet, and needs
+	# none of the VM's credentials (no cloud storage, mail or GCP API; backups,
+	# registry logins and secrets are done on the host). A bridged container's
+	# traffic is forwarded, so it comes here, from its own address before
+	# netavark's masquerade. Gitea's address is fixed (gitea.container's IP=,
+	# the same 10.89.10.250), and only it is named: Caddy needs the server
+	# for DNS-01, and so does role app's network probe, and the release engine's
+	# one-shot containers have no network at all. Gitea resolves names through
+	# aardvark-dns on the bridge gateway (input, above), which asks upstream as
+	# root on the host, so its DNS is untouched. IPv4 only: the gitea network
+	# and this VM have no IPv6.
+	#
+	# Accept policy, so it only ever takes one thing away: see the header.
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+
+		ip saddr 10.89.10.250 ip daddr 169.254.169.254 counter reject with icmpx admin-prohibited comment "Gitea, metadata server"
 	}
 }

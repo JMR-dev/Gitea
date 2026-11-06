@@ -117,7 +117,20 @@ type Config struct {
 	// this project's logs and metrics as. Unset, package telemetry creates
 	// nothing (docs/runners.md).
 	WatchtowerReader string
+
+	// WatchtowerPeerSecret names, by resource name
+	// (projects/<project>/secrets/<id>), the secret that holds this VM's
+	// WireGuard peer config for the watchtower VPN. A name, never a value:
+	// the playbook's role tunnel reads it on the VM as the VM's own service
+	// account, and Alloy ships the VM's logs and metrics through that tunnel
+	// (docs/runbook.md, "Telemetry to watchtower"). Empty means no tunnel and
+	// no Alloy.
+	WatchtowerPeerSecret string
 }
+
+// A secret's resource name, as Secret Manager writes it: a project id and a
+// secret id. The project is named, since the secret lives in watchtower's.
+var secretResourceName = regexp.MustCompile(`^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/secrets/[A-Za-z0-9_-]{1,255}$`)
 
 func Load(ctx *pulumi.Context) (*Config, error) {
 	gcp := config.New(ctx, "gcp")
@@ -167,7 +180,8 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		OpsMachineType: c.Get("opsMachineType"),
 		OpsLaunchers:   strings.Fields(strings.ReplaceAll(c.Get("opsLaunchers"), ",", " ")),
 
-		WatchtowerReader: c.Get("watchtowerReader"),
+		WatchtowerReader:     c.Get("watchtowerReader"),
+		WatchtowerPeerSecret: c.Get("watchtowerPeerSecret"),
 	}
 
 	// Both meant something else before the node pool was split into base and
@@ -350,6 +364,10 @@ func validate(c *Config) error {
 	}
 	if r := c.WatchtowerReader; r != "" && (!strings.HasSuffix(r, ".iam.gserviceaccount.com") || strings.Count(r, "@") != 1) {
 		return fmt.Errorf("gitea:watchtowerReader %q is not a service account email", r)
+	}
+	if s := c.WatchtowerPeerSecret; s != "" && !secretResourceName.MatchString(s) {
+		// The VM reads the latest version itself; a version here would pin it.
+		return fmt.Errorf("gitea:watchtowerPeerSecret %q is not a secret's resource name (projects/<project>/secrets/<id>)", s)
 	}
 	for _, f := range strings.Fields(c.Fail2banIgnore) {
 		// Values only, never echoed: this one is a secret. fail2ban would

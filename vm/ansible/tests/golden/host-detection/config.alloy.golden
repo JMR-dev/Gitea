@@ -1,0 +1,609 @@
+// Rendered by the playbook (vm/ansible, role logship) into
+// /etc/gitea/alloy/config.alloy, its variables in the same dollar-brace form
+// as every file in vm/config; read by vm/quadlets/alloy.container. No
+// secrets: the one value filled in is the public domain.
+//
+// Grafana Alloy (v1.21.3) for a service that ships its telemetry to
+// watchtower; docs/client-telemetry.md (in watchtower-observability-stack) is
+// the contract, and this file is its config/alloy/config.alloy.example with
+// Gitea's labels, rules and scrape targets. The host must be one of
+// watchtower's agent peers (its config is in Secret Manager,
+// watchtower-observe/wireguard-gitea-vm-peer, installed by role tunnel):
+// watchtower.jasonmross.dev resolves to 10.8.0.1, inside the tunnel, and
+// nowhere else.
+//
+// Agents may only write, and only into the shared tenant jasonmross: Caddy
+// overwrites X-Scope-OrgID for them, so the headers below only say so.
+// Everything is TLS with a public certificate, so no `insecure` settings.
+//
+// No OTLP receiver in v1: nothing of ours emits traces yet.
+//
+// Nothing on the server scrubs: loki.process "scrub" is all that stands
+// between these logs and storage. stage.replace rewrites each capture group
+// with `replace` and nothing else (a regex without one changes nothing), so
+// every rule captures exactly the part to hide. scripts/check-alloy-scrub.sh
+// runs the rules against scripts/testdata/scrub.log and scrub.caddy.log
+// (vm/ansible/tests/check, so `make check`, every PR preview and every
+// deploy).
+
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+// ============================================================
+// LOGS  ──► Loki
+// ============================================================
+
+loki.source.journal "system" {
+	forward_to    = [loki.process.scrub.receiver]
+	relabel_rules = loki.relabel.journal.rules
+	labels        = {service = "gitea", host = "gitea-vm", env = "production"}
+}
+
+loki.relabel "journal" {
+	forward_to = []
+
+	// conmon splits a long line into several journal entries and marks all
+	// but the last. Drop those, so no piece of a long record (an audit log
+	// with headers in it) ships out of context; a JSON pipeline drops the
+	// last piece as malformed.
+	rule {
+		source_labels = ["__journal_container_partial_message"]
+		regex         = "true"
+		action        = "drop"
+	}
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		target_label  = "unit"
+	}
+
+	// A rootless (user) unit's name is in _SYSTEMD_USER_UNIT; its
+	// _SYSTEMD_UNIT is just user@<uid>.service.
+	rule {
+		source_labels = ["__journal__systemd_user_unit"]
+		regex         = "(.+)"
+		target_label  = "unit"
+	}
+
+	rule {
+		source_labels = ["__journal_container_name"]
+		target_label  = "container"
+	}
+
+	rule {
+		source_labels = ["__journal_priority_keyword"]
+		target_label  = "level"
+	}
+}
+
+// scrub: begin (scripts/check-alloy-scrub.sh tests what is between the markers)
+loki.process "scrub" {
+	forward_to = [loki.write.watchtower.receiver]
+
+	// Caddy logs one JSON object a line. One that doesn't parse is the last
+	// piece of a line conmon split (the relabel rule drops the others): the
+	// tail of a record with headers in it, cut off from the keys the rules
+	// below look for. It never ships. First, since a redacted line is no
+	// longer JSON.
+	stage.match {
+		selector = "{container=\"caddy\"}"
+
+		stage.json {
+			expressions    = {logger = ""}
+			drop_malformed = true
+		}
+	}
+
+	// Coraza's audit records hold whole requests: headers, cookies, bodies.
+	stage.drop {
+		expression          = `\\*"transaction\\*"\s*:\s*\{`
+		drop_counter_reason = "audit_record"
+	}
+
+	// A WAF rule match quotes what it matched as [data "..."]: a visitor's
+	// form value, header or cookie. The whole field goes, first, so a quoted
+	// "Cookie: ..." can't set off a rule below that cuts to the end of the
+	// line. Coraza writes [severity "..."] right after it, once a line, so
+	// the greedy match ends at the real field even when the data holds a
+	// lookalike. A rule with several matches adds [msg_match_N "..."]
+	// [data_match_N "..."] at the end of the line. Inside Caddy's JSON the
+	// quotes are \", and more backslashes in JSON inside that.
+	stage.replace {
+		expression = `(\[data \\*".*\\*"\] ?)\[severity `
+		replace    = ""
+	}
+
+	stage.replace {
+		expression = `(\[msg_match_\d+ \\*".*\\*"\])`
+		replace    = ""
+	}
+
+	// Matched data in a shape those two didn't expect: drop the line.
+	// fail2ban reads the journal on the host, so a ban doesn't depend on it.
+	stage.drop {
+		expression          = `\[data(?:_match_\d+)? \\*"`
+		drop_counter_reason = "waf_data"
+	}
+
+	// ---- Gitea's own: from here to the next such line ----
+	//
+	// The name typed at a failed sign-in, whole: a mistyped name, someone
+	// else's, or a password typed into the name field, which has no key name
+	// for a rule below to find. Gitea writes `Failed authentication attempt
+	// for <name> from <address>:<port>: <error>` (routers/web/auth, and the
+	// fail2ban filter vm/fail2ban/filter.d/gitea.conf reads the same line on the
+	// host). Up to the last " from <address>:<port>" on the line, so a name
+	// holding " from " goes whole too; the error's own copy of the name is the
+	// next rule's.
+	stage.replace {
+		expression = `(?i)\b(?:failed (?:[\w-]+ )?authentication attempt for|attempted oauth2 login|attempted access of unknown user:?) (.+) from \S+:\d+(?::|\s|$)`
+		replace    = "[REDACTED-USER]"
+	}
+
+	// The same at Gitea's own SSH server: anyone who runs `ssh <name>@host -p
+	// 2222` with a name other than git gets `Invalid SSH username <name> - must
+	// use git for all git operations via ssh` (modules/ssh, publicKeyHandler),
+	// the name as typed. Up to the last copy of that fixed ending, so a name
+	// holding part of it goes whole too.
+	stage.replace {
+		expression = `\bInvalid SSH username (.+) - must use \S+ for all git operations via ssh`
+		replace    = "[REDACTED-USER]"
+	}
+
+	// The error it quotes names the account again: Gitea's user errors end
+	// `[uid: <n>, name: <name>]` (no such user, password invalid, not allowed
+	// to log in, inactive) or `[name: <name>]`, and an unknown address
+	// `[email: <typed>]`, which need not be an address the rule below finds.
+	// To the last ] on the line. A repository's error starts [id: and stays.
+	stage.replace {
+		expression = `\[(?:uid: -?\d+, )?name: (.*)\]`
+		replace    = "[REDACTED-USER]"
+	}
+
+	stage.replace {
+		expression = `\[email: (.*)\]`
+		replace    = "[REDACTED-EMAIL]"
+	}
+
+	// ---- The example's again ----
+
+	// sudo's command and environment: who ran it, when and as whom ship, and
+	// what they ran stays in the journal. A secret passed as an argument has no
+	// key name for a rule below to match. ENV= comes before COMMAND= (`sudo
+	// NAME=value cmd`), COMMAND= comes last and "(command continued)" is the
+	// rest of one past 960 bytes, so each goes to the end of the line. On any
+	// unit, since sudo run from a service logs under that service. ENV= only
+	// after sudo's " ; ", so an app's own ENV=production stays.
+	stage.replace {
+		expression = `(?s)(?:;\s*ENV=|\bCOMMAND=|\(command continued\))(.*)`
+		replace    = "[REDACTED-COMMAND]"
+	}
+
+	// JWTs: the two parts of an unsigned one and all five of an encrypted one,
+	// whose second part can be empty. Bearer tokens wherever they appear.
+	stage.replace {
+		expression = `\b(eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)+)`
+		replace    = "[REDACTED-JWT]"
+	}
+
+	stage.replace {
+		expression = `(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{8,})`
+		replace    = "[REDACTED-CREDENTIAL]"
+	}
+
+	// Tokens known by their shape alone, with no key name beside them: GitHub's
+	// ghp_, Google's ya29. and AWS's AKIA. The left edge is a character of its
+	// own, so one after a _ goes too; the lengths leave the bare prefixes alone.
+	stage.replace {
+		expression = `(?:^|[^A-Za-z0-9])(ghp_[A-Za-z0-9]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AKIA[0-9A-Z]{16})`
+		replace    = "[REDACTED-TOKEN]"
+	}
+
+	// SSH public keys, which name a person as a fingerprint does. Only the key:
+	// its type stays, as does a type named alone (sshd's "key type ssh-rsa not
+	// in"), and so does a comment after it.
+	stage.replace {
+		expression = `\b(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+)\s+(AAAA[A-Za-z0-9+/]{16,}={0,3})`
+		replace    = "[REDACTED-SSH-KEY]"
+	}
+
+	// Basic credentials: a value with a digit or base64's + / = in it, so
+	// `basic authentication failed` stays. All letters gets through.
+	stage.replace {
+		expression = `(?i)\bbasic\s+([A-Za-z._~-]*[0-9+/=][A-Za-z0-9._~+/=-]*)`
+		replace    = "[REDACTED-CREDENTIAL]"
+	}
+
+	// SSH key fingerprints, which name a person's key. Upper case only: a
+	// lower-case sha256: is an image digest. A SHA1: or SHA-256: followed by
+	// exactly a hash in lower-case hex is a checksum or a git sha, no fingerprint
+	// (those are base64 or colon-separated): the first two alternatives have no
+	// capture group, so they hide nothing.
+	stage.replace {
+		expression = `\bSHA1:[0-9a-f]{40}(?:$|[^A-Za-z0-9+/=:])|\bSHA-256:[0-9a-f]{64}(?:$|[^A-Za-z0-9+/=:])|\b(?:SHA256|SHA-256|SHA1|MD5):([A-Za-z0-9+/=:]{16,})`
+		replace    = "[REDACTED-FINGERPRINT]"
+	}
+
+	// wg's errors quote the line or key they choke on, and that can be a
+	// private key.
+	stage.replace {
+		expression = `(?:Key is not the correct length or format|Line unrecognized): \x60(.+)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// A JSON field whose name holds one of these goes whole, name kept, the
+	// value read the way it is written: an array of strings (Caddy logs every
+	// header as "Name":["value"]) or one more deeply nested, an object, a
+	// string with escaped quotes, a single-quoted string (Python's repr), or
+	// a number, true, false or null up to its comma. Any other bare word runs
+	// to the next blank. A wrapper (Some("x")), what doesn't close, and what
+	// nests deeper than these go to the end of the line, so a closing bracket
+	// in a value or a line cut short never ships the rest. => := and == count
+	// as well as : and =.
+	stage.replace {
+		expression = `(?i)["'\x60][\w\s.\[\]-]*authorization[\w\s.\[\]-]*["'\x60]\s*(?:=>|:=|==|[:=])\s*(?:(true|false|null|-?\d[\d.eE+-]*)(?:[,}\]\s]|$)|(\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"'\[\]])*\]|[^"'\[\]])*\]|\{(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\{(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"'{}])*\}|[^"'{}])*\}|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\w+\(.*|[^\s,}\]\[{"'\\](?:\\.|[^\s\\])*|.*))`
+		replace    = "[REDACTED-CREDENTIAL]"
+	}
+
+	stage.replace {
+		expression = `(?i)["'\x60][\w\s.\[\]-]*cookie[\w\s.\[\]-]*["'\x60]\s*(?:=>|:=|==|[:=])\s*(?:(true|false|null|-?\d[\d.eE+-]*)(?:[,}\]\s]|$)|(\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"'\[\]])*\]|[^"'\[\]])*\]|\{(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\{(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"'{}])*\}|[^"'{}])*\}|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\w+\(.*|[^\s,}\]\[{"'\\](?:\\.|[^\s\\])*|.*))`
+		replace    = "[REDACTED-COOKIE]"
+	}
+
+	// Secrets by key name (DB_PASSWORD, X-API-Key, "session", privateKey,
+	// "password hash", user[token], ...), quoted with " ' or a backtick. pass,
+	// otp, auth, sid, ssn, cvv and cvc are the whole name or its last part
+	// (db_pass, x-auth, dbPass, oauth2), never part of a word (bypass,
+	// authenticated), though byPass goes too.
+	stage.replace {
+		expression = `(?i)["'\x60](?:[\w\s.\[\]-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key)[\w\s.\[\]-]*|(?:[\w\s.\[\]-]*[_.\s\[-])?(?:pass|t?otp|o?auth|sid|ssn|cvv|cvc)\d*\]?|[\w\s.\[\]-]*[a-z0-9](?-i:Pass|Otp|Totp|Auth|OAuth|Sid)\d*)["'\x60]\s*(?:=>|:=|==|[:=])\s*(?:(true|false|null|-?\d[\d.eE+-]*)(?:[,}\]\s]|$)|(\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"'\[\]])*\]|[^"'\[\]])*\]|\{(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\{(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"'{}])*\}|[^"'{}])*\}|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\w+\(.*|[^\s,}\]\[{"'\\](?:\\.|[^\s\\])*|.*))`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// The same inside a JSON string: a log line that quotes a JSON body, with
+	// \" for its quotes (\' for Python's). Deeper quoting or nesting than that
+	// goes to the end of the line.
+	stage.replace {
+		expression = `(?i)\\+["'](?:[\w\s.\[\]-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key|authorization|cookie)[\w\s.\[\]-]*|(?:[\w\s.\[\]-]*[_.\s\[-])?(?:pass|t?otp|o?auth|sid|ssn|cvv|cvc)\d*\]?|[\w\s.\[\]-]*[a-z0-9](?-i:Pass|Otp|Totp|Auth|OAuth|Sid)\d*)\\+["']\s*(?:=>|:=|==|[:=])\s*(?:(true|false|null|-?\d[\d.eE+-]*)(?:[,}\]\s]|$)|(\[(?:\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|[^"\\\[\]])*\]|\{(?:\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|[^"\\{}])*\}|\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|\\'(?:\\\\\\'|\\\\|\\[^'\\]|[^'\\])*\\'|\w+\(.*|[^\s,}\]\[{"'\\](?:\\.|[^\s\\])*|.*))`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// Authorization and cookie headers as `Name: value`, under any name that
+	// holds one, to the end of the line. The kernel's tcp_syncookies is no
+	// cookie: that alternative has no capture group, so it hides nothing.
+	stage.replace {
+		expression = `(?i)[\w.-]*authorization[\w.-]*\s*[:=]\s*([^\r\n]+)`
+		replace    = "[REDACTED-CREDENTIAL]"
+	}
+
+	stage.replace {
+		expression = `(?i)[\w.-]*syncookies\s*[:=]|[\w.-]*cookie[\w.-]*\s*[:=]\s*([^\r\n]+)`
+		replace    = "[REDACTED-COOKIE]"
+	}
+
+	// key=value or key: value, or with => := or ==: quoted, with quotes
+	// escaped inside it or the whole value in \" (logfmt, a JSON msg), or bare.
+	// A bare one goes up to the next blank, & or closing quote, so a comma or a
+	// semicolon in it (?password=a,b;c in a uri) doesn't ship the rest; \" is
+	// part of the value, as in a JSON string. One that opens a bracket or a
+	// wrapper (password: Some("x"), token: [ "x" ]) goes to the end of the line.
+	//
+	// A name may have brackets on it (user[password]=x, %5D when encoded) or a
+	// word after it (Session ID:, Password Hash:). ssn, cvv and cvc only as a
+	// whole name or its last part (card_cvc), never in processname=.
+	//
+	// The first five alternatives have no capture group, so they hide nothing:
+	// they match first and take these out of the rule's reach. systemd's
+	// `session-3.scope: Deactivated` names a unit, sudo's `TTY=x ; PWD=/y ;` a
+	// directory, `Starting session: shell` is sshd's, `sshd-session[12]: ` a
+	// program and its pid, and an earlier rule's marker is no name. Any other
+	// PWD is a password's short name.
+	stage.replace {
+		expression = `(?i)session-\w+\.scope:|(?-i:\bTTY=[^\s;=:]+ ; PWD=/[^\s;=:]* ;)|(?-i:\bStarting session:)|\[REDACTED-[\w-]+\]|[\w.-]+\[\d+\]:|(?:[\w.-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key)(?:[\w.\[\]-]|%5[Dd])*(?:\s+(?:id|hash|key))?|(?:^|[^a-z0-9])(?:ssn|cvv|cvc)\d*)\s*(?:=>|:=|==|%(?:25)*3[Dd]|=|:)\s*("(?:[^"\\]|\\.)*"|".*|'(?:[^'\\]|\\.)*'|'.*|\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|\\".*|[\[{(].*|\w+\(.*|(?:\\.|[^\s&"'\\])(?:\\.|[^\s&"\\])*)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// Short names that are also ordinary words: only with an equals sign, so
+	// `auth: ok` and `tests pass: 5` stay. `otp: 123456` gets through. As in
+	// JSON, the last part of a name, in camelCase or with a number too.
+	stage.replace {
+		expression = `(?i)(?:\b|%(?:25)*(?:3[Ff]|26))(?:(?:[\w.\[\]-]*(?:[_.\[-]|%5[Bb]))?(?:pass|t?otp|o?auth)\d*(?:\]|%5[Dd])?|[\w.-]*[a-z0-9](?-i:Pass|Otp|Totp|Auth|OAuth)\d*)\s*(?:=>|:=|==|%(?:25)*3[Dd]|=)\s*("(?:[^"\\]|\\.)*"|".*|'(?:[^'\\]|\\.)*'|'.*|\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|\\".*|[\[{(].*|\w+\(.*|(?:\\.|[^\s&"'\\])(?:\\.|[^\s&"\\])*)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// The same names as XML tags: <password>x</password>.
+	stage.replace {
+		expression = `(?i)<(?:[\w.:-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key|authorization|cookie)[\w.:-]*|(?:[\w.:-]*[_.:-])?(?:pass|t?otp|o?auth))(?:\s[^<>]*)?>([^<]+)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// A secret passed as a separate argument: --password x on a command line.
+	stage.replace {
+		expression = `(?i)--(?:[\w-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key)[\w-]*|(?:[\w-]*-)?(?:pass|t?otp|o?auth))\s+(\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s"',]+)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// The same with the name and value as strings side by side: an argument
+	// array, ["--password","x"], or a Python header tuple, ('Cookie', 'x').
+	stage.replace {
+		expression = `(?i)["'](?:[\w.-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key|authorization|cookie)[\w.-]*|(?:[\w.-]*[_.-])?(?:pass|t?otp|o?auth))["']\s*,\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// Other credentials in query strings, the ? or & as \u0026 (Go's JSON) or
+	// &amp;, or a URL nested in another, percent-encoded, in which case the
+	// value runs to the next blank.
+	stage.replace {
+		expression = `(?i)(?:[?&]|\\u0026|&amp;|%(?:25)*3[Ff]|%(?:25)*26)(?:code|state|key|sid|sig|signature|tok|ticket|nonce|x-amz-signature|x-amz-credential|x-goog-signature|x-goog-credential)(?:=|%(?:25)*3[Dd])((?:\\.|[^&\s"#\\])+)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// ---- Gitea's own again, to the next such line ----
+	//
+	// An access token in a query string: Gitea takes ?token= and
+	// ?access_token= on the API, raw files and feeds, and its router log and
+	// Caddy's access log both write the whole URI. Encoded too, as in a
+	// ?redirect_to= after a login. The key=value rule above already takes most;
+	// this one makes sure of them. After it, not before: a value it had already
+	// replaced would start with "[", which that rule reads as a bracket and
+	// cuts to the end of the line, status, address and all.
+	stage.replace {
+		expression = `(?i)(?:[?&]|\\u0026|&amp;|%(?:25)*3[Ff]|%(?:25)*26)(?:access_)?token(?:=|%(?:25)*3[Dd])((?:\\.|[^&\s"#\\])+)`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// ---- The example's again ----
+
+	// Passwords in connection strings: scheme://user:PASSWORD@host, up to the
+	// last @ before a blank or quote, since a password holding / or @ is what
+	// makes a driver fail and log its URL. A path with an @ after a port goes
+	// too.
+	stage.replace {
+		expression = `(?i)\b[a-z][a-z0-9+.-]*://[^/\s:]*:([^\s"']+)@`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// The same in Go's MySQL form, with no scheme: user:PASSWORD@tcp(host).
+	stage.replace {
+		expression = `(?i)[\w.-]*:([^\s"']+)@(?:tcp|unix)\(`
+		replace    = "[REDACTED-SECRET]"
+	}
+
+	// Email addresses, URL-encoded (%40, %2540) or \u-escaped too, with a
+	// local part in any alphabet or in quotes. An instantiated systemd unit
+	// (wg-quick@wg-watchtower.service) is no address: that first alternative
+	// has no capture group, so it hides nothing.
+	stage.replace {
+		expression = `[\w.:-]+@[\w.:\\-]*\.(?:service|socket|timer|target|mount|path|slice|scope)\.?(?:$|[^\w.-])|([\p{L}\p{N}._%+'!#$*^~-]+(?:@|%40|%2540|\\u0040)[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.[A-Za-z]{2,}|"[^"@]*"@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.[A-Za-z]{2,})`
+		replace    = "[REDACTED-EMAIL]"
+	}
+
+	// OS Login usernames: an email address in a domain in use
+	// (user_gmail_com), or a service account's number (sa_<id>).
+	stage.replace {
+		expression = `\b([a-z0-9][a-z0-9._-]*_(?:gmail_com|googlemail_com|jasonmross_dev))\b`
+		replace    = "[REDACTED-USER]"
+	}
+
+	stage.replace {
+		expression = `\b(sa_\d{10,})\b`
+		replace    = "[REDACTED-USER]"
+	}
+
+	// OS Login uids, which stand for their users and run to 10 digits: pam's
+	// uid= (auid= and euid= hold the same text), systemd's "UID <n>", its
+	// user-<n>.slice, user@<n>.service and user-runtime-dir@<n>.service, and
+	// /run/user/<n>. The unit's name stays. root and other small uids stay.
+	//
+	// Gitea's one change to the example's own rules, until the example has it
+	// too: the last alternative, run-user-<n>.mount, the mount unit of
+	// /run/user/<n>, which systemd names in its "Deactivated successfully" and
+	// "Unmounting" lines.
+	stage.replace {
+		expression = `uid=(\d{10,})\b|\bUID (\d{10,})\b|\buser-(\d{10,})\.slice|\buser(?:-runtime-dir)?@(\d{10,})\.service|/run/user/(\d{10,})\b|\brun-user-(\d{10,})\.mount`
+		replace    = "[REDACTED-UID]"
+	}
+
+	// IPv4 addresses, whole, next to a letter or _ too (ip_192.0.2.1). A
+	// four-part version number goes too. The edge is a character of its own,
+	// since RE2 has no lookahead; only on the left, so two addresses a comma
+	// apart both go. A last part over three digits (1.2.3.4567) is no address:
+	// that alternative has no capture group, so it hides nothing.
+	stage.replace {
+		expression = `(?:^|[^0-9])(?:(?:\d{1,3}\.){3}\d{4,}|((?:\d{1,3}\.){3}\d{1,3}))`
+		replace    = "[REDACTED-IP]"
+	}
+
+	// IPv4 inside a hostname, dashed: ec2-192-0-2-1.compute-1.amazonaws.com.
+	stage.replace {
+		expression = `(?:^|[^0-9])(\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3})\.[A-Za-z]`
+		replace    = "[REDACTED-IP]"
+	}
+
+	// IPv6 addresses: eight groups, or compressed with "::" and a group after
+	// it or two before it, or a lone prefix with a digit in it (2a01::). Never
+	// a clock time or a Rust path (db::query, db::commit: that first
+	// alternative has no capture group, so it hides nothing). A path of all
+	// hex words (dead::beef) is a valid address, so it goes. Then the same
+	// after a colon, _ or dot (client:2001:db8::1, ip_2001:db8::1), where one
+	// group needs a digit in it (client:2a01::7). Then percent-encoded.
+	stage.replace {
+		expression = `(?:^|[^\w:.])(?:[0-9A-Fa-f]{0,4}::[a-fA-F]{0,3}[g-zG-Z_]|((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1,6}::|[0-9A-Fa-f]{0,3}\d[0-9A-Fa-f]{0,3}::))`
+		replace    = "[REDACTED-IP6]"
+	}
+
+	stage.replace {
+		expression = `[:_.]((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){2,6}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5})?|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{0,3}\d[0-9A-Fa-f]{0,3}::[0-9A-Fa-f]{1,4})`
+		replace    = "[REDACTED-IP6]"
+	}
+
+	stage.replace {
+		expression = `(?:^|[^\w%])((?:[0-9A-Fa-f]{0,4}%3[Aa]){2,8}[0-9A-Fa-f]{0,4})`
+		replace    = "[REDACTED-IP6]"
+	}
+
+	// MAC addresses.
+	stage.replace {
+		expression = `\b((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2})\b`
+		replace    = "[REDACTED-MAC]"
+	}
+
+	// Card numbers: 15 or 16 digits starting 2 to 6, unbroken or in dashed
+	// fours. Never an epoch time (they start with 1 until 2033) or a list of
+	// ports; a number typed with spaces, another length or dashed Amex groups
+	// get through.
+	stage.replace {
+		expression = `\b([2-6]\d{14,15}|[2-6]\d{3}(?:-\d{4}){3})\b`
+		replace    = "[REDACTED-PAN]"
+	}
+
+	// UUIDs, which name users and their records.
+	stage.replace {
+		expression = `\b([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\b`
+		replace    = "[REDACTED-UUID]"
+	}
+
+	// A secret in a shape none of the rules caught: drop the line.
+	stage.drop {
+		expression          = `(?i)[\w.-]*(?:password|passwd|secret)[\w.-]*\s*[:=]\s*[^\s\["'=>:]`
+		drop_counter_reason = "secret"
+	}
+
+	// A login's user manager and runtime directory are user@<uid>.service and
+	// user-runtime-dir@<uid>.service in the unit label (the relabel rule above
+	// sets it), and an OS Login uid in a label is a stream per user. stage.replace
+	// only touches the line, so these rewrite the label. Last, so a service's own
+	// rules still see the unit as it came.
+	stage.match {
+		selector = `{unit=~"user@[0-9]+\\.service"}`
+
+		stage.static_labels {
+			values = {unit = "user@.service"}
+		}
+	}
+
+	stage.match {
+		selector = `{unit=~"user-runtime-dir@[0-9]+\\.service"}`
+
+		stage.static_labels {
+			values = {unit = "user-runtime-dir@.service"}
+		}
+	}
+
+	// Podman's transient health check units are named <container id>-<hex>.service,
+	// so each recreated container adds new values and new streams against the
+	// tenant's budget. The log lines stay; only the label loses the id. The match
+	// is on the whole value, so no ordinary unit is touched.
+	stage.match {
+		selector = `{unit=~"[0-9a-f]{64}-[0-9a-f]+\\.service"}`
+
+		stage.static_labels {
+			values = {unit = "podman-healthcheck.service"}
+		}
+	}
+}
+// scrub: end
+
+loki.write "watchtower" {
+	endpoint {
+		url     = "https://watchtower.jasonmross.dev:3100/loki/api/v1/push"
+		headers = {"X-Scope-OrgID" = "jasonmross"}
+
+		// Keep retrying through a watchtower restart or reboot (about a
+		// day at most); the journal position waits meanwhile.
+		max_backoff_period  = "5m"
+		max_backoff_retries = 300
+		retry_on_http_429   = true
+	}
+}
+
+// ============================================================
+// METRICS  ──► Mimir
+// ============================================================
+
+// The host's, not the container's: alloy.container mounts /proc, /sys and /
+// read-only under /host.
+prometheus.exporter.unix "host" {
+	set_collectors = ["cpu", "diskstats", "filesystem", "loadavg", "meminfo", "netdev", "pressure", "stat", "time", "uname", "vmstat"]
+	procfs_path    = "/host/proc"
+	sysfs_path     = "/host/sys"
+	rootfs_path    = "/host/root"
+	udev_data_path = "/host/root/run/udev/data"
+
+	// The exporter's own exclusions, and each login's /run/user/<uid>: a
+	// label with an OS Login uid in it otherwise.
+	filesystem {
+		mount_points_exclude = "^/(dev|proc|run/credentials/.+|run/user/.+|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)"
+	}
+}
+
+prometheus.exporter.self "alloy" { }
+
+// Gitea, end to end from this host: DNS, the certificate, Caddy and the WAF,
+// the gitea container and its database (/api/healthz checks it). IPv4 only, as
+// the VM has no IPv6.
+prometheus.exporter.blackbox "gitea" {
+	config = "{ modules: { http_2xx: { prober: http, timeout: 10s, http: { preferred_ip_protocol: ip4, ip_protocol_fallback: false, fail_if_not_ssl: true } } } }"
+
+	target {
+		name    = "gitea"
+		address = "https://git.example.test/api/healthz"
+		module  = "http_2xx"
+	}
+}
+
+discovery.relabel "blackbox" {
+	targets = prometheus.exporter.blackbox.gitea.targets
+
+	rule {
+		target_label = "job"
+		replacement  = "blackbox"
+	}
+}
+
+discovery.relabel "unix" {
+	targets = prometheus.exporter.unix.host.targets
+
+	rule {
+		target_label = "job"
+		replacement  = "integrations/unix"
+	}
+}
+
+discovery.relabel "alloy" {
+	targets = prometheus.exporter.self.alloy.targets
+
+	rule {
+		target_label = "job"
+		replacement  = "alloy"
+	}
+}
+
+// Caddy's metrics site (vm/config/Caddyfile.tmpl's :2020) and Gitea's own
+// /metrics (app.ini [metrics]), both on the host's loopback in either Caddy
+// network mode: gitea.container publishes Gitea's HTTP on 127.0.0.1:3000 only,
+// and Caddy answers /metrics from outside with a 404. Their instance is named,
+// or it would be the address.
+prometheus.scrape "local" {
+	targets = array.concat(
+		discovery.relabel.unix.output,
+		discovery.relabel.alloy.output,
+		discovery.relabel.blackbox.output,
+		[
+			{"__address__" = "127.0.0.1:2020", "instance" = "gitea-vm", "job" = "caddy"},
+			{"__address__" = "127.0.0.1:3000", "instance" = "gitea-vm", "job" = "gitea"},
+		],
+	)
+	forward_to      = [prometheus.remote_write.watchtower.receiver]
+	scrape_interval = "60s"
+}
+
+prometheus.remote_write "watchtower" {
+	endpoint {
+		url     = "https://watchtower.jasonmross.dev:8080/api/v1/push"
+		headers = {"X-Scope-OrgID" = "jasonmross"}
+	}
+	external_labels = {service = "gitea", host = "gitea-vm", env = "production"}
+}

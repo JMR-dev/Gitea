@@ -13,6 +13,10 @@ runner_egress_ip: 34.26.149.196 203.0.113.7
 backup_bucket: example-project-gitea-backups
 caddy_mode: bridge
 runner_token_present: true
+# A dummy watchtower peer (this repo mirrors to GitHub): role logship renders
+# Alloy only when there is one, and this is the systemd-journal gid it finds.
+watchtower_peer_secret: projects/example-observe/secrets/wireguard-example-peer
+logship_journal_gid: "190"
 secrets:
   GITEA_SECRET_KEY: fixtureSecretKey0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL
   GITEA_INTERNAL_TOKEN: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYmYiOjE3MDAwMDAwMDB9.fixture-internal-token

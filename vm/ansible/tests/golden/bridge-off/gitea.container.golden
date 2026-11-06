@@ -26,6 +26,12 @@ AutoUpdate=registry
 PodmanArgs=--authfile=/etc/containers/ar-auth.json
 Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
 Network=gitea.network
+# A fixed address, which vm/nftables/gitea.nft's forward chain keeps off the
+# metadata server: Gitea faces the internet and needs none of the VM's
+# credentials. Caddy reaches it by name (gitea:3000), so the address is
+# nowhere else. Caddy's is fixed too (caddy.container), so no container takes
+# this one from podman's allocator while Gitea is down.
+IP=10.89.10.250
 LogDriver=journald
 
 # Git over SSH, public. HTTP is loopback-only: Caddy is the only thing that

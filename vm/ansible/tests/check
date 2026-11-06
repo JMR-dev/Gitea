@@ -15,28 +15,110 @@ defines it, so a new variable fails here with what to add, not as an Ansible
 tests/make-goldens the way vm/bootstrap.sh rendered, which proved the cutover
 byte for byte; from then on --update is how they change.
 
+Once the goldens match, the telemetry to watchtower is checked too (not under
+--update). Everywhere, as they need nothing downloaded:
+  - the watchtower peer script over made-up configs (scripts/check-peer-config.sh);
+  - role tunnel's state over every case (tests/tunnel-state.yml);
+  - that the metadata guard in the ruleset names Alloy's uid and Gitea's
+    address, and not Caddy's (scripts/check-metadata-guard.sh --static).
+In a PR preview, `make check` and by hand, also, failing hard:
+  - `alloy fmt --test` and `alloy validate` on every fixture's rendered config;
+  - its scrub rules over scripts/testdata/scrub.log and scrub.caddy.log
+    (scripts/check-alloy-scrub.sh).
+Those two need Alloy and jq, downloaded pinned by sha256 (TOOLS) into
+~/.cache/gitea-vm-checks. A deploy (infra_deploy.py up) and `make
+vm-check`/`vm-apply` skip them, so a deploy never waits on github.com or fails
+on telemetry: the PR preview of the same tree ran them. See run_mode().
+
 Run with ansible-core on PATH (`make goldens` and `make ansible-check` do).
 """
 import argparse
 import difflib
+import hashlib
 import os
+import platform
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
+import zipfile
 
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ANSIBLE = os.path.dirname(HERE)
 VM = os.path.dirname(ANSIBLE)
+ROOT = os.path.dirname(VM)
 SECRETS = {"app.ini": ["GITEA_SECRET_KEY", "GITEA_INTERNAL_TOKEN", "GITEA_OAUTH2_JWT_SECRET", "GITEA_LFS_JWT_SECRET"],
            "Caddyfile": ["CADDY_EMAIL"]}
 # The directories whose files are rendered with ${ } delimiters.
 TEMPLATED = ["config", "quadlets", "nftables", "fail2ban/jail.d"]
-VARS_FILES = ["roles/app/vars/main.yml", "roles/firewall/vars/main.yml"]
+VARS_FILES = ["roles/app/vars/main.yml", "roles/firewall/vars/main.yml", "roles/logship/vars/main.yml"]
 HELPER = "roles/app/files/gitea-render-secrets"
 VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# The tools the download-needing telemetry checks run, per Linux machine type
+# (the deploy image is x86_64; a workstation may be either): name -> (url, the
+# sha256 its release publishes, the member to take from a zip or None). Alloy
+# is the version watchtower's contract pins (v1.21.3, as in
+# vm/quadlets/alloy.container), from the release's SHA256SUMS; jq, which
+# scripts/check-alloy-scrub.sh reads Alloy's log with and the deploy image
+# lacks, from its release's sha256sum.txt. Bump them here by hand.
+TOOLS = {
+    "x86_64": {
+        "alloy": ("https://github.com/grafana/alloy/releases/download/v1.21.3/alloy-linux-amd64.zip",
+                  "50d23af2d0f98c00beac6ce9a365693e60f87fb76b6cad6fe1d161e80588af6d", "alloy-linux-amd64"),
+        "jq": ("https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64",
+               "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f", None),
+    },
+    "aarch64": {
+        "alloy": ("https://github.com/grafana/alloy/releases/download/v1.21.3/alloy-linux-arm64.zip",
+                  "ca2f383cc60491877b21aef50c54af6a198f6c861c2c4b80f41ec49ad73b1b93", "alloy-linux-arm64"),
+        "jq": ("https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64",
+               "8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309", None),
+    },
+}
+ALLOY_CONFIG = "config.alloy"  # the rendered name of vm/config/config.alloy.tmpl
+SCRUB_FIXTURE = os.path.join(ROOT, "scripts", "testdata", "scrub.log")
+# infra_deploy.py's modes that change, or read, the VM: the deploy, and `make
+# vm-check`/`vm-apply` (also ci-vm-check/ci-vm-apply). Its other, `preview`, is
+# a pull request's.
+DEPLOY_MODES = {"up", "vm-check", "vm-apply"}
+MODES = DEPLOY_MODES | {"preview"}
+
+
+def run_mode():
+    """"deploy" when infra_deploy.py runs this for a deploy or a vm-check or
+    vm-apply, "strict" otherwise: a PR preview, `make check`, by hand.
+
+    infra_deploy.py and cloudbuild/infra.yaml are release-gate files, and the
+    environment it hands this is the same in a preview as in a deploy. What
+    differs is its own command line: it runs this directly (subprocess, no
+    shell), so the parent process is infra_deploy.py, and its mode is the one
+    positional argument with fixed choices (MODES). Read from
+    /proc/<parent>/cmdline. Anything unrecognised is strict, so a check can
+    only ever be skipped by a deploy-mode parent.
+
+    GITEA_CHECK_MODE=strict|deploy decides instead, for testing this."""
+    forced = os.environ.get("GITEA_CHECK_MODE", "")
+    if forced:
+        if forced not in ("strict", "deploy"):
+            raise SystemExit(f"tests/check: GITEA_CHECK_MODE={forced!r}: strict or deploy")
+        return forced
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as fh:
+            argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return "strict"
+    for i, arg in enumerate(argv):
+        if os.path.basename(arg) == "infra_deploy.py":
+            mode = next((a for a in argv[i + 1:] if a in MODES), "")
+            return "deploy" if mode in DEPLOY_MODES else "strict"
+    return "strict"
 
 
 def check_variables():
@@ -97,6 +179,111 @@ def render(fixture, out):
     return True
 
 
+def fetch_tools():
+    """TOOLS for this machine, each downloaded once and checked against its
+    pinned sha256, in a cache directory named for the pins; returns that
+    directory. Raises SystemExit, saying why, if it can't."""
+    machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(platform.machine().lower(), platform.machine())
+    tools = TOOLS.get(machine) if platform.system() == "Linux" else None
+    if tools is None:
+        raise SystemExit(f"tests/check: the Alloy checks need Linux on {' or '.join(TOOLS)} (TOOLS), not "
+                         f"{platform.system()} {platform.machine()}")
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    pins = hashlib.sha256("".join(sha for _, sha, _ in tools.values()).encode()).hexdigest()[:16]
+    bindir = os.path.join(cache, "gitea-vm-checks", pins)
+    os.makedirs(bindir, exist_ok=True)
+    for name, (url, sha, member) in tools.items():
+        dst = os.path.join(bindir, name)
+        if os.path.isfile(dst):
+            continue
+        # Streamed to disk and hashed on the way: Alloy is ~570 MB unpacked.
+        download = dst + ".download"
+        for attempt in range(3):
+            try:
+                h = hashlib.sha256()
+                with urllib.request.urlopen(url, timeout=120) as r, open(download, "wb") as fh:
+                    for chunk in iter(lambda: r.read(1 << 20), b""):
+                        h.update(chunk)
+                        fh.write(chunk)
+                break
+            except OSError as e:
+                if attempt == 2:
+                    raise SystemExit(f"tests/check: could not download {url}: {e}")
+                time.sleep(10)
+        if h.hexdigest() != sha:
+            os.remove(download)
+            raise SystemExit(f"tests/check: {url} has sha256 {h.hexdigest()}, not the pinned {sha}")
+        tmp = dst + ".tmp"
+        if member:
+            with zipfile.ZipFile(download) as zf, zf.open(member) as src, open(tmp, "wb") as fh:
+                shutil.copyfileobj(src, fh, 1 << 20)
+            os.remove(download)
+        else:
+            os.replace(download, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+    return bindir
+
+
+def free_port():
+    """A loopback port nothing listens on now, for the scrub harness's Alloy, so
+    two runs on one machine don't collide on a fixed one."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def telemetry_checks(mode):
+    """The telemetry checks, run on the goldens, which the caller has just
+    proved are exactly what renders; returns what failed. The ones that need
+    Alloy run only in strict mode (run_mode)."""
+    env = dict(os.environ)
+    failures = []
+
+    def run(what, cmd, quiet=False):
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stdout[-3000:], r.stderr[-3000:], sep="\n")
+            failures.append(what)
+        elif not quiet:
+            print(r.stdout, end="")
+        return r.returncode == 0
+
+    # Nothing to download: everywhere.
+    run("peer script", ["bash", os.path.join(ROOT, "scripts", "check-peer-config.sh")])
+    if run("tunnel state", ["ansible-playbook", "-i", "localhost,", os.path.join(HERE, "tunnel-state.yml")],
+           quiet=True):
+        print("tunnel state: role tunnel comes to the right state in every case")
+    goldens = sorted(os.listdir(os.path.join(HERE, "golden")))
+    for name in goldens:
+        run(f"{name}: metadata guard", ["bash", os.path.join(ROOT, "scripts", "check-metadata-guard.sh"), "--static"]
+            + [os.path.join(HERE, "golden", name, f + ".golden")
+               for f in ("nftables.conf", "alloy.container", "gitea.container", "caddy.container")])
+
+    if mode == "deploy":
+        print("tests/check: a deploy or vm-check/vm-apply: alloy fmt/validate and the scrub rules are skipped "
+              "(they need Alloy from github.com; the PR preview ran them, and `make check` does)")
+        return failures
+
+    env["PATH"] = fetch_tools() + os.pathsep + env.get("PATH", "")
+    for name in goldens:
+        golden = os.path.join(HERE, "golden", name, ALLOY_CONFIG + ".golden")
+        with tempfile.TemporaryDirectory() as t:
+            # Alloy reads a file by its .alloy name.
+            cfg = os.path.join(t, ALLOY_CONFIG)
+            shutil.copyfile(golden, cfg)
+            run(f"{name}: alloy fmt", ["alloy", "fmt", "--test", cfg])
+            run(f"{name}: alloy validate", ["alloy", "validate", cfg])
+    # The scrub block renders the same from every fixture: it has no ${VAR}.
+    # A port of its own, and up to 5 minutes for Alloy to start and get the
+    # fixture through, on a slow builder.
+    env["ALLOY_TEST_PORT"] = str(free_port())
+    env.setdefault("ALLOY_TEST_TIMEOUT", "300")
+    run("scrub rules", [os.path.join(ROOT, "scripts", "check-alloy-scrub.sh"),
+                        os.path.join(HERE, "golden", goldens[0], ALLOY_CONFIG + ".golden"), SCRUB_FIXTURE])
+    return failures
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--update", action="store_true", help="rewrite the goldens from what renders now")
@@ -143,8 +330,14 @@ def main():
         return 1
     if a.update:
         print(f"tests/check: wrote {written} goldens; review `git diff vm/ansible/tests/golden`")
-    else:
-        print(f"tests/check: {checked} rendered files match their goldens")
+        return 0
+    print(f"tests/check: {checked} rendered files match their goldens")
+    mode = run_mode()
+    failures = telemetry_checks(mode)
+    if failures:
+        print("telemetry check failures: " + ", ".join(failures))
+        return 1
+    print(f"tests/check: the telemetry checks pass ({mode} mode)")
     return 0
 
 

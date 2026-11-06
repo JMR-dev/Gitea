@@ -14,6 +14,10 @@ runner_egress_ip: ""
 backup_bucket: ""
 caddy_mode: host
 runner_token_present: false
+# A dummy watchtower peer, as in bridge-on: Alloy on a VM whose Caddy is on
+# the host network.
+watchtower_peer_secret: projects/example-observe/secrets/wireguard-example-peer
+logship_journal_gid: "190"
 secrets:
   GITEA_SECRET_KEY: k2
   GITEA_INTERNAL_TOKEN: t2
