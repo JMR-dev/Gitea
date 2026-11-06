@@ -51,6 +51,9 @@ Volume=/etc/machine-id:/etc/machine-id:ro
 Volume=/proc:/host/proc:ro
 Volume=/sys:/host/sys:ro
 Volume=/:/host/root:ro,rslave
+# vm/nftables/gitea.nft keeps this uid off the metadata server, which relies
+# on User=473, the host network and no UserNS= here (vm/ansible/tests/check
+# and scripts/check-metadata-guard.sh check all three).
 User=473
 GroupAdd=${JOURNAL_GID}
 # A confined container cannot read the host journal (container_t has no

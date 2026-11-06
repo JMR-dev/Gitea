@@ -142,6 +142,16 @@ loki.process "scrub" {
 		replace    = "[REDACTED-USER]"
 	}
 
+	// The same at Gitea's own SSH server: anyone who runs `ssh <name>@host -p
+	// 2222` with a name other than git gets `Invalid SSH username <name> - must
+	// use git for all git operations via ssh` (modules/ssh, publicKeyHandler),
+	// the name as typed. Up to the last copy of that fixed ending, so a name
+	// holding part of it goes whole too.
+	stage.replace {
+		expression = `\bInvalid SSH username (.+) - must use \S+ for all git operations via ssh`
+		replace    = "[REDACTED-USER]"
+	}
+
 	// The error it quotes names the account again: Gitea's user errors end
 	// `[uid: <n>, name: <name>]` (no such user, password invalid, not allowed
 	// to log in, inactive) or `[name: <name>]`, and an unknown address
@@ -386,8 +396,13 @@ loki.process "scrub" {
 	// uid= (auid= and euid= hold the same text), systemd's "UID <n>", its
 	// user-<n>.slice, user@<n>.service and user-runtime-dir@<n>.service, and
 	// /run/user/<n>. The unit's name stays. root and other small uids stay.
+	//
+	// Gitea's one change to the example's own rules, until the example has it
+	// too: the last alternative, run-user-<n>.mount, the mount unit of
+	// /run/user/<n>, which systemd names in its "Deactivated successfully" and
+	// "Unmounting" lines.
 	stage.replace {
-		expression = `uid=(\d{10,})\b|\bUID (\d{10,})\b|\buser-(\d{10,})\.slice|\buser(?:-runtime-dir)?@(\d{10,})\.service|/run/user/(\d{10,})\b`
+		expression = `uid=(\d{10,})\b|\bUID (\d{10,})\b|\buser-(\d{10,})\.slice|\buser(?:-runtime-dir)?@(\d{10,})\.service|/run/user/(\d{10,})\b|\brun-user-(\d{10,})\.mount`
 		replace    = "[REDACTED-UID]"
 	}
 

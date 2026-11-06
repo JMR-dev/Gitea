@@ -569,7 +569,8 @@ through it. Labels `service="gitea"`, `host="gitea-vm"`, `env="production"`.
 
 - **Logs:** every unit's journal, Gitea and Caddy included, scrubbed by
   `vm/config/config.alloy.tmpl`'s `loki.process "scrub"` (watchtower's shared
-  block plus Gitea's own: the name at a failed sign-in, `?token=`). Nothing on
+  block plus Gitea's own: the name at a failed sign-in, on the web or at its
+  SSH server, and `?token=`). Nothing on
   watchtower scrubs. Coraza's audit records stay on the VM, in
   `/var/log/caddy/coraza-audit.log` (`docs/waf.md`).
 - **Metrics,** every 60 s: the host (`job="integrations/unix"`), Alloy
@@ -593,6 +594,12 @@ through it. Labels `service="gitea"`, `host="gitea-vm"`, `env="production"`.
 - **Nothing comes in over the tunnel:** `vm/nftables/gitea.nft` drops anything
   on `wg-watchtower` that isn't a reply, at prerouting (before the containers'
   DNAT) and in input.
+- **Alloy can't reach the metadata server** but for DNS: the ruleset's output
+  chain rejects uid 473 (Alloy, `User=473` on the host network) to
+  169.254.169.254, so a compromised Alloy can't take `gitea-vm@`'s token.
+  Every other uid is untouched (Caddy on the host network needs the server for
+  DNS-01). `make check-metadata-guard` proves it in a namespace; a refusal on
+  the VM shows in `sudo nft list chain inet gitea_filter output`'s counter.
 - **Never a failed deploy:** a start that fails and the deploy check (Alloy's
   `/-/ready`, then a handshake within 2 minutes) only warn. A change to Alloy
   or the tunnel restarts only them, never Gitea or Caddy.

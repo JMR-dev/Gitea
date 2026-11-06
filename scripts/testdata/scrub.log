@@ -300,4 +300,11 @@ same:g21 2026/11/06 14:00:00 routers/init.go:122:InitWebInstalled() [I] Git vers
 same:g22 2026/11/06 14:00:00 cmd/web.go:261:runWeb() [I] Starting Gitea on PID: 2
 same:g23 2026/11/06 14:06:00 routers/api/v1/repo/repo.go:540:Get() [W] GetRepositoryByName: repository does not exist [id: 0, uid: 0, owner_name: example-org, name: infra]
 same:g24 2026/11/06 14:06:01 services/cron/tasks.go:89:RunWithUser() [I] Starting task: delete_old_actions (cron: @every 24h)
+keep:g25 systemd[1]: run-user-3141592653.mount: Deactivated successfully.
+keep:g26 systemd[1]: Unmounting run-user-3141592654.mount - /run/user/3141592654...
+same:g27 systemd[1]: run-user-1000.mount: Deactivated successfully.
+keep:g28 2026/11/06 14:07:01 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username fakeUSER728 - must use git for all git operations via ssh
+keep:g29 2026/11/06 14:07:02 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username fake USER729 [uid: 0, name: x] - must use git for all git operations via ssh
+keep:g30 2026/11/06 14:07:03 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username fakeUSER730 - must use root for all git operations via ssh - must use git for all git operations via ssh
+keep:g31 2026/11/06 14:07:04 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username correct horse fakeLEAK731 battery - must use git for all git operations via ssh
 same:59 2026-10-26 03:12:45 mimir ingester ring healthy, 150000 series

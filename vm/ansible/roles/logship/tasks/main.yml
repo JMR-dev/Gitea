@@ -37,12 +37,25 @@
 - name: Journal group access, as the next boot's systemd-tmpfiles would set it
   ansible.builtin.command:
     argv: [systemd-tmpfiles, --create, --prefix=/var/log/journal]
+  register: logship_tmpfiles
   when:
     - tunnel_state == 'up'
     - logship_journal_dir.stat.exists
     - logship_journal_dir.stat.gr_name != 'systemd-journal'
   changed_when: true
+  failed_when: false
   notify: alloy changed
+
+# Warn only, like the rest of the telemetry: Alloy then reads nothing until
+# the next boot's systemd-tmpfiles does this.
+- name: Warn when the journal's group access couldn't be set
+  ansible.builtin.debug:
+    msg: >-
+      WARN: systemd-tmpfiles --create --prefix=/var/log/journal exited {{ logship_tmpfiles.rc }}:
+      Alloy may read no journal until the next reboot -- {{ logship_tmpfiles.stderr | default('') | trim }}
+  when:
+    - logship_tmpfiles is not skipped
+    - logship_tmpfiles.rc | default(0) != 0
 
 - name: Alloy's config directory
   ansible.builtin.file:

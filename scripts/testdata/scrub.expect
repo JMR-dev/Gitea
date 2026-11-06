@@ -40,3 +40,8 @@ keep:g16 2026/11/06 14:04:01 modules/ssh/ssh.go:241:publicKeyHandler() [W] Unkno
 keep:g18 sshd-session[4321]: Accepted publickey for [REDACTED-USER] from [REDACTED-IP] port 51234 ssh2: ED25519 SHA256:[REDACTED-FINGERPRINT]
 keep:g19 sudo[4400]: [REDACTED-USER] : TTY=pts/0 ; PWD=/home/[REDACTED-USER] ; USER=root ; COMMAND=[REDACTED-COMMAND]
 keep:g20 wg-quick[812]: [#] ip -4 address add [REDACTED-IP]/32 dev wg-watchtower
+keep:g25 systemd[1]: run-user-[REDACTED-UID].mount: Deactivated successfully.
+keep:g26 systemd[1]: Unmounting run-user-[REDACTED-UID].mount - /run/user/[REDACTED-UID]...
+keep:g28 2026/11/06 14:07:01 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username [REDACTED-USER] - must use git for all git operations via ssh
+keep:g29 2026/11/06 14:07:02 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username [REDACTED-USER] - must use git for all git operations via ssh
+keep:g30 2026/11/06 14:07:03 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username [REDACTED-USER] - must use git for all git operations via ssh

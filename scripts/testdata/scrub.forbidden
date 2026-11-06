@@ -51,6 +51,7 @@ uid=1000000000
 314159265[0-9]
 @1000000000
 fakeUSER
+USER7[0-9][0-9]
 correct horse
 leak\.example\.net
 35\.235\.

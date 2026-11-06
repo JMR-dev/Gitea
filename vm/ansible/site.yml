@@ -49,6 +49,19 @@
       changed_when: true
       listen: journald config changed
 
+    # fail2ban's systemd backend opened its journal reader when only
+    # /run/log/journal existed, and never picks up /var/log/journal: after the
+    # two above, every jail would match nothing until fail2ban restarts. A real
+    # restart, not a reload, which can keep the old reader. Its bans come back
+    # from its own database. After the flush, so the reader opens the files the
+    # journal now writes.
+    - name: Restart fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban.service
+        state: restarted
+      when: fail2ban_present | default(false) | bool
+      listen: journald config changed
+
     - name: Restart gitea
       ansible.builtin.systemd_service:
         name: gitea.service

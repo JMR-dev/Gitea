@@ -34,6 +34,11 @@
 #
 # SCRUB_SHOW=1 prints what came out. Needs alloy and jq. Service repos copy
 # it with the example config.
+#
+# Gitea's copy differs from watchtower's in one place: the wait for the last
+# line is a deadline of ALLOY_TEST_TIMEOUT seconds (default 60) rather than 60
+# polls, so a slow builder can be given longer (vm/ansible/tests/check gives
+# it 300, and a free port in ALLOY_TEST_PORT).
 
 set -euo pipefail
 
@@ -108,7 +113,8 @@ alloy run --server.http.listen-addr="127.0.0.1:${port}" --storage.path="${work}/
 pid=$!
 
 out="${work}/out.txt"
-for _ in $(seq 60); do
+deadline=$((SECONDS + ${ALLOY_TEST_TIMEOUT:-60}))
+while ((SECONDS < deadline)); do
   jq -r 'select(.component_id == "loki.echo.out") | .entry' "${work}/alloy.log" 2>/dev/null >"$out" || true
   grep -q "^${last} " "$out" && { [[ -z "$caddy_last" ]] || grep -qF "$caddy_last" "$out"; } &&
     [[ "$(grep -c '^unit:[0-9]*$' "$out")" -eq "$unit_count" ]] && break

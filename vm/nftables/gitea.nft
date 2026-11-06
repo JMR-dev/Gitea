@@ -77,4 +77,24 @@ table inet gitea_filter {
 		# Rate-limited logging so a scan cannot fill the disk via journald.
 		limit rate 5/minute burst 10 packets log prefix "nft-drop-in: " level info
 	}
+
+	# Alloy keeps off the metadata server, whose token is this VM's
+	# credentials (gitea-vm@: Gitea's secrets, new versions of them, the
+	# watchtower peer, dns.admin on the zone). Alloy runs on the host network
+	# (vm/quadlets/alloy.container) with no user namespace, so its packets leave
+	# through here under uid 473, and the two numbers have to stay the same:
+	# vm/ansible/tests/check and scripts/check-metadata-guard.sh check it. One
+	# uid and no more: Caddy on the host network (uid 1000) needs the server for
+	# DNS-01, and root for gcloud. A bridged container's traffic is forwarded
+	# and never comes here.
+	#
+	# The same address is GCE's resolver, the one in /etc/resolv.conf, and Alloy
+	# has to look up watchtower and this host's domain, so DNS still goes
+	# through.
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		meta skuid 473 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept comment "Alloy's DNS"
+		meta skuid 473 ip daddr 169.254.169.254 counter reject with icmpx admin-prohibited comment "Alloy, metadata server"
+	}
 }
