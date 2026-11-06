@@ -8,8 +8,6 @@
 package main
 
 import (
-	"path/filepath"
-
 	"github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -29,7 +27,8 @@ import (
 	"gitea-infra/pkg/telemetry"
 )
 
-// The vm/ tree and its bootstrap script live one level up from infra/.
+// The vm/ tree -- the playbook (vm/ansible) and the files it installs -- lives
+// one level up from infra/.
 const vmDir = "../vm"
 
 func main() {
@@ -100,8 +99,7 @@ func main() {
 		}
 
 		inst, err := compute.New(ctx, cfg, net, accounts.VM,
-			buckets.Config, buckets.Backup, buckets.ConfigHash,
-			filepath.Join(vmDir, "bootstrap.sh"), apis)
+			buckets.Config, buckets.Backup, buckets.ConfigHash, apis)
 		if err != nil {
 			return err
 		}

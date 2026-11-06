@@ -1,0 +1,9 @@
+# The names vm/nftables/gitea.nft and vm/fail2ban/jail.d/gitea.local use.
+# tests/render.yml loads this same file.
+PODMAN_SUBNET: "{{ podman_subnet }}"
+PODMAN_GATEWAY: "{{ podman_gateway }}"
+# One config value drives both halves: the WAF only blocks in On, and only then
+# is it safe to escalate a WAF verdict into an nftables ban.
+CORAZA_JAIL_ENABLED: "{{ 'true' if waf_mode == 'On' else 'false' }}"
+# Empty when runners are off, which leaves ignoreip exactly as it was.
+RUNNER_EGRESS_IP: "{{ runner_egress_ip }}"

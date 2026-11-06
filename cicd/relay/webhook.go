@@ -291,15 +291,42 @@ func Classify(paths []string, complete bool) (mode string, pipelines []string, r
 // does, by the pipeline that runs them. A change is live at the next release
 // -- the unattended weekly rebuild, once automation is on -- so it must pass
 // that pipeline's drills first, and scripts/cicd/release_gate.py refuses an
-// automatic run until it has. Keep in step with that script's FILES.
+// automatic run until it has. Keep in step with that script's FILES: the
+// engine is every file its ENGINE names, one line each.
 var ReleasePaths = map[string][]string{
-	"cloudbuild/image.yaml":        {PipelineImage},
-	"cloudbuild/infra.yaml":        {PipelineInfra},
-	"scripts/cicd/infra_deploy.py": {PipelineInfra},
-	"scripts/cicd/release_gate.py": {PipelineImage, PipelineInfra},
-	"scripts/ops/gitea_ops.py":     {PipelineImage, PipelineInfra},
-	"scripts/ops/launch_job.py":    {PipelineImage, PipelineInfra},
-	"scripts/ops/vm-steps.sh":      {PipelineImage, PipelineInfra},
+	"cloudbuild/image.yaml":                               {PipelineImage},
+	"cloudbuild/infra.yaml":                               {PipelineInfra},
+	"scripts/cicd/infra_deploy.py":                        {PipelineInfra},
+	"scripts/cicd/release_gate.py":                        {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/ansible.cfg":                     {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/files/gitea-ops-lib.sh":          {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/ops.yml":                         {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/requirements.in":                 {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/requirements.txt":                {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/auto-update.yml":           {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/config-tarball.yml":        {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/dump.yml":                  {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/inventory.yml":             {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/journal-errors.yml":        {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/marker-check.yml":          {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/marker.yml":                {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/migrate.yml":               {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/pause-timers.yml":          {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/pre-restore-list.yml":      {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/pre-restore-remove.yml":    {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/pull.yml":                  {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/restart-if-not.yml":        {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/restarts.yml":              {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/restore-sync.yml":          {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/restore-test-dump.yml":     {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/restore-test-snapshot.yml": {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/resume-timers.yml":         {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/running-digest.yml":        {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/selftest.yml":              {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/start.yml":                 {PipelineImage, PipelineInfra},
+	"scripts/ops/ansible/steps/stop.yml":                  {PipelineImage, PipelineInfra},
+	"scripts/ops/gitea_ops.py":                            {PipelineImage, PipelineInfra},
+	"scripts/ops/launch_job.py":                           {PipelineImage, PipelineInfra},
 }
 
 // Drills each pipeline's release code must pass (scripts/cicd/release_gate.py).

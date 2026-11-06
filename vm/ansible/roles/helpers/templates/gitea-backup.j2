@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Streams a portable `gitea dump` straight to Cloud Storage.
+#
+# Complements the PD snapshot policy rather than replacing it: a dump restores
+# onto any host, a snapshot only restores this disk.
+set -euo pipefail
+BUCKET="{{ backup_bucket }}"
+[[ -n "${BUCKET}" ]] || { echo "no backup bucket configured" >&2; exit 0; }
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+podman exec -u 1000 gitea gitea dump -c /etc/gitea/app.ini -t /tmp -f - \
+    | gcloud storage cp - "gs://${BUCKET}/dumps/gitea-${stamp}.zip"
+echo "backup complete: gs://${BUCKET}/dumps/gitea-${stamp}.zip"

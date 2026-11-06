@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Reboots only when the package layer says a reboot is genuinely required.
+#
+# `needs-restarting -r` exits 0 for "no reboot needed" and 1 for "reboot
+# needed". Anything else -- most likely 127 because the dnf5 plugin is packaged
+# differently on this release -- means we do not KNOW, and "do not know" must
+# never mean "reboot the Gitea host every Sunday".
+set -uo pipefail
+
+dnf needs-restarting -r >/dev/null 2>&1
+rc=$?
+
+case "${rc}" in
+    0) echo "no reboot required" ; exit 0 ;;
+    1) echo "reboot required by pending updates -- rebooting" ; systemctl reboot ;;
+    *) echo "needs-restarting returned ${rc} (plugin missing?) -- NOT rebooting" >&2
+       echo "install the dnf needs-restarting plugin, or this check is inert" >&2
+       exit 0 ;;
+esac

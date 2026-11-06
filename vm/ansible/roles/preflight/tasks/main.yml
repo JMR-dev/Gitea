@@ -1,0 +1,77 @@
+# The VM's inputs are its instance metadata, set by Pulumi (infra/pkg/compute)
+# -- the same keys vm/bootstrap.sh read, with the same defaults. Read on the
+# VM, from the metadata server, so Pulumi stays the one source of values and a
+# run needs nothing but SSH. no_log throughout: runner-egress-ip carries the
+# operator's own addresses (gitea:fail2banIgnore).
+- name: Wait for the VM to accept the run
+  ansible.builtin.wait_for_connection:
+    timeout: 600
+
+- name: Read the instance metadata
+  ansible.builtin.uri:
+    url: http://169.254.169.254/computeMetadata/v1/instance/attributes/?recursive=true
+    headers:
+      Metadata-Flavor: Google
+    return_content: true
+  register: metadata_raw
+  check_mode: false
+  no_log: true
+
+- name: Take the inputs from it
+  ansible.builtin.set_fact:
+    md_startup_script: "{{ 'startup-script' in metadata_raw.json }}"
+    gcp_project: "{{ metadata_raw.json['gcp-project'] | default('') }}"
+    backup_bucket: "{{ metadata_raw.json['backup-bucket'] | default('') }}"
+    ar_host: "{{ metadata_raw.json['ar-host'] | default('') }}"
+    image_gitea: "{{ metadata_raw.json['image-gitea'] | default('') }}"
+    image_caddy: "{{ metadata_raw.json['image-caddy'] | default('') }}"
+    domain: "{{ metadata_raw.json['domain'] | default('') }}"
+    app_name: "{{ metadata_raw.json['app-name'] | default('', true) or 'Gitea' }}"
+    podman_subnet: "{{ metadata_raw.json['podman-subnet'] | default('') }}"
+    podman_gateway: "{{ metadata_raw.json['podman-gateway'] | default('') }}"
+    require_signin_view: "{{ metadata_raw.json['require-signin-view'] | default('', true) or 'false' }}"
+    # DetectionOnly is the safe default: run it, read what it flags, add
+    # exclusions, then switch to On. See docs/waf.md.
+    waf_mode: "{{ metadata_raw.json['waf-mode'] | default('', true) or 'DetectionOnly' }}"
+    data_disk_device: "{{ metadata_raw.json['data-disk-device'] | default('', true) or '/dev/disk/by-id/google-gitea-data' }}"
+    # Only present when runners or gitea:fail2banIgnore are on. Empty is fine
+    # everywhere it is used.
+    runner_egress_ip: "{{ metadata_raw.json['runner-egress-ip'] | default('') }}"
+    # The rehearsal VM reads gitea-rehearsal-* instead of prod's secrets.
+    secret_prefix: "{{ metadata_raw.json['gitea-secret-prefix'] | default('', true) or 'gitea' }}"
+  no_log: true
+
+- name: Check the inputs
+  ansible.builtin.assert:
+    that:
+      - domain | length > 0
+      - gcp_project | length > 0
+      - ar_host | length > 0
+      - image_gitea | length > 0
+      - image_caddy | length > 0
+      - podman_subnet | length > 0
+      - podman_gateway | length > 0
+      - waf_mode in ['On', 'DetectionOnly', 'Off']
+    fail_msg: >-
+      instance metadata is incomplete or invalid (domain, gcp-project, ar-host,
+      image-gitea, image-caddy, podman-subnet, podman-gateway, and waf-mode one
+      of On, DetectionOnly, Off) -- infra/pkg/compute sets these
+    quiet: true
+
+# A VM whose startup script is vm/bootstrap.sh configures itself at every
+# boot and on gitea-config-sync; applying this as well would have the two
+# fight. Check mode only reads, so it may run there (the pre-cutover proof).
+- name: Refuse to apply over vm/bootstrap.sh
+  ansible.builtin.fail:
+    msg: >-
+      this VM still has a startup-script (vm/bootstrap.sh configures it);
+      only --check may run here
+  when: md_startup_script | bool and not ansible_check_mode
+
+# Every file module on an SELinux host needs Python's SELinux bindings.
+- name: SELinux bindings for Python
+  ansible.builtin.raw: rpm -q python3-libselinux >/dev/null 2>&1 || dnf -y -q install python3-libselinux
+  register: libselinux
+  changed_when: "'Installed' in libselinux.stdout"
+  check_mode: false
+  when: not ansible_check_mode

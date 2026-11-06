@@ -2,36 +2,21 @@
 #
 # VM-side steps for scripts/ops/gitea_ops.py. Runs as root ON gitea-vm.
 #
-# gitea_ops.py ships this file over IAP SSH for every call and runs one step;
-# it is never installed on the VM. Installing it would mean editing
-# vm/bootstrap.sh, and the whole of that script is the instance's
-# metadataStartupScript -- any edit replaces the VM.
-#
 # Each step is one small action. The orchestrator owns every decision and the
 # order they happen in, so it can run from a workstation or from Cloud Build
 # and roll back from wherever it got to.
-#
-# Usage: vm-steps.sh <step> [args...]
 
 set -euo pipefail
 
-readonly AUTHFILE=/etc/containers/ar-auth.json
 readonly DATA=/var/lib/gitea
 readonly APP_INI=/etc/gitea/app.ini
 # The device name gitea_ops.py attaches a snapshot-derived disk under.
 readonly RESTORE_DEV=/dev/disk/by-id/google-gitea-restore
 readonly RESTORE_MNT=/mnt/gitea-restore
 readonly TEST_CTR=gitea-restore-test
-# The two timers that must not fire mid-release: auto-update would race the
-# rollout, and the reboot window would reboot with a restore disk attached.
-readonly TIMERS=(podman-auto-update.timer gitea-reboot-window.timer)
 
 log() { echo "[vm-steps] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
-
-# The credential file is refreshed by a timer; a long-idle box can hold a
-# stale one, and a pull that fails on auth looks like a missing image.
-refresh_auth() { systemctl start gitea-ar-auth.service; }
 
 # A private copy of app.ini for one-shot containers. Mounting the real file
 # with :Z would relabel it with THAT container's private MCS category, and the
@@ -122,64 +107,17 @@ count_files() {
 
 # --- steps ------------------------------------------------------------------
 
+# selftest: the sha256 of this script's own text. ops.yml never copies it to
+# the VM: it runs it as `bash -c <text> gitea-ops-lib <step> [args...]`, so
+# the text is BASH_EXECUTION_STRING, and `gitea_ops.py probe` compares this
+# with the file's own hash -- proof it arrived byte for byte, with nothing
+# templated or expanded on the way.
+step_selftest() {
+    printf '%s' "${BASH_EXECUTION_STRING:?run as bash -c, by ops.yml}" | sha256sum | cut -d' ' -f1
+}
+
 # inventory TOOL_IMAGE [DATA_DIR]: the inventory of the live tree (default).
 step_inventory() { inventory "${2:-${DATA}}" "$1"; }
-
-# pull IMAGE...: pull by reference, print each local digest on stdout.
-step_pull() {
-    refresh_auth
-    local img
-    for img in "$@"; do
-        podman pull --authfile "${AUTHFILE}" "${img}" >&2
-        podman image inspect "${img}" --format '{{.Digest}}'
-    done
-}
-
-# pause-timers [DEADMAN]: stop the timers, and arm a dead man's switch.
-#
-# The engine resumes the timers itself, but only if it is still alive to. If
-# it dies mid-release (its pod, its node, a laptop), the switch re-enables
-# them after DEADMAN (default 3h, longer than the engine Job's 2h deadline)
-# and logs at crit. It does NOT touch gitea.service: whether starting it is
-# safe depends on how far a migration got, which is a decision for a person.
-# And with a restore disk still attached it leaves the timers paused too,
-# because the reboot window would then boot onto a copy (fstab mounts by UUID).
-step_pause_timers() {
-    systemctl stop "${TIMERS[@]}"
-    disarm_deadman
-    systemd-run --quiet --unit=gitea-ops-deadman --on-active="${1:-3h}" \
-        --timer-property=AccuracySec=1min \
-        --description="Re-enable Gitea's timers if the release engine died" \
-        /bin/bash -c '
-            if [ -e /dev/disk/by-id/google-gitea-restore ]; then
-                logger -p user.crit -t gitea-ops "DEADMAN: the release engine never came back and a restore disk is attached; timers left paused"
-            else
-                systemctl start podman-auto-update.timer gitea-reboot-window.timer
-                logger -p user.crit -t gitea-ops "DEADMAN: the release engine never came back; timers re-enabled; gitea.service is $(systemctl is-active gitea.service)"
-            fi'
-}
-step_resume_timers() { systemctl start "${TIMERS[@]}"; disarm_deadman; }
-disarm_deadman() {
-    systemctl stop gitea-ops-deadman.timer gitea-ops-deadman.service 2>/dev/null || true
-    systemctl reset-failed gitea-ops-deadman.service 2>/dev/null || true
-}
-
-# stop UNIT / start UNIT. start blocks until the quadlet's Notify=healthy
-# fires or TimeoutStartSec runs out, so its exit status is the health verdict.
-step_stop()  { systemctl stop "$1"; sync; }
-step_start() { systemctl start "$1"; }
-
-# restart-if-not DIGEST UNIT CONTAINER: restart only when the container is not
-# already running DIGEST (after a :prod tag move and a pull).
-step_restart_if_not() {
-    local want="$1" unit="$2" ctr="$3" have
-    have=$(podman inspect "${ctr}" --format '{{.ImageDigest}}' 2>/dev/null || true)
-    if [[ "${have}" == "${want}" ]]; then
-        log "${ctr} already runs ${want}"
-        return 0
-    fi
-    systemctl restart "${unit}"
-}
 
 # migrate IMAGE: the explicit schema migration, run as a one-shot BEFORE the
 # unit starts. Inside the unit, a long migration would be killed by
@@ -194,18 +132,6 @@ step_migrate() {
     gitea_oneshot "${img}" "${DATA}" doctor check --config /etc/gitea/app.ini >&2 \
         || log "WARNING: doctor check reported problems (not fatal)"
 }
-
-step_auto_update() {
-    refresh_auth
-    systemctl start podman-auto-update.service
-    journalctl -u podman-auto-update -n 20 --no-pager -o cat >&2 || true
-}
-
-# running-digest CONTAINER: the image digest the container is actually running.
-step_running_digest() { podman inspect "$1" --format '{{.ImageDigest}}'; }
-
-# restarts UNIT: systemd's restart counter, compared before/after a soak.
-step_restarts() { systemctl show "$1" -p NRestarts --value; }
 
 # journal-errors UNIT SINCE: fatal and panic lines since SINCE (a UTC time).
 step_journal_errors() {
@@ -239,11 +165,6 @@ step_config_tarball() {
         usr/local/sbin/gitea-bootstrap opt/gitea-config \
         | gcloud storage cp - "${url}"
 }
-
-# marker NAME: drop a file in the live data directory. The data-restore drill
-# writes one AFTER its snapshot; a restore that really happened removes it.
-step_marker()       { install -o 1000 -g 1000 -m 0644 /dev/null "${DATA}/.drill-$1"; }
-step_marker_check() { [[ -e "${DATA}/.drill-$1" ]] && echo present || echo absent; }
 
 # restore-sync TOOL_IMAGE: replace /var/lib/gitea with the attached snapshot copy.
 #

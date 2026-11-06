@@ -1,0 +1,6 @@
+[Unit]
+Description=Caddy autosaved JSON config storage
+
+[Volume]
+VolumeName=caddy-config
+Label=app=gitea

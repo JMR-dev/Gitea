@@ -1,0 +1,16 @@
+# running-digest CONTAINER: the image digest the container is actually
+# running -- the container's ImageDigest, which is what Artifact Registry
+# reports for :prod. (The image's own Digest, which pull prints, can differ.)
+- name: Inspect {{ step_args[0] }}
+  ansible.builtin.command:
+    argv: [podman, inspect, "{{ step_args[0] }}"]
+    expand_argument_vars: false
+  register: inspected
+  changed_when: false
+
+- name: Its digest
+  ansible.builtin.set_fact:
+    step_result:
+      rc: 0
+      stdout: "{{ (inspected.stdout | from_json | first).ImageDigest }}"
+      stderr: "{{ inspected.stderr }}"

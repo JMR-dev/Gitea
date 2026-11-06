@@ -1,0 +1,8 @@
+# restore-test-dump GS_URL IMAGE: rebuild an instance from a dump on the
+# attached scratch disk, then boot it in isolation.
+# Bash: step_restore_test_dump in files/gitea-ops-lib.sh.
+- name: restore-test-dump (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'restore-test-dump'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result
