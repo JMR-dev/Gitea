@@ -358,6 +358,38 @@ Gitea Actions job: the release stops Gitea, and an Actions job reports to
 Gitea. `RUN_ON=local` runs the engine here instead, as break-glass for when
 the cluster itself is broken. Keep the machine awake, and use tmux.
 
+**How it reaches the VM.** Each VM-side step (stop, pull, migrate, dump, the
+restores, ...) is one run of `scripts/ops/ansible/ops.yml` over IAP SSH, as
+the engine's OS Login user, with an hour's key it extends as it goes. The
+steps that move data are bash (`files/gitea-ops-lib.sh`), passed to
+`bash -c`: nothing is copied to or installed on the VM. Before it changes
+anything, the engine installs its pinned ansible-core from PyPI
+(`requirements.txt`, hash-locked; a few seconds), and stops with exit 3 if it
+can't. `make ops-probe` runs every step that changes nothing and checks what
+each says (the lib arrived intact, the digests are `:prod`'s, the inventory
+reads); run it first after any change to the engine. `make ops-check` checks
+the steps locally.
+
+**If this engine misbehaves** (a step that hangs or says something wrong),
+the bash engine it replaced still works: the manifests are the same.
+
+1. Cancel the build (`gcloud builds cancel`), then delete the Job and its
+   ConfigMap (`make kube` first; a launcher refuses to start while the
+   ConfigMap is left behind):
+   `kubectl --context=gke_<project>_<zone>_gitea-runners -n gitea-ops delete job/gitea-ops configmap/gitea-ops`.
+   The engine takes no lock for a rollback, so two must never act at once.
+2. Look at the VM: an attached restore disk (`lsblk`), one-shot containers
+   (`podman ps -a`), `gitea` and `caddy`, the dead man's switch
+   (`systemctl list-timers 'gitea-ops-deadman*'`), and the run's newest
+   `progress-*.json`. Detach and delete any restore disk.
+3. Roll back with the bash engine, from a worktree at `c6ac72c` (its attested
+   code): `git worktree add /tmp/bash-engine c6ac72c && cd /tmp/bash-engine &&
+   make ops-rollback MANIFEST=<that progress url>`, adding `RESTORE_DATA=1`
+   if it got past `snapshotted`. Either engine disarms the other's dead man's
+   switch (the same unit, `gitea-ops-deadman`).
+4. If that fails too, do it by hand: *Roll back to a previous image* and
+   *Restore the data disk from a snapshot*, below.
+
 **If the engine itself dies mid-release** (its node, an OOM, the 2-hour
 deadline):
 

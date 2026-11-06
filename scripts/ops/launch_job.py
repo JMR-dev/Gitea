@@ -32,7 +32,25 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = ["gitea_ops.py", "vm-steps.sh"]
+
+
+def engine_files():
+    """The engine the Job runs, as paths under scripts/ops: gitea_ops.py, this
+    launcher, and everything under ansible/ (its VM steps). The same set as
+    release_gate.py's ENGINE; test_cicd.py checks."""
+    out = ["gitea_ops.py", "launch_job.py"]
+    for root, dirs, names in os.walk(os.path.join(HERE, "ansible")):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__")
+        out += sorted(os.path.relpath(os.path.join(root, n), HERE) for n in names
+                      if not n.startswith(".") and not n.endswith((".pyc", ".swp", ".retry")))
+    return out
+
+
+def configmap_key(path):
+    """A ConfigMap key cannot hold a /: ansible/steps/start.yml is
+    ansible__steps__start.yml, and the volume's items put it back."""
+    return path.replace("/", "__")
+
 
 NAMESPACE = "gitea-ops"      # infra/pkg/ops.Namespace
 KSA = "gitea-release"        # infra/pkg/ops.KSAName
@@ -44,7 +62,7 @@ JOB = "gitea-ops"
 IMAGE = ("gcr.io/google.com/cloudsdktool/google-cloud-cli:589.0.0-slim"
          "@sha256:159c2b19fee4d45a4ee0d5388f4f6a22d3598b217a26213e9fe3e0387e0d992c")
 # Longer than a release with its soak and a data restore; shorter than the
-# VM-side dead man's switch (vm-steps.sh pause-timers, 3h).
+# VM-side dead man's switch (the pause-timers step, 3h).
 DEADLINE_SECONDS = 2 * 3600
 
 
@@ -117,11 +135,12 @@ def job_state(job):
 def manifests(engine_args, project):
     # A Cloud Build source tarball has no .git; the pipeline names the commit.
     commit = os.environ.get("COMMIT_SHA") or git("rev-parse", "HEAD")
-    dirty = bool(git("status", "--porcelain", "--", *SCRIPTS))
+    dirty = bool(git("status", "--porcelain", "--", "."))
+    files = engine_files()
     data = {}
-    for name in SCRIPTS:
+    for name in files:
         with open(os.path.join(HERE, name)) as f:
-            data[name] = f.read()
+            data[configmap_key(name)] = f.read()
     labels = {"app": APP}
     annotations = {
         "gitea-ops/commit": commit + ("-dirty" if dirty else ""),
@@ -176,7 +195,9 @@ def manifests(engine_args, project):
                                          {"name": "work", "mountPath": "/work"}],
                     }],
                     "volumes": [
-                        {"name": "ops", "configMap": {"name": JOB, "defaultMode": 0o755}},
+                        {"name": "ops", "configMap": {
+                            "name": JOB, "defaultMode": 0o755,
+                            "items": [{"key": configmap_key(n), "path": n} for n in files]}},
                         {"name": "work", "emptyDir": {}},
                     ],
                 },

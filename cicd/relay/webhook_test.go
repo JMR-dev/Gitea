@@ -218,6 +218,7 @@ func TestClassify(t *testing.T) {
 		{"gated wins over deploy", []string{"infra/main.go", "image/gitea.version"}, true, ModeGated, []string{"infra", "image"}},
 		{"docs only", []string{"docs/runbook.md", "README.md"}, true, ModeDeploy, nil},
 		{"engine only", []string{"scripts/ops/gitea_ops.py"}, true, ModeDeploy, nil},
+		{"engine vm step deploys nothing", []string{"scripts/ops/ansible/steps/start.yml"}, true, ModeDeploy, nil},
 		{"ci program only", []string{"cicd/pkg/relay/relay.go", "cicd/relay/webhook.go"}, true, ModeDeploy, nil},
 		{"infra deploy driver", []string{"scripts/cicd/infra_deploy.py"}, true, ModeDeploy, []string{"infra"}},
 		{"shared release gate", []string{"scripts/cicd/release_gate.py"}, true, ModeDeploy, []string{"infra", "image"}},
@@ -336,7 +337,7 @@ func TestOversizedBodyRefused(t *testing.T) {
 func TestReleaseCodeNeedsDrills(t *testing.T) {
 	h, pub, st := newHook()
 	body := pushBody(t, func(p map[string]any) {
-		p["commits"] = []any{map[string]any{"id": "x", "modified": []any{"scripts/ops/vm-steps.sh"}}}
+		p["commits"] = []any{map[string]any{"id": "x", "modified": []any{"scripts/ops/ansible/ops.yml"}}}
 	})
 	if rec := deliver(t, h, "push", body, sign); rec.Code != http.StatusNoContent || len(pub.got) != 0 {
 		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
@@ -362,6 +363,7 @@ func TestDrillStatusesByPipeline(t *testing.T) {
 		{"image pipeline only", []string{"cloudbuild/image.yaml"}, true, 2},
 		{"infra deploy script", []string{"scripts/cicd/infra_deploy.py"}, true, 1},
 		{"shared engine", []string{"scripts/ops/gitea_ops.py"}, true, 3},
+		{"engine vm step", []string{"scripts/ops/ansible/steps/start.yml"}, true, 3},
 		{"not release code", []string{"infra/main.go", "image/gitea/Dockerfile", "scripts/cicd/bootstrap.py"}, true, 0},
 		{"truncated", nil, false, 3},
 	} {

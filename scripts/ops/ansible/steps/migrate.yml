@@ -1,0 +1,7 @@
+# migrate IMAGE: the schema migration, as a one-shot container, Gitea stopped.
+# Bash: step_migrate in files/gitea-ops-lib.sh.
+- name: migrate (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'migrate'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result

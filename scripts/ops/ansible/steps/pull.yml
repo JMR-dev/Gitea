@@ -1,0 +1,36 @@
+# pull IMAGE...: pull by reference, print each local digest on stdout (the
+# image's own Digest, one line each).
+#
+# The registry credential is refreshed first: a timer renews it, a long-idle
+# box can hold a stale one, and a pull that fails on auth looks like a
+# missing image.
+- name: Refresh the registry credential
+  ansible.builtin.command:
+    argv: [systemctl, start, gitea-ar-auth.service]
+    expand_argument_vars: false
+
+- name: Pull
+  ansible.builtin.command:
+    argv: [podman, pull, --authfile, /etc/containers/ar-auth.json, "{{ item }}"]
+    expand_argument_vars: false
+  loop: "{{ step_args }}"
+  register: pulled
+
+- name: Inspect
+  ansible.builtin.command:
+    argv: [podman, image, inspect, "{{ item }}"]
+    expand_argument_vars: false
+  loop: "{{ step_args }}"
+  register: inspected
+  changed_when: false
+
+- name: Their digests
+  ansible.builtin.set_fact:
+    step_result:
+      rc: 0
+      # Double-quoted, so YAML makes the \n a newline: Jinja leaves a
+      # backslash in a string literal as it is.
+      stdout: "{{ inspected.results | map(attribute='stdout') | map('from_json') | map('first')
+                  | map(attribute='Digest') | join('\n') }}"
+      stderr: "{{ pulled.results | map(attribute='stderr') | zip(pulled.results | map(attribute='stdout'))
+                  | flatten | select | join('\n') }}"

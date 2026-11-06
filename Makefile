@@ -31,7 +31,7 @@ fmt: ## Format Go sources
 # -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
 # Shell that runs on the VM (shipped by the playbook) or for it.
-SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/vm-steps.sh scripts/rehearsal.sh \
+SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh scripts/rehearsal.sh \
 	vm/ansible/roles/app/files/gitea-render-secrets vm/ansible/roles/helpers/files/gitea-ar-auth \
 	vm/ansible/roles/helpers/files/gitea-reboot-if-needed
 .PHONY: check
@@ -124,6 +124,18 @@ ops-rollback: ## Undo a release from its manifest (MANIFEST=...; RESTORE_DATA=1 
 .PHONY: ops-drill-restore
 ops-drill-restore: ## Prove the latest snapshot and dump restore, in isolation (TOOL_IMAGE=... before 28)
 	$(OPS) --yes drill-restore $(if $(TOOL_IMAGE),--tool-image $(TOOL_IMAGE))
+
+.PHONY: ops-probe
+ops-probe: ## Read-only: run every VM step that changes nothing, and check what each says
+	$(OPS) probe
+
+# The engine's VM steps (scripts/ops/ansible) with the pinned ansible-core and
+# podman, on this machine only: syntax, the rules every step follows, ops.yml
+# end to end against localhost, and the bash lib in an AlmaLinux 10 container.
+# Never reaches a cloud project (scripts/cicd/ops_check.py).
+.PHONY: ops-check
+ops-check: ## Check the release engine's Ansible steps locally (pinned ansible-core, podman)
+	python3 scripts/cicd/ops_check.py
 
 .PHONY: rollout
 rollout: ## Pull the latest :prod images onto the VM right now

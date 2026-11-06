@@ -1,0 +1,7 @@
+# inventory TOOL_IMAGE [DATA_DIR]: users, repos and their ref hashes, as TSV.
+# Bash: step_inventory in files/gitea-ops-lib.sh.
+- name: inventory (gitea-ops-lib.sh)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-c', lib, 'gitea-ops-lib', 'inventory'] + step_args }}"
+    expand_argument_vars: false
+  register: step_result
