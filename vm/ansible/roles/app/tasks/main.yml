@@ -1,0 +1,189 @@
+# Gitea and Caddy: images, config (app.ini and the Caddyfile through
+# files/gitea-render-secrets), quadlets, units and timers. Any change to them
+# restarts both, Gitea first, as vm/bootstrap.sh's render_all did.
+- name: Config directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+  loop: [/etc/gitea, /etc/caddy, /etc/containers/systemd]
+
+# Pulled here, on a VM that has neither, so the network probe below can run on
+# the very first pass; normally the quadlets and podman-auto-update pull.
+- name: Images present?
+  ansible.builtin.command: podman image exists {{ item }}
+  loop: ["{{ image_gitea }}", "{{ image_caddy }}"]
+  register: images
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Artifact Registry credentials, to pull
+  ansible.builtin.command: /usr/local/bin/gitea-ar-auth
+  when: images.results | selectattr('rc', '!=', 0) | list | length > 0
+
+- name: Pull the images
+  ansible.builtin.command: podman pull --quiet --authfile /etc/containers/ar-auth.json {{ item.item }}
+  loop: "{{ images.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc != 0
+
+# Caddy on the podman bridge needs the metadata server reachable from a
+# container there (the ACME DNS-01 plugin authenticates through it); if it is
+# not, Caddy uses the host network. Probed once and cached, as before.
+- name: Caddy's network, as probed before
+  ansible.builtin.slurp:
+    src: /etc/gitea/caddy-network
+  register: caddy_network_cache
+  failed_when: false
+
+- name: Probe Caddy's network
+  ansible.builtin.shell: |
+    podman network create --ignore --subnet {{ podman_subnet }} --gateway {{ podman_gateway }} gitea >/dev/null 2>&1 || true
+    if podman run --rm --network gitea --entrypoint curl {{ image_gitea }} \
+        -fsS -m 10 -H 'Metadata-Flavor: Google' \
+        http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token >/dev/null 2>&1; then
+      echo bridge
+    else
+      echo host
+    fi
+  register: caddy_probe
+  changed_when: false
+  when: caddy_network_cache.content is not defined and not ansible_check_mode
+
+- name: Remember Caddy's network
+  ansible.builtin.copy:
+    dest: /etc/gitea/caddy-network
+    content: "{{ caddy_probe.stdout }}\n"
+    mode: "0644"
+  when: caddy_probe is not skipped and caddy_probe.stdout is defined
+
+- name: Caddy's network
+  ansible.builtin.set_fact:
+    caddy_mode: >-
+      {{ (caddy_network_cache.content | b64decode | trim) if caddy_network_cache.content is defined
+         else (caddy_probe.stdout | default('bridge')) }}
+
+- name: Warn when Caddy is on the host network
+  ansible.builtin.debug:
+    msg: "WARN: metadata server unreachable from the podman bridge -- Caddy uses the host network"
+  when: caddy_mode == 'host'
+
+# Container-local sysctls are unavailable on the host network, so allow
+# unprivileged binds to 80/443 host-wide instead. Narrower than granting the
+# container CAP_NET_BIND_SERVICE.
+- name: Unprivileged ports, host network only
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-gitea-caddy.conf
+    content: "net.ipv4.ip_unprivileged_port_start = 80\n"
+    mode: "0644"
+  register: caddy_sysctl
+  when: caddy_mode == 'host'
+
+- name: Apply it
+  ansible.builtin.command: sysctl -q -p /etc/sysctl.d/90-gitea-caddy.conf
+  when: caddy_mode == 'host' and caddy_sysctl is changed
+
+- name: No host-wide port sysctl on the bridge
+  ansible.builtin.file:
+    path: /etc/sysctl.d/90-gitea-caddy.conf
+    state: absent
+  when: caddy_mode != 'host'
+
+- name: Runner registration token
+  ansible.builtin.script:
+    cmd: gitea-render-secrets {{ '--check' if ansible_check_mode else '' }} runner-token {{ gcp_project }} {{ secret_prefix }}
+  register: runner_token
+  changed_when: runner_token.stdout_lines[0] in ['changed', 'would-change']
+  check_mode: false
+  notify: gitea config changed
+
+- name: Whether Gitea gets it
+  ansible.builtin.set_fact:
+    runner_token_present: "{{ runner_token.stdout_lines[1] == 'present' }}"
+
+- name: app.ini
+  ansible.builtin.script:
+    cmd: >-
+      gitea-render-secrets {{ '--check' if ansible_check_mode else '' }}
+      app-ini {{ gcp_project }} {{ secret_prefix }} {{ image_gitea }}
+  environment:
+    GITEA_RENDER_INPUT: >-
+      {{ lookup('ansible.builtin.template', vm_src + '/config/app.ini.tmpl',
+                variable_start_string='${', variable_end_string='}') }}
+  register: app_ini
+  changed_when: app_ini.stdout_lines[0] in ['changed', 'would-change']
+  check_mode: false
+  notify: gitea config changed
+
+- name: app.ini diff (secrets masked)
+  ansible.builtin.debug:
+    msg: "{{ app_ini.stdout_lines[1:] }}"
+  when: app_ini is changed and ansible_diff_mode
+
+- name: Caddyfile
+  ansible.builtin.script:
+    cmd: gitea-render-secrets {{ '--check' if ansible_check_mode else '' }} caddyfile {{ gcp_project }} {{ secret_prefix }}
+  environment:
+    GITEA_RENDER_INPUT: >-
+      {{ lookup('ansible.builtin.template', vm_src + '/config/Caddyfile.tmpl',
+                variable_start_string='${', variable_end_string='}') }}
+  register: caddyfile
+  changed_when: caddyfile.stdout_lines[0] in ['changed', 'would-change']
+  check_mode: false
+  notify: gitea config changed
+
+- name: Caddyfile diff (contact masked)
+  ansible.builtin.debug:
+    msg: "{{ caddyfile.stdout_lines[1:] }}"
+  when: caddyfile is changed and ansible_diff_mode
+
+- name: Quadlets
+  ansible.builtin.template:
+    src: "{{ vm_src }}/quadlets/{{ item }}"
+    dest: /etc/containers/systemd/{{ item }}
+    mode: "0644"
+    variable_start_string: "${"
+    variable_end_string: "}"
+  loop: [gitea.network, gitea.container, caddy.container, caddy-data.volume, caddy-config.volume]
+  notify: gitea config changed
+
+- name: Units
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: /etc/systemd/system/{{ item | basename }}
+    mode: "0644"
+  with_fileglob: "{{ vm_src }}/systemd/*"
+  notify: gitea config changed
+
+# What vm/bootstrap.sh left behind: its config-sync unit, the copy of itself
+# that unit ran, and the copy of vm/ it pulled from the config bucket.
+- name: Remove the bash config path
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/gitea-config-sync.service
+    - /usr/local/sbin/gitea-bootstrap
+    - /opt/gitea-config
+  notify: units changed
+
+- name: Timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: [gitea-ar-auth.timer, gitea-backup.timer, gitea-reboot-window.timer]
+
+- name: Restart what changed
+  ansible.builtin.meta: flush_handlers
+
+# Quadlet units are generated at daemon-reload and started at boot by their
+# [Install] section; they cannot be `enabled`. Starting gitea blocks until its
+# health check passes (Notify=healthy).
+- name: Gitea and Caddy running
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: started
+  loop: [gitea.service, caddy.service]

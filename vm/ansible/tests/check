@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""The playbook's golden tests: renders every fixture in tests/golden/ with
+tests/render.yml and compares each file, byte for byte, with its .golden --
+which tests/make-goldens wrote the way vm/bootstrap.sh rendered it. Secrets
+are filled in as files/gitea-render-secrets does on the VM.
+
+Run with ansible-core on PATH: scripts/cicd/infra_deploy.py's ansible_checks
+does (PR previews and deploys), and so does `make check`.
+"""
+import difflib
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SECRETS = {"app.ini": ["GITEA_SECRET_KEY", "GITEA_INTERNAL_TOKEN", "GITEA_OAUTH2_JWT_SECRET", "GITEA_LFS_JWT_SECRET"],
+           "Caddyfile": ["CADDY_EMAIL"]}
+
+
+def main():
+    failures, checked = [], 0
+    for name in sorted(os.listdir(os.path.join(HERE, "golden"))):
+        d = os.path.join(HERE, "golden", name)
+        fixture = os.path.join(d, "fixture.yml")
+        with open(fixture) as fh:
+            secrets = yaml.safe_load(fh)["secrets"]
+        with tempfile.TemporaryDirectory() as out:
+            r = subprocess.run(["ansible-playbook", "-i", "localhost,", os.path.join(HERE, "render.yml"),
+                                "-e", f"@{fixture}", "-e", f"out={out}"], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(r.stdout[-3000:], r.stderr[-3000:], sep="\n")
+                failures.append(f"{name}: render.yml failed")
+                continue
+            for final, names in SECRETS.items():
+                with open(os.path.join(out, final + ".stage"), "rb") as fh:
+                    text = fh.read().decode()
+                for n in names:
+                    text = text.replace("${" + n + "}", secrets[n])
+                with open(os.path.join(out, final), "wb") as fh:
+                    fh.write(text.encode())
+            for g in sorted(f for f in os.listdir(d) if f.endswith(".golden")):
+                checked += 1
+                want = open(os.path.join(d, g), "rb").read()
+                got_path = os.path.join(out, g[: -len(".golden")])
+                got = open(got_path, "rb").read() if os.path.exists(got_path) else b""
+                if got != want:
+                    diff = difflib.unified_diff(want.decode().splitlines(True), got.decode().splitlines(True),
+                                                f"golden/{name}/{g}", "rendered")
+                    sys.stdout.writelines(diff)
+                    failures.append(f"{name}/{g}")
+    if failures:
+        print("golden mismatches: " + ", ".join(failures))
+        return 1
+    print(f"tests/check: {checked} rendered files match their goldens")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

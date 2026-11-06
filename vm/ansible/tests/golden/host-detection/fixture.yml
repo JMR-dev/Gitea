@@ -1,0 +1,22 @@
+# Caddy on the host network, no runner token, the WAF only detecting (jail
+# off), no runner-egress-ip, an app name with a space, no backup bucket, and
+# no ACME contact.
+app_name: Our Gitea
+domain: git.example.test
+require_signin_view: "false"
+waf_mode: DetectionOnly
+gcp_project: other-project
+image_gitea: us-central1-docker.pkg.dev/other-project/gitea/gitea:prod
+image_caddy: us-central1-docker.pkg.dev/other-project/gitea/caddy:prod
+podman_subnet: 10.89.20.0/24
+podman_gateway: 10.89.20.1
+runner_egress_ip: ""
+backup_bucket: ""
+caddy_mode: host
+runner_token_present: false
+secrets:
+  GITEA_SECRET_KEY: k2
+  GITEA_INTERNAL_TOKEN: t2
+  GITEA_OAUTH2_JWT_SECRET: o2
+  GITEA_LFS_JWT_SECRET: l2
+  CADDY_EMAIL: "# no ACME contact address: secret gitea-acme-email was unreadable at render time"
