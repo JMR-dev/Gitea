@@ -1,0 +1,96 @@
+# The data disk (infra/pkg/compute, protected) at /var/lib/gitea: formatted
+# only when it carries no filesystem at all, mounted by UUID, labelled for
+# containers once, owned by the container's uid.
+- name: Data disk present
+  ansible.builtin.stat:
+    path: "{{ data_disk_device }}"
+  register: data_disk
+  failed_when: not data_disk.stat.exists
+
+# blkid -p probes the device itself (no cache) and exits 2 only when it finds
+# no signature of any kind. Anything else -- a filesystem, a partition table,
+# an error -- leaves the disk alone.
+- name: Probe the data disk
+  ansible.builtin.command: blkid -p -o export {{ data_disk_device }}
+  register: probe
+  changed_when: false
+  failed_when: probe.rc not in [0, 2]
+  check_mode: false
+
+# No -f: mkfs refuses a device that has a filesystem, a second guard.
+- name: Format a blank data disk
+  ansible.builtin.command: mkfs.xfs -q {{ data_disk_device }}
+  when: probe.rc == 2
+
+- name: Read its UUID
+  ansible.builtin.command: blkid -s UUID -o value {{ data_disk_device }}
+  register: uuid
+  changed_when: false
+  check_mode: false
+  failed_when: uuid.rc != 0 and not ansible_check_mode
+
+- name: Mount point
+  ansible.builtin.file:
+    path: /var/lib/gitea
+    state: directory
+
+# By UUID, never by device path: GCE can reorder /dev/sdX across reboots.
+- name: Data disk in fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^UUID={{ uuid.stdout }} '
+    line: UUID={{ uuid.stdout }} /var/lib/gitea xfs defaults,nofail,x-systemd.device-timeout=30 0 2
+  when: uuid.stdout | length > 0
+  register: fstab
+
+- name: Mounted?
+  ansible.builtin.command: mountpoint -q /var/lib/gitea
+  register: mounted
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Mount it
+  ansible.builtin.shell: systemctl daemon-reload && mount /var/lib/gitea && mountpoint -q /var/lib/gitea
+  when: mounted.rc != 0
+
+# The label is set persistently ONCE, rather than with :Z on the quadlet's
+# volume line, which would relabel the whole repository tree on every start.
+- name: Container label rule present?
+  ansible.builtin.shell: semanage fcontext -l 2>/dev/null | grep -q '^/var/lib/gitea(/\.\*)?'
+  register: fcontext
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Container label rule
+  ansible.builtin.command: semanage fcontext -a -t container_file_t '/var/lib/gitea(/.*)?'
+  when: fcontext.rc != 0
+
+# The mount point itself must belong to the container's uid, not just the
+# subdirectories: Gitea creates GITEA_CUSTOM (/var/lib/gitea/custom) at
+# startup, and a root-owned 0755 mount point makes that mkdir fail with a bare
+# "permission denied" that reads like an SELinux problem.
+- name: Ownership
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0750"
+  loop:
+    - /var/lib/gitea
+    - /var/lib/gitea/data
+    - /var/lib/gitea/log
+    - /var/lib/gitea/custom
+
+# After Ownership, which creates directories as the SSH user's SELinux user
+# (unconfined_u): -F resets that too, so relabelling last leaves nothing for
+# the next run. -v prints only what it relabels, so a labelled tree reports no
+# change; in check mode -n only reports.
+- name: Labels
+  ansible.builtin.command: restorecon -RFv {{ '-n' if ansible_check_mode else '' }} /var/lib/gitea
+  register: relabel
+  changed_when: relabel.stdout | length > 0
+  check_mode: false
+  when: mounted.rc == 0 or not ansible_check_mode

@@ -1,0 +1,64 @@
+# Rendered by vm/bootstrap.sh into /etc/containers/systemd/
+#
+# gitea.network is chosen by bootstrap.sh at run time, not by hand:
+# the googleclouddns ACME plugin authenticates via Application Default
+# Credentials, which on GCE means reaching the metadata server at
+# 169.254.169.254. bootstrap.sh probes whether a container on the gitea bridge
+# can do that and falls back to Network=host if it cannot. See
+# gitea-probe-metadata in bootstrap.sh and docs/runbook.md.
+[Unit]
+Description=Caddy (TLS termination, ACME DNS-01 via Google Cloud DNS)
+Documentation=https://caddyserver.com/docs/
+After=gitea.service gitea-ar-auth.service network-online.target
+Wants=gitea.service gitea-ar-auth.service
+
+[Container]
+ContainerName=caddy
+Image=us-east1-docker.pkg.dev/example-project/gitea/caddy:prod
+AutoUpdate=registry
+# Registry auth for Artifact Registry. Two settings, because two different
+# code paths need it: PodmanArgs covers `podman run`'s pull, and the
+# io.containers.autoupdate.authfile label is what `podman auto-update` reads
+# when it checks the registry digest. (There is no AuthFile= key in the
+# [Container] group -- that one only exists for .image and .build units.)
+PodmanArgs=--authfile=/etc/containers/ar-auth.json
+Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
+Network=gitea.network
+LogDriver=journald
+
+PublishPort=80:80
+PublishPort=443:443
+PublishPort=443:443/udp
+
+Volume=/etc/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,Z
+Volume=caddy-data.volume:/data
+Volume=caddy-config.volume:/config
+
+User=1000:1000
+# Caddy binds 80/443 as a non-root user. On the bridge this is a container-local
+# sysctl; podman REJECTS net.* sysctls when Network=host, so bootstrap.sh emits
+# nothing here in that mode and sets the equivalent host sysctl instead. File
+# capabilities are not an option -- NoNewPrivileges blocks them.
+Sysctl=net.ipv4.ip_unprivileged_port_start=0
+
+# The plugin reads Application Default Credentials; the project must be explicit
+# because the metadata server's project and the DNS zone's project need not match.
+Environment=GCP_PROJECT=example-project
+
+HealthCmd=curl -fsS http://127.0.0.1:2019/config/
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=30s
+HealthRetries=3
+Notify=healthy
+
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=0
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

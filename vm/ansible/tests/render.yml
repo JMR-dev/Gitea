@@ -1,0 +1,57 @@
+# Renders every templated file the way the roles do -- the same templates, the
+# same ${ } delimiters, the same role vars files -- into `out`, from a
+# fixture's values instead of a VM's. tests/check runs it per fixture.
+- name: Render the VM's templated files
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    vm_src: "{{ playbook_dir }}/../.."
+  tasks:
+    - name: The roles' template names
+      ansible.builtin.include_vars:
+        file: "{{ item }}"
+      loop:
+        - ../roles/app/vars/main.yml
+        - ../roles/firewall/vars/main.yml
+
+    - name: Output directory
+      ansible.builtin.file:
+        path: "{{ out }}"
+        state: directory
+        mode: "0700"
+
+    # As the app role hands them to files/gitea-render-secrets: secrets still
+    # as placeholders (tests/check substitutes the fixture's).
+    - name: app.ini and the Caddyfile, before the secrets
+      ansible.builtin.copy:
+        dest: "{{ out }}/{{ item.dest }}"
+        content: "{{ lookup('ansible.builtin.template', vm_src + '/config/' + item.src,
+                      variable_start_string='${', variable_end_string='}') }}"
+        mode: "0600"
+      loop:
+        - {src: app.ini.tmpl, dest: app.ini.stage}
+        - {src: Caddyfile.tmpl, dest: Caddyfile.stage}
+
+    - name: Quadlets, the ruleset, the jail
+      ansible.builtin.template:
+        src: "{{ vm_src }}/{{ item.src }}"
+        dest: "{{ out }}/{{ item.dest }}"
+        mode: "0600"
+        variable_start_string: "${"
+        variable_end_string: "}"
+      loop:
+        - {src: quadlets/gitea.network, dest: gitea.network}
+        - {src: quadlets/gitea.container, dest: gitea.container}
+        - {src: quadlets/caddy.container, dest: caddy.container}
+        - {src: quadlets/caddy-data.volume, dest: caddy-data.volume}
+        - {src: quadlets/caddy-config.volume, dest: caddy-config.volume}
+        - {src: nftables/gitea.nft, dest: nftables.conf}
+        - {src: fail2ban/jail.d/gitea.local, dest: gitea.local}
+
+    - name: The backup script
+      ansible.builtin.template:
+        src: ../roles/helpers/templates/gitea-backup.j2
+        dest: "{{ out }}/gitea-backup"
+        mode: "0600"
