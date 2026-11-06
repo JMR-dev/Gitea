@@ -49,6 +49,15 @@ ansible-check: ## Lint, syntax-check and golden-test the playbook (vm/ansible)
 	python3 -c 'import os, sys, argparse; sys.path[:0] = ["scripts/cicd", "scripts/ops"]; import infra_deploy as D; \
 		D.Deploy(argparse.Namespace(mode="check", state_bucket="")).ansible_checks(os.getcwd())'
 
+# After changing a templated file or a variable: re-render the goldens with the
+# pinned ansible-core, then review `git diff vm/ansible/tests/golden` -- the
+# rendered effect of the change -- and commit it (vm/ansible/README.md).
+.PHONY: goldens
+goldens: ## Rewrite the playbook's golden renders from what renders now
+	python3 -c 'import os, sys, argparse, subprocess; sys.path[:0] = ["scripts/cicd", "scripts/ops"]; import infra_deploy as D; \
+		env = D.Deploy(argparse.Namespace(mode="check", state_bucket="")).ansible_env(os.getcwd()); \
+		sys.exit(subprocess.run(["vm/ansible/tests/check", "--update"], env=env).returncode)'
+
 .PHONY: preview
 preview: check ## Show what `pulumi up` would change
 	cd infra && pulumi preview
