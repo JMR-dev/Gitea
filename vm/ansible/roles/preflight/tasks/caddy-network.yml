@@ -1,0 +1,53 @@
+# Caddy's retired host-network mode. Role app used to probe whether a
+# container on the gitea network reached the metadata server, which Caddy's
+# DNS-01 plugin needs, and if not, ran Caddy on the host network: the answer
+# cached in the file caddy_network_cache names, and a host-wide port sysctl in
+# the one caddy_port_sysctl_file names (tasks/main.yml passes both). Caddy now
+# runs on the gitea network only, and the ruleset accepts nothing on 80 or 443
+# at input.
+#
+# So a VM whose cache says host stops here, before role firewall installs that
+# ruleset (ansible.cfg forces handlers, so a failure later in the run would
+# still load it) and before role app moves Caddy. Any other VM loses both
+# files, and, if the sysctl file was there, the live value it set.
+# tests/caddy-network.yml runs this over every case (vm/ansible/tests/check).
+#
+# A one-time migration: once every VM has run it, this file, its import in
+# tasks/main.yml and that test can go together.
+- name: Caddy's network, as the old probe cached it
+  ansible.builtin.slurp:
+    src: "{{ caddy_network_cache }}"
+  register: caddy_network_was
+  failed_when: false
+
+- name: Stop if Caddy is on the host network
+  ansible.builtin.fail:
+    msg: >-
+      {{ caddy_network_cache }} says Caddy runs on the host network: when the
+      old probe ran, a container on the gitea network could not reach the
+      metadata server, which Caddy's certificates (DNS-01) need. This playbook
+      runs Caddy on the gitea network only, so it stops here, before it changes
+      the firewall or Caddy. To move this VM by hand (docs/runbook.md, "Caddy
+      cannot get a certificate"): make the metadata server answer a container
+      on the gitea network, then delete {{ caddy_network_cache }} and run the
+      playbook again, watching it until Caddy answers.
+  when: (caddy_network_was.content | default('') | b64decode | trim) == 'host'
+
+- name: No host-network leftovers for Caddy
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ caddy_network_cache }}"
+    - "{{ caddy_port_sysctl_file }}"
+  register: caddy_leftovers
+
+- name: Whether the host-wide port sysctl was set
+  ansible.builtin.set_fact:
+    caddy_port_sysctl_reset: "{{ caddy_leftovers.results[1] is changed }}"
+
+# Deleting the file leaves the running kernel as the file set it, every uid
+# able to bind ports from 80 up, until a reboot. 1024 is the kernel's default.
+- name: The live port sysctl, back to the kernel's default
+  ansible.builtin.command: sysctl -q -w net.ipv4.ip_unprivileged_port_start=1024
+  when: caddy_port_sysctl_reset | bool

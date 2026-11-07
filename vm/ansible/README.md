@@ -37,9 +37,7 @@ every deploy — fails if what renders differs from them.
    `tests/check` names whichever of these is missing before it renders.
    Before it renders it also fails if the playbook could put Caddy anywhere
    but the gitea network (`caddy_bridge_only()`): `vm/quadlets/caddy.container`
-   must say `Network=gitea.network` itself, nothing may name `caddy_mode` (the
-   retired host-network fallback's switch), and role `app` may name
-   `/etc/gitea/caddy-network`, that fallback's cache, only to remove it.
+   must have one `Network=` line, `Network=gitea.network` written out.
 3. A new templated file: add it to a role and to `tests/render.yml`.
 4. `make goldens` re-renders the goldens; review `git diff vm/ansible/tests/golden`
    — it is exactly what the change does to the VM's files — and commit it with
@@ -53,7 +51,10 @@ runs the telemetry checks:
   `shutdown_delay` + `grace_period` + 3 s to fit in `caddy.container`'s
   explicit `StopTimeout=`, itself under `TimeoutStopSec` (systemd's 90 s if
   unset), so a stop ends before podman's SIGKILL (`docs/runbook.md`, "Caddy's
-  stop budget"); `scripts/check-peer-config.sh` over the peer script,
+  stop budget"); `tests/caddy-network.yml` over what Caddy's retired
+  host-network mode can leave on a VM (role preflight stops one still in it,
+  before anything changes, and tidies up after any other);
+  `scripts/check-peer-config.sh` over the peer script,
   `tests/tunnel-state.yml` over role tunnel's states, and
   `scripts/check-metadata-guard.sh --static`, which checks that the ruleset's
   metadata guard names the uid `alloy.container` runs as and the address

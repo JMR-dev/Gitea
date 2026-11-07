@@ -1,0 +1,72 @@
+# One case of tests/caddy-network.yml: the case's files in a temp directory,
+# preflight's caddy-network.yml run on them in check mode, then what it came
+# to. Facts it sets are cleared first, so a refused case can't pass on the
+# last case's.
+- name: A directory for this case
+  ansible.builtin.tempfile:
+    state: directory
+  register: case_dir
+  check_mode: false
+
+- name: The old probe's cache, as the case has it
+  ansible.builtin.copy:
+    dest: "{{ case_dir.path }}/{{ cache_file }}"
+    content: "{{ case.cache }}"
+    mode: "0644"
+  when: case.cache is not none
+  check_mode: false
+
+- name: The old host-wide port sysctl file, if the case has it
+  ansible.builtin.copy:
+    dest: "{{ case_dir.path }}/{{ sysctl_file }}"
+    content: "net.ipv4.ip_unprivileged_port_start = 80\n"
+    mode: "0644"
+  when: case.sysctl
+  check_mode: false
+
+- name: Nothing from the last case
+  ansible.builtin.set_fact:
+    caddy_leftovers: {}
+    caddy_port_sysctl_reset: false
+    case_refused: false
+    case_why: ""
+
+- name: Preflight's tasks
+  block:
+    - name: Caddy's retired host-network mode, in check mode
+      ansible.builtin.include_tasks:
+        file: ../roles/preflight/tasks/caddy-network.yml
+        apply:
+          check_mode: true
+      vars:
+        caddy_network_cache: "{{ case_dir.path }}/{{ cache_file }}"
+        caddy_port_sysctl_file: "{{ case_dir.path }}/{{ sysctl_file }}"
+  rescue:
+    - name: Refused
+      ansible.builtin.set_fact:
+        case_refused: true
+        case_why: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: What it came to
+  ansible.builtin.assert:
+    that:
+      - case_refused == case.refused
+      - not case.refused or (case_dir.path + '/' + cache_file) in case_why
+      - not case.refused or 'host network' in case_why
+      - case_removes == case.removes
+      - caddy_port_sysctl_reset | bool == case.reset
+    fail_msg: >-
+      {{ case.what }}: refused {{ case_refused }} ({{ case_why }}), would remove {{ case_removes }},
+      resets the live sysctl {{ caddy_port_sysctl_reset }}; want refused {{ case.refused }},
+      removes {{ case.removes }}, reset {{ case.reset }}
+    success_msg: "{{ case.what }}: refused {{ case_refused }}, removes {{ case_removes }}, reset {{ case.reset }}"
+  vars:
+    case_removes: >-
+      {{ (caddy_leftovers.results | default([])) | selectattr('changed') | map(attribute='item')
+         | map('basename') | list }}
+
+- name: The case's directory goes
+  ansible.builtin.file:
+    path: "{{ case_dir.path }}"
+    state: absent
+  check_mode: false

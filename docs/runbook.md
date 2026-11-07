@@ -541,9 +541,20 @@ sudo nft list chain inet gitea_filter forward    # one reject, Gitea's address
 
 There is no host-network fallback any more: the playbook used to probe this
 and, if the bridge couldn't reach the server, move Caddy to the host network,
-caching the answer in `/etc/gitea/caddy-network`. Now it only removes that
-file. On the host network Caddy's loopback, its admin API among it, would be
-every host process's too.
+caching the answer in `/etc/gitea/caddy-network`. On the host network Caddy's
+loopback, its admin API among it, would be every host process's too. Role
+`preflight` now removes that file, and the old host-wide port sysctl with it,
+but a VM whose file says `host` stops there, before the firewall or Caddy
+changes. To move such a VM by hand:
+
+1. Make the metadata server answer a container on the gitea network: the same
+   `curl`, run as `sudo podman run --rm --network gitea --entrypoint curl
+   <the Gitea image> …`, must print 200. Find what blocks it first.
+2. `sudo rm /etc/gitea/caddy-network`, then `make vm-apply`, and watch it to
+   the end: it restarts Caddy on the gitea network and loads a ruleset with
+   nothing on 80 or 443 at input. Handlers are forced, so if the run fails
+   after role firewall and before Caddy restarts, the ruleset loads anyway and
+   HTTPS is down until a run gets through.
 
 Also verify the zone-scoped grant:
 

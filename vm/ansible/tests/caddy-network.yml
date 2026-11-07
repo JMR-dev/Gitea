@@ -1,0 +1,84 @@
+# Runs roles/preflight/tasks/caddy-network.yml, what Caddy's retired
+# host-network mode leaves to check and tidy, over every case it can meet:
+# the old probe's cache and the old host-wide port sysctl file made up in a
+# temp directory, and the tasks run in check mode, so the live sysctl reset is
+# decided but never run. A cache saying host must stop the run before anything
+# is removed; anything else loses both files, and the live sysctl is reset
+# only when its file was there. First, that the file runs where it must: in
+# preflight, which site.yml runs before firewall and app. Runs on localhost
+# and touches nothing outside its temp directories; tests/check runs it.
+- name: Caddy's retired host-network mode, case by case
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    sysctl_file: 90-gitea-caddy.conf
+    cache_file: caddy-network
+    cases:
+      - what: a new VM, neither file
+        cache: null
+        sysctl: false
+        refused: false
+        removes: []
+        reset: false
+      - what: the probe said bridge
+        cache: "bridge\n"
+        sysctl: false
+        refused: false
+        removes: ["{{ cache_file }}"]
+        reset: false
+      - what: bridge, and the sysctl file left from host mode
+        cache: "bridge\n"
+        sysctl: true
+        refused: false
+        removes: ["{{ cache_file }}", "{{ sysctl_file }}"]
+        reset: true
+      - what: the sysctl file alone
+        cache: null
+        sysctl: true
+        refused: false
+        removes: ["{{ sysctl_file }}"]
+        reset: true
+      # The old role read anything but host as the bridge.
+      - what: an empty cache
+        cache: ""
+        sysctl: false
+        refused: false
+        removes: ["{{ cache_file }}"]
+        reset: false
+      - what: the probe said host
+        cache: "host\n"
+        sysctl: true
+        refused: true
+        removes: []
+        reset: false
+      - what: host, with spaces and no newline
+        cache: " host "
+        sysctl: false
+        refused: true
+        removes: []
+        reset: false
+  tasks:
+    - name: The check runs in preflight, and preflight before firewall and app
+      ansible.builtin.assert:
+        that:
+          # By key, as selectattr would read the dots as nested attributes.
+          - preflight_tasks | map('dict2items') | flatten | selectattr('key', 'equalto', 'ansible.builtin.import_tasks')
+            | selectattr('value', 'equalto', 'caddy-network.yml') | list | length == 1
+          - site_roles.index('preflight') < site_roles.index('firewall')
+          - site_roles.index('preflight') < site_roles.index('app')
+        fail_msg: >-
+          roles/preflight/tasks/main.yml must import caddy-network.yml, and site.yml run preflight before firewall
+          and app: a VM whose Caddy is on the host network has to stop before the ruleset or Caddy changes
+        success_msg: preflight imports caddy-network.yml, ahead of firewall and app
+      vars:
+        preflight_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/preflight/tasks/main.yml') | from_yaml }}"
+        site_roles: "{{ (lookup('ansible.builtin.file', playbook_dir + '/../site.yml') | from_yaml)[0].roles }}"
+
+    - name: One case
+      ansible.builtin.include_tasks: caddy-network-case.yml
+      loop: "{{ cases }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.what }}"

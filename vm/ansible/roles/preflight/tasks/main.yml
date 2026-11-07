@@ -83,3 +83,11 @@
   changed_when: "'Installed' in libselinux.stdout"
   check_mode: false
   when: not ansible_check_mode
+
+# Here, so that a VM whose Caddy is still on the retired host network stops
+# before role firewall or role app changes anything (caddy-network.yml).
+- name: Caddy's retired host-network mode
+  ansible.builtin.import_tasks: caddy-network.yml
+  vars:
+    caddy_network_cache: /etc/gitea/caddy-network
+    caddy_port_sysctl_file: /etc/sysctl.d/90-gitea-caddy.conf

@@ -54,20 +54,6 @@
     label: "{{ item.item }}"
   when: item.rc != 0
 
-# Caddy runs on the gitea network only (vm/quadlets/caddy.container). This
-# role used to probe whether a container there reached the metadata server
-# and, if not, put Caddy on the host network, caching the answer in
-# /etc/gitea/caddy-network, with a host-wide port sysctl for that mode. Both
-# files go, so a VM the probe ran on ends like a new one. tests/check fails
-# if the role names the cache for anything else.
-- name: No host-network leftovers for Caddy
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /etc/gitea/caddy-network
-    - /etc/sysctl.d/90-gitea-caddy.conf
-
 - name: Runner registration token
   ansible.builtin.script:
     cmd: gitea-render-secrets {{ '--check' if ansible_check_mode else '' }} runner-token {{ gcp_project }} {{ secret_prefix }}
