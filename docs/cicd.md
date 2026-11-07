@@ -91,14 +91,15 @@ on every PR to main:
 | `go` | `heavy` | `make infra-check ci-check`: build, vet and test `infra/`, `cicd/` and `cicd/relay`, and `python3 -m unittest discover -s scripts/cicd` |
 | `scripts` | `ubuntu-latest` | `make scripts-check`: `bash -n`, `shellcheck -S warning`, `py_compile` and the bats tests (`infra/pkg/runner/bats`), with shellcheck, bats and ripgrep from apt |
 
-- The contexts should be `checks / go (pull_request)` and `checks / scripts
-  (pull_request)`. Confirm them on the first PR before naming them in branch
-  protection.
+- The contexts are `checks / go (pull_request)` and `checks / scripts
+  (pull_request)`, confirmed on a throwaway PR (#44), which also showed each
+  kind of breakage turning them red. A cancelled run (a newer push to the same
+  PR) is posted as `failure` on the superseded commit.
 - `make check` runs three stages a PR doesn't:
   - `ansible-check`: `cloudbuild/preview` already runs it;
-  - `check-metadata-guard`: it needs user and network namespaces and nft,
-    which a job pod may not allow. A probe on a throwaway PR will decide
-    whether it can join;
+  - `check-metadata-guard`: a job pod allows the user and network namespaces
+    and nft, but mounts `/proc/sys` read-only, so the script can't turn on
+    `ip_forward` there (probed on PR #44). It stays local;
   - `workflow-lint`: actionlint, pinned by digest, runs through podman, which
     job pods don't have. Run `make workflow-lint` after editing a workflow.
 - PRs only: a merge to main deploys what already passed here as a PR.
