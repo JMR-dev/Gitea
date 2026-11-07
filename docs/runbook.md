@@ -66,6 +66,13 @@ curl -vI https://gitea.jasonmross.dev            # valid Let's Encrypt cert
 DNS-01 means renewal does not need inbound port 80 at all. That is testable:
 temporarily remove the `gitea-allow-web` port 80 rule and force a renewal.
 
+Caddy still renews as `gitea-vm@`, which holds `roles/dns.admin` on the zone.
+Its own account already exists, ahead of the switch: `gitea-caddy-dns@`
+(Pulumi output `caddyDnsServiceAccount`). It holds only the custom role
+`giteaAcmeDns01` on zone `main` (the six record-set and change permissions,
+none on the zone or its IAM) and project `roles/dns.reader`, for the zone
+listing. It has no key: only `gitea-vm@` may mint its tokens.
+
 The ACME account and certificates live in the `caddy-data` podman volume, under
 `/var/lib/containers` on the **boot** disk, not the data disk. Replacing the
 instance therefore re-registers and re-issues on first start. That is fine
