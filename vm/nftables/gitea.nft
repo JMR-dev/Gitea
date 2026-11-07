@@ -80,8 +80,8 @@ table inet gitea_filter {
 	}
 
 	# Alloy keeps off the metadata server, whose token is this VM's
-	# credentials (gitea-vm@: Gitea's secrets, new versions of them, the
-	# watchtower peer, dns.admin on the zone). Alloy runs on the host network
+	# credentials (gitea-vm@: reading Gitea's secrets and the watchtower
+	# peer, dns.admin on the zone). Alloy runs on the host network
 	# (vm/quadlets/alloy.container) with no user namespace, so its packets leave
 	# through here under uid 473, and the two numbers have to stay the same:
 	# vm/ansible/tests/check and scripts/check-metadata-guard.sh check it. One

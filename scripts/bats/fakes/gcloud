@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# A fake `gcloud` for bootstrap.bats. bootstrap.sh makes dozens of calls
+# (APIs, the state bucket, the runner account and its roles); this one
+# succeeds at all of them, as against a project where everything exists.
+# Only Secret Manager's versions have state, in $FAKE:
+#
+# State:
+#   no_version   secret names with no enabled version, one per line; every
+#                other secret has one
+# Records:
+#   added.log    the name of each `secrets versions add`, never the value
+
+set -uo pipefail
+
+: "${FAKE:?the fake gcloud needs FAKE}"
+
+case "$1 ${2:-} ${3:-}" in
+  "secrets versions list")
+    # list NAME --project=... --filter=state:ENABLED --limit=1 --format=...
+    name=${4:?name}
+    if [[ -f "$FAKE/no_version" ]] && [[ $'\n'"$(cat "$FAKE/no_version")"$'\n' == *$'\n'"$name"$'\n'* ]]; then
+      exit 0
+    fi
+    echo "projects/p/secrets/$name/versions/1"
+    ;;
+  "secrets versions add")
+    cat >/dev/null
+    echo "${4:?name}" >>"$FAKE/added.log"
+    ;;
+  *)
+    exit 0
+    ;;
+esac

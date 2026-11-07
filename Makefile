@@ -37,10 +37,10 @@ SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh 
 	infra/pkg/runner/start.sh infra/pkg/runner/image-prune.sh \
 	infra/pkg/runner/bats/fakes/docker infra/pkg/runner/bats/fakes/df \
 	vm/ansible/roles/app/files/bats/fakes/gcloud vm/ansible/roles/app/files/bats/fakes/podman \
-	vm/ansible/roles/app/files/bats/fakes/chown
+	vm/ansible/roles/app/files/bats/fakes/chown scripts/bats/fakes/gcloud
 # Bats tests for the shell above that has them. Shellchecked too; `bash -n`
 # can't parse their @test blocks.
-BATS_DIRS  = infra/pkg/runner/bats vm/ansible/roles/app/files/bats
+BATS_DIRS  = infra/pkg/runner/bats vm/ansible/roles/app/files/bats scripts/bats
 BATS_FILES = $(wildcard $(addsuffix /*.bats,$(BATS_DIRS)))
 
 # Every stage. A PR runs infra-check and ci-check (a heavy runner) and
