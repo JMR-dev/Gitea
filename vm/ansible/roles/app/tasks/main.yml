@@ -32,11 +32,12 @@
     enabled: true
     state: started
 
-# Pulled here, on a VM that has neither: Gitea's so that app.ini's render
-# below can generate a missing Gitea secret with it (files/gitea-render-secrets)
-# on the very first pass, and Caddy's so that a registry or credential failure
-# shows here, as this task's error, not as caddy.service failing to start at
-# the end of the run. Normally the quadlets and podman-auto-update pull.
+# Pulled here, on a VM that has neither: Gitea's so that, on the rehearsal VM,
+# app.ini's render below can generate a missing gitea-rehearsal-* secret with
+# it on the very first pass (files/gitea-render-secrets; prod's are read, never
+# generated), and both so that a registry or credential failure shows here, as
+# this task's error, not as a service failing to start at the end of the run.
+# Normally the quadlets and podman-auto-update pull.
 - name: Images present?
   ansible.builtin.command: podman image exists {{ item }}
   loop: ["{{ image_gitea }}", "{{ image_caddy }}"]
