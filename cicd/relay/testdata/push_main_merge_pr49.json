@@ -1,0 +1,221 @@
+{
+  "ref": "refs/heads/main",
+  "before": "6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+  "after": "96776d039aca88cf58482966a72ca2ab7673c884",
+  "compare_url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/compare/6fad9f8cb3e832eb460cd6ddc4add853247e27aa...96776d039aca88cf58482966a72ca2ab7673c884",
+  "commits": [
+    {
+      "id": "96776d039aca88cf58482966a72ca2ab7673c884",
+      "message": "Merge pull request 'Drop gitea-vm@'s secret version-adder grants' (#49) from security/drop-vm-secret-adders into main\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/96776d039aca88cf58482966a72ca2ab7673c884",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T19:18:30Z",
+      "added": [
+        "scripts/bats/bootstrap.bats",
+        "scripts/bats/fakes/gcloud",
+        "vm/ansible/roles/app/files/bats/fakes/chown",
+        "vm/ansible/roles/app/files/bats/fakes/gcloud",
+        "vm/ansible/roles/app/files/bats/fakes/podman",
+        "vm/ansible/roles/app/files/bats/gitea-render-secrets.bats"
+      ],
+      "removed": [],
+      "modified": [
+        ".gitea/workflows/checks.yml",
+        "Makefile",
+        "README.md",
+        "docs/runbook.md",
+        "infra/pkg/iam/iam.go",
+        "infra/pkg/iam/iam_test.go",
+        "infra/pkg/secrets/secrets.go",
+        "scripts/bootstrap.sh",
+        "scripts/rehearsal.sh",
+        "vm/ansible/roles/app/files/gitea-render-secrets",
+        "vm/ansible/tests/golden/bridge-off/nftables.conf.golden",
+        "vm/ansible/tests/golden/bridge-on/nftables.conf.golden",
+        "vm/ansible/tests/golden/host-detection/nftables.conf.golden",
+        "vm/nftables/gitea.nft"
+      ]
+    },
+    {
+      "id": "7ff334149cdf54c8ca9dbaba8364d8bfc08417c4",
+      "message": "Merge branch 'main' into security/drop-vm-secret-adders\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/7ff334149cdf54c8ca9dbaba8364d8bfc08417c4",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T19:02:15Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "cicd/pkg/identity/identity.go",
+        "cicd/pkg/identity/identity_test.go",
+        "cloudbuild/infra.yaml",
+        "docs/cicd.md",
+        "scripts/cicd/infra_deploy.py",
+        "scripts/cicd/test_cicd.py"
+      ]
+    },
+    {
+      "id": "60263c54c8bdb33caef7c7490cdc58b041723900",
+      "message": "Merge branch 'main' into security/drop-vm-secret-adders\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/60263c54c8bdb33caef7c7490cdc58b041723900",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T18:42:19Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "docs/runbook.md",
+        "image/caddy/Dockerfile",
+        "vm/ansible/README.md",
+        "vm/ansible/tests/check",
+        "vm/ansible/tests/golden/bridge-off/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-off/caddy.container.golden",
+        "vm/ansible/tests/golden/bridge-on/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-on/caddy.container.golden",
+        "vm/ansible/tests/golden/host-detection/Caddyfile.golden",
+        "vm/ansible/tests/golden/host-detection/caddy.container.golden",
+        "vm/config/Caddyfile.tmpl",
+        "vm/quadlets/caddy.container"
+      ]
+    },
+    {
+      "id": "22fdcec6723d8f39c0c1f769b5847d5110fe04dd",
+      "message": "Say the VM only reads Gitea's secrets wherever that's described\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/22fdcec6723d8f39c0c1f769b5847d5110fe04dd",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T11:12:47-06:00",
+      "added": [
+        "scripts/bats/bootstrap.bats",
+        "scripts/bats/fakes/gcloud"
+      ],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "README.md",
+        "infra/pkg/secrets/secrets.go",
+        "scripts/bootstrap.sh",
+        "vm/ansible/tests/golden/bridge-off/nftables.conf.golden",
+        "vm/ansible/tests/golden/bridge-on/nftables.conf.golden",
+        "vm/ansible/tests/golden/host-detection/nftables.conf.golden",
+        "vm/nftables/gitea.nft"
+      ]
+    },
+    {
+      "id": "fd074f1685f6185ce9c3baa74fa6c84a17e113cb",
+      "message": "Drop gitea-vm@'s secret version-adder grants\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/fd074f1685f6185ce9c3baa74fa6c84a17e113cb",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T10:36:25-06:00",
+      "added": [
+        "vm/ansible/roles/app/files/bats/fakes/chown",
+        "vm/ansible/roles/app/files/bats/fakes/gcloud",
+        "vm/ansible/roles/app/files/bats/fakes/podman",
+        "vm/ansible/roles/app/files/bats/gitea-render-secrets.bats"
+      ],
+      "removed": [],
+      "modified": [
+        ".gitea/workflows/checks.yml",
+        "Makefile",
+        "docs/runbook.md",
+        "infra/pkg/iam/iam.go",
+        "infra/pkg/iam/iam_test.go",
+        "infra/pkg/secrets/secrets.go",
+        "scripts/rehearsal.sh",
+        "vm/ansible/roles/app/files/gitea-render-secrets"
+      ]
+    }
+  ],
+  "total_commits": 5,
+  "head_commit": {
+    "id": "96776d039aca88cf58482966a72ca2ab7673c884",
+    "added": [
+      "scripts/bats/bootstrap.bats",
+      "scripts/bats/fakes/gcloud",
+      "vm/ansible/roles/app/files/bats/fakes/chown",
+      "vm/ansible/roles/app/files/bats/fakes/gcloud",
+      "vm/ansible/roles/app/files/bats/fakes/podman",
+      "vm/ansible/roles/app/files/bats/gitea-render-secrets.bats"
+    ],
+    "removed": [],
+    "modified": [
+      ".gitea/workflows/checks.yml",
+      "Makefile",
+      "README.md",
+      "docs/runbook.md",
+      "infra/pkg/iam/iam.go",
+      "infra/pkg/iam/iam_test.go",
+      "infra/pkg/secrets/secrets.go",
+      "scripts/bootstrap.sh",
+      "scripts/rehearsal.sh",
+      "vm/ansible/roles/app/files/gitea-render-secrets",
+      "vm/ansible/tests/golden/bridge-off/nftables.conf.golden",
+      "vm/ansible/tests/golden/bridge-on/nftables.conf.golden",
+      "vm/ansible/tests/golden/host-detection/nftables.conf.golden",
+      "vm/nftables/gitea.nft"
+    ]
+  },
+  "repository": {
+    "id": 1,
+    "name": "Gitea",
+    "full_name": "JMR-dev/Gitea",
+    "private": false,
+    "default_branch": "main"
+  },
+  "pusher": {
+    "id": 1,
+    "login": "JMR-dev"
+  },
+  "sender": {
+    "id": 1,
+    "login": "JMR-dev"
+  }
+}

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -385,6 +386,74 @@ func TestDeployStillPublishesWithDrillStatuses(t *testing.T) {
 	}
 	if len(st.got) != 1 || st.got[0].Context != "cloudbuild/drill-infra-fail-verify" {
 		t.Fatalf("statuses %+v", st.got)
+	}
+}
+
+// statusList is each posted status as "context=state", in posting order.
+func statusList(got []Status) []string {
+	var out []string
+	for _, s := range got {
+		out = append(out, s.Context+"="+s.State)
+	}
+	return out
+}
+
+// allDrills is what a push whose files aren't known in full owes.
+var allDrills = []string{"cloudbuild/drill-image-fail-verify=pending",
+	"cloudbuild/drill-image-fail-after-migrate=pending", "cloudbuild/drill-infra-fail-verify=pending"}
+
+// pushWant is what one push to main should publish and post.
+type pushWant struct {
+	mode      string
+	pipelines string
+	statuses  []string // statusList's form
+}
+
+func checkPublished(t *testing.T, h *Webhook, pub *fakePub, st *fakeStatus, body []byte, want pushWant) {
+	t.Helper()
+	if rec := deliver(t, h, "push", body, sign); rec.Code != http.StatusAccepted || len(pub.got) != 1 {
+		t.Fatalf("code %d, published %d", rec.Code, len(pub.got))
+	}
+	m := pub.got[0]
+	if m.Topic != h.Topics[want.mode] || m.Attributes["mode"] != want.mode || m.Attributes["pipelines"] != want.pipelines {
+		t.Errorf("published %s %s %q, want %s %q", m.Topic, m.Attributes["mode"], m.Attributes["pipelines"], want.mode, want.pipelines)
+	}
+	if got := statusList(st.got); !slices.Equal(got, want.statuses) {
+		t.Errorf("statuses %v, want %v", got, want.statuses)
+	}
+}
+
+// The four merges to main of 2026-11-07 whose branches had main merged into
+// them. Gitea 28.3.0 lists every commit in before..after (at most 5, [ui]
+// FEED_MAX_COMMIT_NUM), each with its files against its own first parent, so
+// a "Merge branch 'main' into ..." commit lists what main gained since the
+// branch last synced. In each, the merge's first parent is the push's before.
+var olderBranchMerges = []struct {
+	pr      int
+	fixture string
+	after   string
+}{
+	{47, "push_main_merge_pr47.json", "2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b"}, // 4 of 4 commits
+	{48, "push_main_merge_pr48.json", "f93e5b769c1f385a4072c51b9476ee18ab649154"}, // 3 of 3
+	{43, "push_main_merge_pr43.json", "6fad9f8cb3e832eb460cd6ddc4add853247e27aa"}, // 5 of 6
+	{49, "push_main_merge_pr49.json", "96776d039aca88cf58482966a72ca2ab7673c884"}, // 5 of 5
+}
+
+// From the payload alone (no commit reader) each merge redeploys what main
+// already shipped, and #43's list is truncated, so it's gated. This is the
+// relay's behavior whenever Gitea's API can't settle the push.
+func TestOlderBranchMergesFromPayloadAlone(t *testing.T) {
+	want := map[int]pushWant{
+		47: {ModeDeploy, "infra,image", nil},
+		48: {ModeDeploy, "infra,image", nil},
+		43: {ModeGated, "infra,image", allDrills},
+		49: {ModeDeploy, "infra,image", []string{"cloudbuild/drill-infra-fail-verify=pending"}},
+	}
+	for _, m := range olderBranchMerges {
+		t.Run(fmt.Sprintf("#%d", m.pr), func(t *testing.T) {
+			h, pub, st := newHook()
+			checkPublished(t, h, pub, st, fixture(t, m.fixture), want[m.pr])
+		})
 	}
 }
 

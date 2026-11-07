@@ -1,0 +1,130 @@
+{
+  "ref": "refs/heads/main",
+  "before": "2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b",
+  "after": "f93e5b769c1f385a4072c51b9476ee18ab649154",
+  "compare_url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/compare/2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b...f93e5b769c1f385a4072c51b9476ee18ab649154",
+  "commits": [
+    {
+      "id": "f93e5b769c1f385a4072c51b9476ee18ab649154",
+      "message": "Merge pull request 'Caddy DNS account: create gitea-caddy-dns@ and grant it the zone' (#48) from feat/caddy-dns-account into main\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/f93e5b769c1f385a4072c51b9476ee18ab649154",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T18:41:53Z",
+      "added": [
+        "infra/pkg/dns/dns_test.go",
+        "infra/pkg/iam/iam_test.go"
+      ],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "docs/runbook.md",
+        "infra/main.go",
+        "infra/pkg/dns/dns.go",
+        "infra/pkg/iam/iam.go"
+      ]
+    },
+    {
+      "id": "72f431042694fb10ca862c64a6f0a0c0c8f05b85",
+      "message": "Merge branch 'main' into feat/caddy-dns-account\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/72f431042694fb10ca862c64a6f0a0c0c8f05b85",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T17:09:48Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "docs/runbook.md",
+        "image/caddy/Dockerfile",
+        "vm/ansible/README.md",
+        "vm/ansible/tests/check",
+        "vm/ansible/tests/golden/bridge-off/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-off/caddy.container.golden",
+        "vm/ansible/tests/golden/bridge-on/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-on/caddy.container.golden",
+        "vm/ansible/tests/golden/host-detection/Caddyfile.golden",
+        "vm/ansible/tests/golden/host-detection/caddy.container.golden",
+        "vm/config/Caddyfile.tmpl",
+        "vm/quadlets/caddy.container"
+      ]
+    },
+    {
+      "id": "84ee2e523ef03e83db0ba5687721f9bcf02b28fa",
+      "message": "Caddy DNS account: create gitea-caddy-dns@ and grant it the zone\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/84ee2e523ef03e83db0ba5687721f9bcf02b28fa",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T10:01:59-06:00",
+      "added": [
+        "infra/pkg/dns/dns_test.go",
+        "infra/pkg/iam/iam_test.go"
+      ],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "docs/runbook.md",
+        "infra/main.go",
+        "infra/pkg/dns/dns.go",
+        "infra/pkg/iam/iam.go"
+      ]
+    }
+  ],
+  "total_commits": 3,
+  "head_commit": {
+    "id": "f93e5b769c1f385a4072c51b9476ee18ab649154",
+    "added": [
+      "infra/pkg/dns/dns_test.go",
+      "infra/pkg/iam/iam_test.go"
+    ],
+    "removed": [],
+    "modified": [
+      "Makefile",
+      "docs/runbook.md",
+      "infra/main.go",
+      "infra/pkg/dns/dns.go",
+      "infra/pkg/iam/iam.go"
+    ]
+  },
+  "repository": {
+    "id": 1,
+    "name": "Gitea",
+    "full_name": "JMR-dev/Gitea",
+    "private": false,
+    "default_branch": "main"
+  },
+  "pusher": {
+    "id": 1,
+    "login": "JMR-dev"
+  },
+  "sender": {
+    "id": 1,
+    "login": "JMR-dev"
+  }
+}

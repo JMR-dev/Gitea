@@ -1,0 +1,97 @@
+{
+  "sha": "96776d039aca88cf58482966a72ca2ab7673c884",
+  "parents": [
+    {
+      "url": "https://gitea.jasonmross.dev/api/v1/repos/JMR-dev/Gitea/git/commits/6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+      "sha": "6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+      "created": "0001-01-01T00:00:00Z"
+    },
+    {
+      "url": "https://gitea.jasonmross.dev/api/v1/repos/JMR-dev/Gitea/git/commits/7ff334149cdf54c8ca9dbaba8364d8bfc08417c4",
+      "sha": "7ff334149cdf54c8ca9dbaba8364d8bfc08417c4",
+      "created": "0001-01-01T00:00:00Z"
+    }
+  ],
+  "files": [
+    {
+      "filename": "scripts/bats/bootstrap.bats",
+      "status": "added"
+    },
+    {
+      "filename": "scripts/bats/fakes/gcloud",
+      "status": "added"
+    },
+    {
+      "filename": "vm/ansible/roles/app/files/bats/fakes/chown",
+      "status": "added"
+    },
+    {
+      "filename": "vm/ansible/roles/app/files/bats/fakes/gcloud",
+      "status": "added"
+    },
+    {
+      "filename": "vm/ansible/roles/app/files/bats/fakes/podman",
+      "status": "added"
+    },
+    {
+      "filename": "vm/ansible/roles/app/files/bats/gitea-render-secrets.bats",
+      "status": "added"
+    },
+    {
+      "filename": ".gitea/workflows/checks.yml",
+      "status": "modified"
+    },
+    {
+      "filename": "Makefile",
+      "status": "modified"
+    },
+    {
+      "filename": "README.md",
+      "status": "modified"
+    },
+    {
+      "filename": "docs/runbook.md",
+      "status": "modified"
+    },
+    {
+      "filename": "infra/pkg/iam/iam.go",
+      "status": "modified"
+    },
+    {
+      "filename": "infra/pkg/iam/iam_test.go",
+      "status": "modified"
+    },
+    {
+      "filename": "infra/pkg/secrets/secrets.go",
+      "status": "modified"
+    },
+    {
+      "filename": "scripts/bootstrap.sh",
+      "status": "modified"
+    },
+    {
+      "filename": "scripts/rehearsal.sh",
+      "status": "modified"
+    },
+    {
+      "filename": "vm/ansible/roles/app/files/gitea-render-secrets",
+      "status": "modified"
+    },
+    {
+      "filename": "vm/ansible/tests/golden/bridge-off/nftables.conf.golden",
+      "status": "modified"
+    },
+    {
+      "filename": "vm/ansible/tests/golden/bridge-on/nftables.conf.golden",
+      "status": "modified"
+    },
+    {
+      "filename": "vm/ansible/tests/golden/host-detection/nftables.conf.golden",
+      "status": "modified"
+    },
+    {
+      "filename": "vm/nftables/gitea.nft",
+      "status": "modified"
+    }
+  ]
+}
