@@ -40,9 +40,15 @@ every deploy — fails if what renders differs from them.
    — it is exactly what the change does to the VM's files — and commit it with
    the change.
 
-Once the goldens match, `tests/check` also runs the telemetry checks:
+Once the goldens match, `tests/check` also checks Caddy's stop budget and
+runs the telemetry checks:
 
-- everywhere: `scripts/check-peer-config.sh` over the peer script,
+- everywhere: Caddy's stop budget (`caddy_stop_budget()`), which needs every
+  rendered Caddyfile to set a `grace_period` in its global options, and
+  `shutdown_delay` + `grace_period` + 3 s to fit in `caddy.container`'s
+  explicit `StopTimeout=`, itself under `TimeoutStopSec` (systemd's 90 s if
+  unset), so a stop ends before podman's SIGKILL (`docs/runbook.md`, "Caddy's
+  stop budget"); `scripts/check-peer-config.sh` over the peer script,
   `tests/tunnel-state.yml` over role tunnel's states, and
   `scripts/check-metadata-guard.sh --static`, which checks that the ruleset's
   metadata guard names the uid `alloy.container` runs as and the address

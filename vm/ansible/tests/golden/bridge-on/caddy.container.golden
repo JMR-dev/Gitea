@@ -61,6 +61,8 @@ HealthTimeout=5s
 HealthStartPeriod=30s
 HealthRetries=3
 Notify=healthy
+# podman's default, explicit so tests/check can hold grace_period under it.
+StopTimeout=10
 
 NoNewPrivileges=true
 

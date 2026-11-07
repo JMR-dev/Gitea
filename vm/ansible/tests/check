@@ -15,8 +15,11 @@ defines it, so a new variable fails here with what to add, not as an Ansible
 tests/make-goldens the way vm/bootstrap.sh rendered, which proved the cutover
 byte for byte; from then on --update is how they change.
 
-Once the goldens match, the telemetry to watchtower is checked too (not under
---update). Everywhere, as they need nothing downloaded:
+Once the goldens match, Caddy's stop budget and the telemetry to watchtower are
+checked too (not under --update). Everywhere, as they need nothing downloaded:
+  - Caddy's stop budget (caddy_stop_budget): every fixture's Caddyfile sets a
+    grace_period, and its shutdown_delay + grace_period + 3 s fits in
+    caddy.container's explicit StopTimeout, itself under TimeoutStopSec;
   - the watchtower peer script over made-up configs (scripts/check-peer-config.sh);
   - role tunnel's state over every case (tests/tunnel-state.yml);
   - that the metadata guard in the ruleset names Alloy's uid and Gitea's
@@ -83,6 +86,23 @@ TOOLS = {
     },
 }
 ALLOY_CONFIG = "config.alloy"  # the rendered name of vm/config/config.alloy.tmpl
+# Caddy's stop budget (caddy_stop_budget). The rendered names of
+# vm/config/Caddyfile.tmpl and vm/quadlets/caddy.container; the seconds left,
+# after Caddy's grace period, for it to close its listeners and exit before
+# podman's SIGKILL; and systemd's TimeoutStopSec when a unit sets none.
+CADDYFILE = "Caddyfile"
+CADDY_QUADLET = "caddy.container"
+CADDY_STOP_MARGIN = 3
+SYSTEMD_STOP_TIMEOUT = 90
+# A Caddy duration (caddy.ParseDuration): Go's, a sequence such as 5s, 500ms or
+# 1m30s, plus d for days.
+CADDY_DURATION_UNITS = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600, "d": 86400}
+CADDY_DURATION_PART = r"(\d+(?:\.\d+)?)(ns|us|ms|s|m|h|d)"
+# A systemd time span (systemd.time(7)), as TimeoutStopSec= takes it: seconds
+# alone, or numbers with units such as "1min 30s"; or infinity.
+SYSTEMD_TIME_UNITS = {"": 1, "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1, "sec": 1, "m": 60,
+                      "min": 60, "h": 3600, "hr": 3600}
+SYSTEMD_TIME_PART = r"\s*(\d+(?:\.\d+)?)\s*([a-z]*)"
 SCRUB_FIXTURE = os.path.join(ROOT, "scripts", "testdata", "scrub.log")
 # infra_deploy.py's modes that change, or read, the VM: the deploy, and `make
 # vm-check`/`vm-apply` (also ci-vm-check/ci-vm-apply). Its other, `preview`, is
@@ -233,6 +253,134 @@ def free_port():
         return s.getsockname()[1]
 
 
+def caddy_duration(text):
+    """Seconds in a Caddy duration such as 5s, 500ms or 1m30s; None if it isn't
+    one."""
+    if text == "0":
+        return 0.0
+    if not re.fullmatch(f"(?:{CADDY_DURATION_PART})+", text):
+        return None
+    return sum(float(n) * CADDY_DURATION_UNITS[u] for n, u in re.findall(CADDY_DURATION_PART, text))
+
+
+def systemd_seconds(text):
+    """Seconds in a systemd time span such as 90, 90s or 1min 30s (infinity is
+    float("inf")); None if it isn't one."""
+    if text == "infinity":
+        return float("inf")
+    if not re.fullmatch(f"(?:{SYSTEMD_TIME_PART})+\\s*", text):
+        return None
+    parts = re.findall(SYSTEMD_TIME_PART, text)
+    if any(u not in SYSTEMD_TIME_UNITS for _, u in parts):
+        return None
+    return sum(float(n) * SYSTEMD_TIME_UNITS[u] for n, u in parts)
+
+
+def caddy_global_options(path):
+    """A Caddyfile's global options, {name: [arguments]}: the block that opens
+    with a bare { before the first site, if there is one. Comments are left
+    out, and so are the options of a block nested in it (servers { }, say)."""
+    options, depth = {}, 0
+    with open(path) as fh:
+        for line in fh:
+            words = line.split()
+            # A comment starts at a word that starts with #.
+            words = words[:next((i for i, w in enumerate(words) if w.startswith("#")), len(words))]
+            if not words:
+                continue
+            if depth == 0:
+                if words != ["{"]:
+                    return options  # a site: there is no global block
+                depth = 1
+                continue
+            if depth == 1 and words == ["}"]:
+                return options
+            if depth == 1:
+                options[words[0]] = words[1:]
+            code = " ".join(words)
+            depth += code.count("{") - code.count("}")
+    return options
+
+
+def unit_keys(path):
+    """A systemd unit file's keys, {section: {key: value}}, the last one where
+    a key repeats. Comments are left out."""
+    sections, keys = {}, None
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                keys = sections.setdefault(line[1:-1], {})
+            elif keys is not None and "=" in line:
+                key, value = line.split("=", 1)
+                keys[key.strip()] = value.strip()
+    return sections
+
+
+def caddy_stop_budget():
+    """Problems with Caddy's stop budget in every fixture's goldens, which the
+    caller has just proved are exactly what renders.
+
+    On a stop, podman sends Caddy (PID 1 in its container) SIGTERM, and
+    SIGKILLs it StopTimeout seconds later. Caddy waits shutdown_delay, then up
+    to grace_period for open connections to close; with no grace_period it
+    waits forever, and a browser's idle HTTP/3 connection is closed only by the
+    browser. So the Caddyfile must set one, shutdown_delay + grace_period +
+    CADDY_STOP_MARGIN must fit in caddy.container's StopTimeout, written out
+    rather than left to podman's default, and that must be under the unit's
+    TimeoutStopSec, past which systemd kills the lot."""
+    problems = []
+    for name in sorted(os.listdir(os.path.join(HERE, "golden"))):
+        d = os.path.join(HERE, "golden", name)
+        options = caddy_global_options(os.path.join(d, CADDYFILE + ".golden"))
+        unit = unit_keys(os.path.join(d, CADDY_QUADLET + ".golden"))
+
+        delay = 0.0
+        if "shutdown_delay" in options:
+            delay = caddy_duration(" ".join(options["shutdown_delay"]))
+            if delay is None:
+                problems.append(f"{name}/{CADDYFILE}: shutdown_delay {' '.join(options['shutdown_delay'])!r} "
+                                "is not a Caddy duration (5s, 500ms)")
+        grace = None
+        if "grace_period" not in options:
+            problems.append(f"{name}/{CADDYFILE}: the global options set no grace_period, so on a stop Caddy "
+                            "waits forever for open connections (idle HTTP/3 ones among them) and podman SIGKILLs "
+                            "it at StopTimeout (status 137): add one to vm/config/Caddyfile.tmpl")
+        else:
+            grace = caddy_duration(" ".join(options["grace_period"]))
+            if grace is None:
+                problems.append(f"{name}/{CADDYFILE}: grace_period {' '.join(options['grace_period'])!r} "
+                                "is not a Caddy duration (5s, 500ms)")
+
+        stop = unit.get("Container", {}).get("StopTimeout")
+        if stop is None:
+            problems.append(f"{name}/{CADDY_QUADLET}: [Container] sets no StopTimeout=: write it out (podman's "
+                            "default is 10), so this check can hold Caddy's grace period under it")
+        elif not stop.isdigit():
+            problems.append(f"{name}/{CADDY_QUADLET}: StopTimeout={stop} is not a whole number of seconds")
+            stop = None
+        else:
+            stop = int(stop)
+
+        set_limit = unit.get("Service", {}).get("TimeoutStopSec")
+        limit = SYSTEMD_STOP_TIMEOUT if set_limit is None else systemd_seconds(set_limit)
+        if limit is None:
+            problems.append(f"{name}/{CADDY_QUADLET}: TimeoutStopSec={set_limit} is not a systemd time span")
+
+        if None not in (stop, delay, grace) and delay + grace + CADDY_STOP_MARGIN > stop:
+            problems.append(f"{name}: shutdown_delay {delay:g}s + grace_period {grace:g}s + {CADDY_STOP_MARGIN}s "
+                            f"margin is over caddy.container's StopTimeout={stop}: podman would SIGKILL Caddy "
+                            "(status 137) before it finishes")
+        if None not in (stop, limit) and not stop < limit:
+            what = f"TimeoutStopSec={set_limit}" if set_limit is not None else \
+                f"TimeoutStopSec (unset: systemd's {SYSTEMD_STOP_TIMEOUT}s)"
+            problems.append(f"{name}/{CADDY_QUADLET}: StopTimeout={stop} is not under {what}: systemd would "
+                            "kill the unit before podman stops Caddy")
+    return problems
+
+
 def telemetry_checks(mode):
     """The telemetry checks, run on the goldens, which the caller has just
     proved are exactly what renders; returns what failed. The ones that need
@@ -332,6 +480,12 @@ def main():
         print(f"tests/check: wrote {written} goldens; review `git diff vm/ansible/tests/golden`")
         return 0
     print(f"tests/check: {checked} rendered files match their goldens")
+    problems = caddy_stop_budget()
+    if problems:
+        print("Caddy's stop budget:\n  " + "\n  ".join(problems))
+        return 1
+    print(f"tests/check: Caddy's stop budget holds in every fixture: shutdown_delay + grace_period + "
+          f"{CADDY_STOP_MARGIN}s <= StopTimeout < TimeoutStopSec")
     mode = run_mode()
     failures = telemetry_checks(mode)
     if failures:
