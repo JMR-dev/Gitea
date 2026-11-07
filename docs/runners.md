@@ -412,7 +412,8 @@ should have two lines. `make logs` should show **no** Coraza audit entries for
 | arm64 jobs | `runs-on: docker-arm64`. `gitea:runnerArmMaxNodes` (max 18; quotas may hold it lower: see "The arm64 pool idles at zero nodes too") is how many run at once, one per node; 0 removes the pool and its runner. `gitea:runnerArmMachineType` must be `c4a-standard-N` or `c4a-highmem-N`, N ≥ 2 |
 | Spot burst nodes | `gitea:runnerBurstSpot true`: about 40% off each burst node-hour, and a preemption fails only the jobs on that node. The base pool is always on demand. |
 | Bigger nodes | `gitea:runnerMachineType e2-standard-4`, for both the base and burst pools. Each is replaced create-first, so the runners reschedule. The commitment does not grow with it (*The commitment*). |
-| Upgrade the runner | bump `gitea:runnerImageTag`; it must stay a `-dind-rootless` tag |
+| Upgrade the runner | bump `gitea:runnerImageTag`; it must stay a `-dind-rootless` tag, and the DinD runner's `start.sh` relies on the image starting with `s6-svscan /etc/s6` (it fails the rollout if `/etc/s6/docker` is gone: see "The `docker` runner prunes its own disk"). After the rollout, run the dry run below: it should list images and log no `image-prune: ERROR` (a new Docker CLI can change what `image inspect` prints, and the readiness probe wouldn't notice) |
+| Check the `docker` runner's disk | `kubectl --context=… -n gitea-runner logs gitea-runner-0 -c runner \| rg image-prune`; what a prune would remove, in order, without removing it: `kubectl --context=… -n gitea-runner exec gitea-runner-0 -c runner -- env IMAGE_PRUNE_DRY_RUN=1 IMAGE_PRUNE_ONCE=1 bash /etc/gitea-runner/image-prune.sh` |
 | Shell into a runner | `kubectl --context=gke_<p>_<zone>_gitea-runners -n gitea-runner exec -it gitea-runner-pods-0 -- sh` (or `gitea-runner-0`) |
 | Watch job pods | `kubectl --context=… -n gitea-jobs get pods -o wide -w` (`-n gitea-jobs-arm64` for arm64) |
 
@@ -495,6 +496,41 @@ matrix, say) runs in parallel instead of two-at-a-time. A per-node pre-pull
 DaemonSet (`gitea-runner-heavy-prepull`) keeps the job image resident, so a
 node reused within a burst starts without re-pulling it; a brand-new node
 (scaled from zero) still pulls once, shared with the first job.
+
+**The `docker` runner prunes its own disk.** Its dockerd keeps images and build
+cache on a 20 GiB PVC, shared by every repo's `docker` jobs, and on 2026-11-07
+a Caddy compile failed there with "no space left on device". So the runner
+container runs a third s6 service beside dockerd and the runner,
+`image-prune.sh` (`infra/pkg/runner`), which every 30 seconds:
+
+- notes which images containers use, in `/data/image-prune.state` on the
+  runner-data PVC;
+- when 4 GiB or less of the data root is free, removes unused images least
+  recently used first, one at a time, until it's above that line again. "Used"
+  is the later of the last time it saw a running container using the image
+  and the image's `LastTagTime`, which with the containerd image store this
+  daemon uses is when it last pulled, built or tagged the image;
+- if that isn't enough, removes build cache unused for a day, then all unused
+  build cache.
+
+It never removes an image a container uses, the `docker` label's job image
+(`runner-images:ubuntu-latest`), or, while a job runs, anything used, pulled,
+built or tagged since that job started, such as an image it built and hasn't
+pushed yet. Volumes are left alone: `silverbullet-trivy-cache` (1.7 GB on
+2026-11-07) is a cache on purpose. The container's command is `start.sh`,
+which installs the service and then runs the image's own entrypoint,
+`s6-svscan /etc/s6`. The service has no `finish` script, so if it dies s6
+restarts it rather than stopping the runner. Its log lines start with
+`image-prune:` and reach Watchtower with the runner's: a line when it starts,
+one an hour, and one for each image it removes. If pruning can't get back
+above the line, it logs `still below line`. If it can't read what Docker tells
+it (no images back from `image inspect`, or a `LastTagTime` or a running
+container's `StartedAt` it can't parse; the last also makes it keep every
+image until that container stops), it logs `image-prune: ERROR: …` at once
+and every 10 minutes while that lasts:
+the readiness probe only checks dockerd, so that line is what shows a prune
+loop that has gone blind. Tests: `infra/pkg/runner/bats` (`make check`). The arm64 runner needs none of
+this: each job's dockerd has an `emptyDir` data root that goes with the pod.
 
 **The base pool is a fixed `max(1, runnerReplicas)` nodes.** Pod anti-affinity
 gives each DinD runner a node of its own, and there is always at least one node

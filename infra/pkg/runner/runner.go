@@ -33,9 +33,11 @@
 package runner
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -100,6 +102,17 @@ const (
 	// ubuntu-latest jobs use). The pre-pull DaemonSet keeps it resident on
 	// heavy nodes so a reused node starts a job without pulling it again.
 	heavyJobImage = "docker.io/gitea/runner-images:ubuntu-latest"
+	// dockerJobImage is what `runs-on: docker` jobs run in, inside the DinD
+	// runner's dockerd. image-prune never removes it: every job needs it.
+	dockerJobImage = "docker.io/gitea/runner-images:ubuntu-latest"
+
+	// The DinD runner's data root fills with every repo's images and build
+	// cache (a Caddy compile failed on a full disk on 2026-11-07). image-prune.sh
+	// removes unused images, least recently used first, when this much or less
+	// of it is free: 4 GiB. Its state, when each image was last used, sits on
+	// the runner-data PVC so it survives restarts.
+	pruneMinFreeKiB = 4 * 1024 * 1024
+	pruneStateFile  = "/data/image-prune.state"
 
 	spcName   = "gitea-runner-registration-token"
 	tokenDir  = "/var/run/secrets/gitea-runner"
@@ -127,6 +140,16 @@ const (
 	// GCE's default VPC MTU. Docker defaults to 1500 inside, and the mismatch
 	// shows up as TLS handshakes that hang on large certificates.
 	mtu = 1460
+)
+
+// The DinD runner container's command, and the prune loop it starts beside
+// dockerd and the runner as a third s6 service. Both reach the container through
+// the runner's ConfigMap (dindConfigMapData).
+var (
+	//go:embed start.sh
+	startScript string
+	//go:embed image-prune.sh
+	pruneScript string
 )
 
 type Runner struct {
@@ -237,10 +260,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, gk *gke.Cluster, deps []pulumi
 		// No explicit name: Pulumi auto-names it, so a content change produces
 		// a new name, which changes the pod template and rolls the runners.
 		Metadata: &metav1.ObjectMetaArgs{Namespace: pulumi.String(Namespace)},
-		Data: pulumi.StringMap{
-			"config.yaml": pulumi.String(dindConfig(cfg)),
-			"daemon.json": pulumi.String(daemon),
-		},
+		Data:     pulumi.ToStringMap(dindConfigMapData(cfg, daemon)),
 	}, inNS...)
 	if err != nil {
 		return nil, err
@@ -731,7 +751,7 @@ func dindConfig(cfg *config.Config) string {
 	// Docker Hub can be served through the registry mirror in daemon.json.
 	// Every job behind one NAT IP would otherwise share Docker Hub's anonymous
 	// per-IP pull limit.
-	labels := []string{"docker:docker://docker.io/gitea/runner-images:ubuntu-latest"}
+	labels := []string{"docker:docker://" + dockerJobImage}
 
 	return runnerYAML(cfg.RunnerCapacity, shutdown, labels) + `
 container:
@@ -745,6 +765,29 @@ container:
   # auto-detect without mounting.
   docker_host: ""
 `
+}
+
+// dindConfigMapData is the DinD runner's ConfigMap: the runner's config, its
+// dockerd's daemon.json, and the container command with the prune loop it
+// starts. All of it mounts at configDir except daemon.json (dockerConfigDir).
+func dindConfigMapData(cfg *config.Config, daemon string) map[string]string {
+	return map[string]string{
+		"config.yaml":    dindConfig(cfg),
+		"daemon.json":    daemon,
+		"start.sh":       startScript,
+		"image-prune.sh": pruneScript,
+	}
+}
+
+// pruneEnv is image-prune.sh's settings. It has no defaults of its own, so
+// these are the only place they're set.
+func pruneEnv() map[string]string {
+	return map[string]string{
+		"IMAGE_PRUNE_DATA_ROOT":    dockerDataRoot,
+		"IMAGE_PRUNE_MIN_FREE_KIB": strconv.Itoa(pruneMinFreeKiB),
+		"IMAGE_PRUNE_KEEP":         dockerJobImage,
+		"IMAGE_PRUNE_STATE":        pruneStateFile,
+	}
 }
 
 // podsConfig is the pod runner's config.yaml.
@@ -1271,8 +1314,14 @@ func statefulSet(
 						&corev1.VolumeArgs{
 							Name: pulumi.String("config"),
 							ConfigMap: &corev1.ConfigMapVolumeSourceArgs{
-								Name:  cm.Metadata.Name(),
-								Items: corev1.KeyToPathArray{&corev1.KeyToPathArgs{Key: pulumi.String("config.yaml"), Path: pulumi.String("config.yaml")}},
+								Name: cm.Metadata.Name(),
+								// The scripts are run through sh and bash, so they
+								// need no exec mode.
+								Items: corev1.KeyToPathArray{
+									&corev1.KeyToPathArgs{Key: pulumi.String("config.yaml"), Path: pulumi.String("config.yaml")},
+									&corev1.KeyToPathArgs{Key: pulumi.String("start.sh"), Path: pulumi.String("start.sh")},
+									&corev1.KeyToPathArgs{Key: pulumi.String("image-prune.sh"), Path: pulumi.String("image-prune.sh")},
+								},
 							},
 						},
 						&corev1.VolumeArgs{
@@ -1296,13 +1345,16 @@ func statefulSet(
 						&corev1.ContainerArgs{
 							Name:  pulumi.String(ContainerName),
 							Image: pulumi.String(cfg.RunnerImage()),
+							// start.sh installs the image-prune s6 service, then
+							// execs the image's own entrypoint, s6-svscan.
+							Command: pulumi.ToStringArray([]string{"/bin/sh", configDir + "/start.sh"}),
 							// Rootless dockerd still needs a privileged container
 							// for its user namespaces and mounts -- but the daemon
 							// runs as uid 1000, so a job that escapes its own
 							// container lands as an unprivileged user, not as
 							// root on the node.
 							SecurityContext: &corev1.SecurityContextArgs{Privileged: pulumi.Bool(true)},
-							Env: corev1.EnvVarArray{
+							Env: append(corev1.EnvVarArray{
 								// The public URL, through Caddy, exactly as any
 								// other client. ROOT_URL is what Gitea builds
 								// artifact and checkout URLs from anyway.
@@ -1323,7 +1375,7 @@ func statefulSet(
 								// jobs. Do NOT set DOCKER_TLS_CERTDIR="": that
 								// switches the always-on TCP listener from mTLS
 								// on :2376 to plaintext on :2375.
-							},
+							}, envVars(pruneEnv())...),
 							VolumeMounts: corev1.VolumeMountArray{
 								&corev1.VolumeMountArgs{Name: pulumi.String("runner-data"), MountPath: pulumi.String("/data")},
 								&corev1.VolumeMountArgs{Name: pulumi.String("docker-data"), MountPath: pulumi.String(dockerDataMount)},
@@ -1542,4 +1594,19 @@ func with(base []pulumi.ResourceOption, extra ...pulumi.ResourceOption) []pulumi
 
 func env(name, value string) *corev1.EnvVarArgs {
 	return &corev1.EnvVarArgs{Name: pulumi.String(name), Value: pulumi.String(value)}
+}
+
+// envVars turns a map into env vars, sorted by name so the pod template, and so
+// the preview, doesn't change from one run to the next.
+func envVars(m map[string]string) corev1.EnvVarArray {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(corev1.EnvVarArray, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, env(k, m[k]))
+	}
+	return out
 }

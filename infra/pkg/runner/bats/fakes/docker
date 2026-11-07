@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# A fake `docker` for image-prune.bats. It serves canned state from $FAKE and
+# records what it was asked to do there. Only the calls image-prune.sh makes
+# are understood; anything else fails loudly.
+#
+# State files in $FAKE (all optional):
+#   containers   lines "<image id> <running true|false> <StartedAt RFC 3339>"
+#   images       lines "<id> <LastTagTime RFC 3339> <size> <names, comma-separated or empty>"
+#   keep_id      the kept image's ID (empty or missing: it isn't present)
+#   free         free KiB, as the fake df reports it
+#   free_per_rm  KiB a successful `image rm` frees (default 0)
+#   free_per_cache  KiB a `builder prune` frees (default 0)
+#   rm_fail      names whose removal fails, one per line
+#   mode         "silent-inspect": image inspect prints nothing; "ps-fails": ps fails
+# Records:
+#   rm.log       the names (or ID) of each `image rm`, one call per line
+#   builder.log  the arguments of each `builder prune`, one call per line
+
+set -uo pipefail
+
+: "${FAKE:?the fake docker needs FAKE}"
+
+mode="$(cat "$FAKE/mode" 2>/dev/null)"
+
+touch "$FAKE/containers" "$FAKE/images"
+
+add_free() {
+  local kib
+  kib="$(cat "$FAKE/$1" 2>/dev/null)"
+  echo $(($(cat "$FAKE/free") + ${kib:-0})) >"$FAKE/free"
+}
+
+case "$1 ${2:-}" in
+  "info "*)
+    exit 0
+    ;;
+  "ps -aq")
+    [[ "$mode" == ps-fails ]] && exit 1
+    # One made-up container ID per container line.
+    awk '{ print "container" NR }' "$FAKE/containers"
+    ;;
+  "container inspect")
+    cat "$FAKE/containers"
+    ;;
+  "image ls")
+    awk '{ print $1 }' "$FAKE/images"
+    ;;
+  "image inspect")
+    # `--format {{.Id}} <ref>`: the kept image's ID lookup.
+    if [[ "$4" == "{{.Id}}" ]]; then
+      id="$(cat "$FAKE/keep_id" 2>/dev/null)"
+      [[ -n "$id" ]] || exit 1
+      echo "$id"
+      exit 0
+    fi
+    [[ "$mode" == silent-inspect ]] && exit 0
+    cat "$FAKE/images"
+    ;;
+  "image rm")
+    shift 2
+    for ref in "$@"; do
+      if [[ -f "$FAKE/rm_fail" ]] && rg -qxF -- "$ref" "$FAKE/rm_fail"; then
+        echo "Error response from daemon: conflict: unable to remove $ref" >&2
+        exit 1
+      fi
+    done
+    echo "$*" >>"$FAKE/rm.log"
+    # Drop the image whose ID is the first argument, or whose names hold it.
+    awk -v ref="$1" '{ n = split($4, names, ","); hit = ($1 == ref)
+      for (i = 1; i <= n; i++) if (names[i] == ref) hit = 1
+      if (!hit) print }' "$FAKE/images" >"$FAKE/images.new"
+    mv "$FAKE/images.new" "$FAKE/images"
+    add_free free_per_rm
+    ;;
+  "builder prune")
+    shift 2
+    echo "$*" >>"$FAKE/builder.log"
+    add_free free_per_cache
+    echo "Total reclaimed space: 1GB"
+    ;;
+  *)
+    echo "fake docker: unexpected call: docker $*" >&2
+    exit 99
+    ;;
+esac
