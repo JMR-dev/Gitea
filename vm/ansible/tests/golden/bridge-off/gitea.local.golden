@@ -1,4 +1,4 @@
-# Installed by vm/bootstrap.sh as /etc/fail2ban/jail.d/gitea.local
+# Rendered by the playbook (vm/ansible, role firewall) as /etc/fail2ban/jail.d/gitea.local
 
 [DEFAULT]
 # Podman's journald log driver tags container output with CONTAINER_NAME, so
@@ -72,7 +72,8 @@ bantime.maxtime   = 4w
 # it would have blocked but lets it through, and escalating those reports into
 # nftables bans would turn a tuning false positive into a locked-out user --
 # strictly worse than the 403 that DetectionOnly was chosen to avoid.
-# vm/bootstrap.sh derives this from the same config value as SecRuleEngine.
+# roles/firewall/vars/main.yml derives this from the same config value as
+# SecRuleEngine (waf_mode).
 enabled  = false
 filter   = caddy-coraza
 port     = 80,443

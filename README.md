@@ -171,9 +171,12 @@ containers on older runtimes). The Caddy version stays a deliberate change to
 - **`app.ini` is fully managed** and `INSTALL_LOCK=true`. Gitea settings changed
   in the web UI that map to `app.ini` will not survive the next deploy. Edit
   `vm/config/app.ini.tmpl` instead.
-- **The podman subnet is pinned** (`10.89.10.0/24`). It is what
-  `REVERSE_PROXY_TRUSTED_PROXIES` names; an unpinned subnet would silently make
-  fail2ban ban Caddy instead of the attacker.
+- **The podman subnet is pinned** (`10.89.10.0/24`). Caddy's fixed address in
+  it, `.251`, is what `REVERSE_PROXY_TRUSTED_PROXIES` names, alone (`/32`); an
+  unpinned subnet would silently make fail2ban ban Caddy instead of the
+  attacker. Never widen it to the subnet: every host process that reaches Gitea
+  on 127.0.0.1:3000 arrives from the bridge gateway, inside it, and could then
+  name any client for fail2ban to ban.
 - **Never put `flush ruleset` in the nftables config.** It would wipe netavark's
   rules and break all container networking on reload.
 - **The DNS zone, the backup bucket, and the Gitea secrets are not Pulumi-owned**

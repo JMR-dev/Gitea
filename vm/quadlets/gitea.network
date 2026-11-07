@@ -1,4 +1,4 @@
-# Rendered by vm/bootstrap.sh into /etc/containers/systemd/
+# Rendered by the playbook (vm/ansible, role app) into /etc/containers/systemd/
 #
 # The subnet is PINNED deliberately. Left to podman it is drawn from the default
 # pool and is not stable across a network recreate -- and Caddy's fixed

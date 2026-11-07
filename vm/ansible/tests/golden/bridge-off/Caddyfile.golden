@@ -1,4 +1,5 @@
-# Rendered by vm/bootstrap.sh -> /etc/caddy/Caddyfile
+# Rendered by the playbook (vm/ansible, role app, through
+# files/gitea-render-secrets) -> /etc/caddy/Caddyfile
 #
 # Two compile-time plugins are doing the work here:
 #

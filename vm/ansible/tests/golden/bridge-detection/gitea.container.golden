@@ -1,4 +1,4 @@
-# Rendered by vm/bootstrap.sh into /etc/containers/systemd/
+# Rendered by the playbook (vm/ansible, role app) into /etc/containers/systemd/
 [Unit]
 Description=Gitea
 Documentation=https://docs.gitea.com/
@@ -40,15 +40,15 @@ LogDriver=journald
 PublishPort=2222:2222
 PublishPort=127.0.0.1:3000:3000
 
-# No :z/:Z on the data volume -- bootstrap.sh sets a persistent SELinux fcontext
-# for it instead. A relabel flag here would force a recursive relabel of the
-# entire repository tree on every single container start.
+# No :z/:Z on the data volume -- the playbook (role data_disk) sets a persistent
+# SELinux fcontext for it instead. A relabel flag here would force a recursive
+# relabel of the entire repository tree on every single container start.
 Volume=/var/lib/gitea:/var/lib/gitea
 Volume=/etc/gitea/app.ini:/etc/gitea/app.ini:ro,Z
 
 # Gitea Actions runner registration token: a Volume= for /etc/gitea/runner-token
 # plus Environment=GITEA_RUNNER_REGISTRATION_TOKEN_FILE, or a comment when the
-# secret does not exist. bootstrap.sh decides both from the same check: Gitea
+# secret does not exist. Role app decides both from the same check: Gitea
 # calls log.Fatal if that variable names a file it cannot read, so the env line
 # must never be rendered without the file. See docs/runners.md.
 # No runner registration token: gitea:runnersEnabled is off, or the secret does not exist yet.
