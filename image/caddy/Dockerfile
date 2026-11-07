@@ -21,6 +21,11 @@ FROM golang:${GOLANG_TAG} AS build
 ARG CADDY_VERSION
 ARG CORAZA_VERSION
 ARG XCADDY_VERSION=latest
+# The googleclouddns plugin, pinned (and asserted below): certificate renewal
+# depends on how it and its Google auth libraries find credentials. Bumping it
+# means re-running the ACME staging check (`make acme-staging-check`, coming
+# with the DNS-only account work) before it merges.
+ARG GOOGLECLOUDDNS_VERSION=v1.1.0
 
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local
@@ -32,7 +37,7 @@ RUN set -eux; \
 
 RUN set -eux; \
     xcaddy build "v${CADDY_VERSION}" \
-        --with github.com/caddy-dns/googleclouddns \
+        --with "github.com/caddy-dns/googleclouddns@${GOOGLECLOUDDNS_VERSION}" \
         --with "github.com/corazawaf/coraza-caddy/v2@${CORAZA_VERSION}" \
         --output /out/caddy; \
     /out/caddy version; \
@@ -44,7 +49,16 @@ RUN set -eux; \
         || { echo "googleclouddns module missing"; cat /tmp/modules.txt; exit 1; }; \
     grep -qiE 'coraza|waf' /tmp/modules.txt \
         || { echo "coraza module missing"; cat /tmp/modules.txt; exit 1; }; \
-    echo "WAF/DNS modules present:"; grep -iE 'coraza|waf|googleclouddns' /tmp/modules.txt
+    # Assert the DNS plugin is GOOGLECLOUDDNS_VERSION, as the binary itself
+    # records it. Certificate renewal runs through this plugin's auth path, so
+    # any other version -- `latest` moving, or another module's go.mod pulling
+    # it up -- fails here instead of reaching prod unreviewed.
+    /out/caddy build-info > /tmp/build-info.txt; \
+    gcdns="$(awk '$1 == "dep" && $2 == "github.com/caddy-dns/googleclouddns" {print $3}' /tmp/build-info.txt)"; \
+    test "${gcdns}" = "${GOOGLECLOUDDNS_VERSION}" \
+        || { echo "googleclouddns plugin is ${gcdns:-missing}, want ${GOOGLECLOUDDNS_VERSION}"; grep googleclouddns /tmp/build-info.txt; exit 1; }; \
+    echo "WAF/DNS modules present:"; grep -iE 'coraza|waf|googleclouddns' /tmp/modules.txt; \
+    echo "googleclouddns plugin: ${gcdns}"
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime.
