@@ -167,18 +167,26 @@ make approve BUILD=<id>      # gcloud beta builds approve (there is no GA comman
 - Infra runs before image, and an image is never released after a failed
   infra deploy.
 - Infra deploys take a lock, `gs://gitea-ci-781388-deploy-state/infra.lock`,
-  and wait up to 45 minutes for one already running. The lock names its build
-  and the region it runs in. A cancelled build dies before it can remove it,
-  so a lock whose holder Cloud Build says has finished (any final status, at
-  least a minute ago) is taken over, with a `GITEA_INFRA_LOCK_TAKEOVER` line
-  in the log. A lock whose holder can't be proven finished is waited for, and
-  is stale after 4 hours, as before.
+  and wait up to 45 minutes for one already running. The lock names its build,
+  the region it runs in and its host. A cancelled build dies before it can
+  remove it, so a lock whose holder Cloud Build says has finished (any final
+  status, at least a minute ago) is taken over, with a
+  `GITEA_INFRA_LOCK_TAKEOVER` line in the log. A lock whose holder can't be
+  proven finished is waited for, and is stale after 4 hours, as before.
+- `pulumi up` takes a lock of its own on the stack, and a build cancelled
+  during it leaves that one too, as does a laptop `make up` killed mid-run
+  (which takes Pulumi's lock but not the infra lock). An infra deploy that
+  finds one fails before changing anything, with a
+  `GITEA_INFRA_STACK_LOCKED` line, and never clears it: see
+  [runbook.md](runbook.md), "A leftover Pulumi stack lock".
 - Releases wait for a running engine Job.
 - **A commit older than one already deployed is skipped**, so builds that
   finish out of order never put old code back:
   - for infra, by comparing the commit with last-good;
   - for the image, by asking Gitea, right before the release, whether a newer
-    commit on main also changes the image.
+    commit on main's own first-parent line also changes the image: a merge
+    counts with its diff against main as it was, not with the commits it
+    brought in (a branch that merged main in lists main's changes again).
   - An approved build is never skipped this way, because it may carry the
     version bump the newer one can't release.
 
@@ -188,17 +196,19 @@ make approve BUILD=<id>      # gcloud beta builds approve (there is no GA comman
 1. Release gate.
 2. Lock.
 3. Superseded check.
-4. Destructive-change guard.
-5. Backup: the engine's backup Job (dump, config tarball, online snapshot) plus
+4. Stack lock check: a Pulumi lock left on the stack fails the deploy here,
+   before anything changes (`GITEA_INFRA_STACK_LOCKED`).
+5. Destructive-change guard.
+6. Backup: the engine's backup Job (dump, config tarball, online snapshot) plus
    a `pulumi stack export` under `config/<stamp>-infra/`.
-6. `pulumi up`, then the VM's config: the playbook (`vm/ansible`) for a tree
+7. `pulumi up`, then the VM's config: the playbook (`vm/ansible`) for a tree
    that has it, the old `gitea-config-sync` for one with `vm/bootstrap.sh` --
    the tree being applied decides, so a rollback across the change works. A
    replaced VM is waited for (SSH, boot, then HTTPS after its config).
-7. The engine's `verify` Job.
-8. A preview that must show nothing left to change.
-9. On success, the tree becomes **last-good**. On a failure in steps 6–8, the
-   last-good tree is re-applied and `GITEA_INFRA_ROLLBACK` is logged.
+8. The engine's `verify` Job.
+9. A preview that must show nothing left to change.
+10. On success, the tree becomes **last-good**. On a failure in steps 7–9, the
+    last-good tree is re-applied and `GITEA_INFRA_ROLLBACK` is logged.
 
 This rollback is a re-apply, not an undo:
 - A replaced VM is replaced again.
@@ -451,17 +461,27 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   each checked against its publisher's SHA-256 (`TOOLS` in
   `scripts/cicd/infra_deploy.py`; bump Pulumi there). The infra build's Go
   compile against pulumi-gcp, and the gcp and kubernetes Pulumi plugins, are
-  cached across runs in a GCS `<ci>-build-cache` bucket, one object per
-  `infra/go.mod` + `go.sum` + Go version + `TOOLS`: `scripts/cicd/infra_deploy.py`
-  restores it before `go build` (deploys and previews) and a deploy writes it,
-  after its first preview has fetched the plugins, only when its go.sum has
-  none yet, so an ordinary deploy uploads nothing. A
+  cached across runs in a GCS `<ci>-build-cache` bucket, one zstd-compressed
+  tar (`infra-go-cache-<hash>.tar.zst`) per `infra/go.mod` + `go.sum` + Go
+  version + `TOOLS`: `scripts/cicd/infra_deploy.py` restores it before
+  `go build` (deploys and previews) and a deploy writes it, after its first
+  preview has fetched the plugins, only when its go.sum has none yet, so an
+  ordinary deploy uploads nothing. A
   dependency bump starts from the newest object, and that upload goes up in
   parallel pieces (cb-infra can read the bucket's settings, which gcloud
   checks first). The build uses `-trimpath`:
   without it Go keys every compiled package by its directory, which differs
-  each run, and the cache never hits. Best-effort: a miss or error just builds
-  cold. Infra deploys also hold the ops pool's node with a placeholder pod
+  each run, and the cache never hits. The gcloud image has no zstd binary and
+  its `python3` (3.13) no `compression.zstd`, so its Cloud SDK's bundled
+  Python 3.14 packs the cache at level 3 on every core (gzip took minutes)
+  and unpacks it; an image bump that drops that Python only makes every build
+  cold, with a WARNING (`ZSTD_PYTHONS`). The restore unpacks into a staging
+  directory and moves it into place only once all of it has unpacked, so a
+  failed download or a truncated object is a cold build, never part of a
+  cache. A deploy that saves keeps its own object and the newest other
+  `.tar.zst` one and removes the rest; the old uncompressed `.tar` objects
+  are left to the bucket's 30-day rule. Best-effort: a miss or error just
+  builds cold. Infra deploys also hold the ops pool's node with a placeholder pod
   from the build on, so the backup and verify Jobs never wait for it to scale
   up from zero.
   The image build is still cold: both Dockerfiles are multi-stage and the cost

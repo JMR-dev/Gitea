@@ -432,6 +432,44 @@ In Cloud Build the pinned gcloud image already ships it, and
 token from the caller's own credentials at connect time; no token is stored in
 the stack state.
 
+### A leftover Pulumi stack lock
+
+`pulumi up` holds a lock on the stack while it runs: an object under
+`gs://gitea-496920-pulumi-state/.pulumi/locks/organization/gitea/prod/`. An
+infra build cancelled during `pulumi up`, or a laptop `make up` killed
+mid-run, leaves it there, and every later `pulumi up` refuses the stack. An
+infra deploy looks for one right after its superseded check and, finding one,
+fails before changing anything: it logs `GITEA_INFRA_STACK_LOCKED stack=prod
+locks=N` and names each lock with who took it (user@host, pid, time). It never
+clears one itself, since whoever holds it may still be running. (A `pulumi
+preview` takes no lock, so PR previews never leave one.)
+
+1. Make sure nothing still holds it: no infra build running in
+   `gitea-ci-781388`, and no `make up` on a laptop. A laptop's `make up` takes
+   this lock but not the infra lock, so it can overlap a deploy. If the
+   failure says the run took the infra lock over from a cancelled build, that
+   build is the likely holder.
+2. Clear it, either way:
+
+   ```bash
+   cd infra && pulumi login gs://gitea-496920-pulumi-state && pulumi cancel --stack prod --yes
+   # or remove exactly the objects the failure names:
+   gcloud storage rm gs://gitea-496920-pulumi-state/.pulumi/locks/organization/gitea/prod/<id>.json
+   ```
+
+3. A `pulumi up` killed mid-change can leave pending operations in the
+   state. Check before the next deploy:
+
+   ```bash
+   cd infra && pulumi stack export --stack prod | python3 -c \
+     'import json, sys; print(json.load(sys.stdin)["deployment"].get("pending_operations") or "none")'
+   ```
+
+   If it lists any, run `pulumi refresh --stack prod` first (it needs
+   `PULUMI_CONFIG_PASSPHRASE` and the auth plugin above), and resolve what it
+   reports before the next deploy.
+4. Re-run the failed build.
+
 ### Releases: how an image goes live
 
 A build (`make build`, or the pipeline) pushes `:$SHORT_SHA` and a version tag
