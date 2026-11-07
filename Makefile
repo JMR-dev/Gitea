@@ -28,8 +28,6 @@ bootstrap: ## One-time project setup (run before the first `make up`)
 fmt: ## Format Go sources
 	cd infra && gofmt -w .
 
-# -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
-#   Pulumi runs it rather than compiling. Without it preview/up fail outright.
 # Shell that runs on the VM (shipped by the playbook) or for it, the
 # telemetry checks' own, and the DinD runner container's (infra/pkg/runner).
 SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh scripts/rehearsal.sh \
@@ -42,18 +40,41 @@ SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh 
 # can't parse their @test blocks.
 BATS_DIRS  = infra/pkg/runner/bats
 BATS_FILES = $(wildcard $(addsuffix /*.bats,$(BATS_DIRS)))
+
+# Every stage. A PR runs infra-check and ci-check (a heavy runner) and
+# scripts-check (ubuntu-latest) as Gitea Actions status checks
+# (.gitea/workflows/checks.yml), and ansible-check in Cloud Build's
+# cloudbuild/preview. check-metadata-guard (namespaces, nft) and workflow-lint
+# (podman) run only here. scripts/cicd/test_cicd.py checks the workflow and
+# this list agree (docs/cicd.md, "PR checks").
 .PHONY: check
-check: ci-check ansible-check check-metadata-guard ## Build and vet both Pulumi programs and the relay, test them, and check the scripts and the playbook
+check: ci-check infra-check scripts-check ansible-check check-metadata-guard workflow-lint ## Build and vet both Pulumi programs and the relay, test them, and check the scripts, the playbook and the workflows
+
+# -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
+#   Pulumi runs it rather than compiling. Without it preview/up fail outright.
+.PHONY: infra-check
+infra-check: ## Build, vet and test the app's Pulumi program (infra/)
 	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/runner ./pkg/telemetry
+
+# shellcheck and bats are both required: a PR runs this stage as a status
+# check, so a missing tool must fail it, not skip it.
+.PHONY: scripts-check
+scripts-check: ## Parse and shellcheck the shell, compile the ops scripts, run the bats tests
 	@# One file at a time: `bash -n a b` parses a and hands it b as an argument.
 	for f in $(SHELL_SCRIPTS); do bash -n "$$f" || exit 1; done
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
-	@# if/else, not `a && b || c`: that reports "not installed" and exits 0 when
-	@# shellcheck runs and finds something, so the check could never fail.
-	@if command -v shellcheck >/dev/null; then shellcheck -S warning $(SHELL_SCRIPTS) $(BATS_FILES); \
-	else echo "shellcheck not installed -- skipped"; fi
-	@# Required, unlike shellcheck: these are the scripts' tests, not a lint.
+	shellcheck -S warning $(SHELL_SCRIPTS) $(BATS_FILES)
+	@# The scripts' tests, not a lint.
 	bats $(BATS_DIRS)
+
+# actionlint, pinned by digest (the tag is for reading), on the Gitea Actions
+# workflows. .gitea/actionlint.yaml names the runner labels GitHub doesn't
+# have. The image bundles shellcheck, so `run:` blocks are checked too.
+ACTIONLINT = docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+.PHONY: workflow-lint
+workflow-lint: ## Lint the Gitea Actions workflows (actionlint, through podman)
+	podman run --rm --security-opt label=disable -v "$(CURDIR):/repo:ro" -w /repo $(ACTIONLINT) \
+		-config-file .gitea/actionlint.yaml $(wildcard .gitea/workflows/*.yml .gitea/workflows/*.yaml)
 
 # The checks a PR preview and a deploy run on vm/ansible (infra_deploy.py's
 # ansible_checks), with the pinned ansible-core: no nftables restart/reload,

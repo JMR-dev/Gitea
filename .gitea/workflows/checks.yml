@@ -1,0 +1,68 @@
+# PR status checks: the stages of `make check` that Cloud Build's
+# cloudbuild/preview, /infra and /image don't run (docs/cicd.md, "PR checks").
+#
+#   go       heavy          make infra-check ci-check: build, vet and test infra/,
+#                           cicd/ and cicd/relay, and the scripts/cicd unit tests
+#   scripts  ubuntu-latest  make scripts-check: bash -n, shellcheck, py_compile
+#                           and the bats tests
+#
+# Not here, and run by a local `make check` only: ansible-check, which
+# cloudbuild/preview already runs; check-metadata-guard, which needs user and
+# network namespaces and nft; workflow-lint, which needs podman.
+#
+# PR-only: a merge to main deploys, and what it merges ran here first as a PR.
+# workflow_dispatch runs it by hand, but Gitea posts no commit status for a
+# dispatched run.
+#
+# Never add paths: filters once these are required. A PR the filter skips
+# never gets the status, and a required status that never comes blocks it.
+#
+# scripts/cicd/test_cicd.py (ChecksWorkflowAgrees) checks the make targets
+# here against the Makefile's `check`, the action pins and the apt packages.
+name: checks
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go:
+    # heavy: infra/ compiles the Pulumi providers, more memory than an
+    # ubuntu-latest pod has (docs/runners.md).
+    runs-on: heavy
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: infra/go.mod
+          cache-dependency-path: |
+            infra/go.sum
+            cicd/go.sum
+            cicd/relay/go.sum
+      - run: make infra-check ci-check
+
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install shellcheck, bats and ripgrep
+        # ripgrep: the bats fakes (infra/pkg/runner/bats/fakes) use rg.
+        run: |
+          apt=(apt-get); [[ $(id -u) -eq 0 ]] || apt=(sudo apt-get)
+          "${apt[@]}" update -qq
+          "${apt[@]}" install -y -qq --no-install-recommends shellcheck bats ripgrep
+      - run: make scripts-check

@@ -79,6 +79,46 @@ That is why the relay still previews only same-repo branches whose **author and
 pusher** are both in `gitea-cicd:allowedAuthors`. Keep that list to people you'd
 trust with the home IP.
 
+## PR checks
+
+Cloud Build's statuses (`cloudbuild/preview`, `/infra`, `/image`) cover
+`pulumi preview`, the Ansible checks and an image build. The rest of `make
+check` runs as Gitea Actions status checks, from `.gitea/workflows/checks.yml`,
+on every PR to main:
+
+| Job | Runs on | Runs |
+|---|---|---|
+| `go` | `heavy` | `make infra-check ci-check`: build, vet and test `infra/`, `cicd/` and `cicd/relay`, and `python3 -m unittest discover -s scripts/cicd` |
+| `scripts` | `ubuntu-latest` | `make scripts-check`: `bash -n`, `shellcheck -S warning`, `py_compile` and the bats tests (`infra/pkg/runner/bats`), with shellcheck, bats and ripgrep from apt |
+
+- The contexts should be `checks / go (pull_request)` and `checks / scripts
+  (pull_request)`. Confirm them on the first PR before naming them in branch
+  protection.
+- `make check` runs three stages a PR doesn't:
+  - `ansible-check`: `cloudbuild/preview` already runs it;
+  - `check-metadata-guard`: it needs user and network namespaces and nft,
+    which a job pod may not allow. A probe on a throwaway PR will decide
+    whether it can join;
+  - `workflow-lint`: actionlint, pinned by digest, runs through podman, which
+    job pods don't have. Run `make workflow-lint` after editing a workflow.
+- PRs only: a merge to main deploys what already passed here as a PR.
+  `workflow_dispatch` runs the checks by hand, but Gitea posts no commit
+  status for a dispatched run.
+- **Never add `paths:` filters** once these are required. A PR the filter
+  skips never gets the status, and the merge waits for it forever.
+- `scripts/cicd/test_cicd.py` (`ChecksWorkflowAgrees`) checks that the
+  workflow's make targets and `make check`'s stages agree, that every action is
+  pinned to a commit, that the apt line names the three tools, and that there
+  is no `paths:` filter.
+- The checks depend on the GKE runner cluster ([runners.md](runners.md)). While
+  it is down, or the heavy pool can't scale up, the statuses stay pending, and
+  once they are required no PR can merge. The first `go` job after an idle
+  spell waits a few minutes for a heavy node.
+- The jobs use no secrets. The workflow asks for a read-only run token
+  (`permissions: contents: read`); whether Gitea applies `permissions` is
+  still to be confirmed. Unlike the Cloud Build preview, nothing limits which
+  authors' PRs run it.
+
 ## What deploys, and when
 
 The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
@@ -91,7 +131,7 @@ The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
 | push to main touching `scripts/cicd/release_gate.py` (the gate both pipelines run) | infra deploy **and** image build and release | no |
 | push to main touching `image/gitea.version`, `image/alpine.version` or `vm/bootstrap.sh` | as above | **yes** (`make approve`) |
 | push whose commit list Gitea truncated (more than 15 commits) | everything | **yes** |
-| anything else (docs, `cicd/`, `scripts/ops/`, `scripts/cicd/bootstrap.py` and tests) | nothing; status "nothing to deploy" | n/a |
+| anything else (docs, `cicd/`, `scripts/ops/`, `scripts/cicd/bootstrap.py` and tests, `.gitea/`, the Makefile) | nothing; status "nothing to deploy" | n/a |
 | Sunday 04:00 UTC | image rebuild from main and release | no |
 
 - The version files are what make a Gitea major or Alpine minor change.
