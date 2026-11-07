@@ -210,7 +210,7 @@ func TestCertPolicy(t *testing.T) {
 	got, _ := run(t, testConfig(18))
 	p := resourceNamed(t, got, "cert-not-renewing")
 
-	if d := str(p, "displayName"); d != "Gitea: TLS certificate not renewing, or unreachable from outside" {
+	if d := str(p, "displayName"); d != "Gitea: TLS certificate not renewing (or HTTPS unreachable)" {
 		t.Errorf("displayName %q", d)
 	}
 	if str(p, "severity") != "CRITICAL" || str(p, "combiner") != "OR" || str(p, "project") != "p" {
@@ -269,20 +269,38 @@ func TestCertPolicy(t *testing.T) {
 		t.Errorf("documentation: mimeType %q, %d characters (8192 at most)", str(doc, "mimeType"), len([]rune(content)))
 	}
 	// Unreachable needs action in minutes, so it comes first.
-	unreachable, renewing := strings.Index(content, "Unreachable from outside"), strings.Index(content, "Not renewing")
+	unreachable, renewing := strings.Index(content, "HTTPS unreachable from outside"), strings.Index(content, "Not renewing")
 	if unreachable < 0 || renewing < 0 || unreachable > renewing {
 		t.Errorf("documentation must explain unreachable (at %d) before not renewing (at %d):\n%s", unreachable, renewing, content)
 	}
 	for _, want := range []string{
+		// What it is not: with Caddy serving TLS, Gitea down may send nothing.
+		"not an outage alert",
+		"Gitea itself is down",
+		// Right on any VM.
+		`sudo journalctl CONTAINER_NAME=caddy | grep -E '"logger":"tls\.(obtain|renew)"'`,
+		"Caddy cannot get a certificate",
+		// Right once the change that brings them has landed.
 		"systemctl status gitea-caddy-dns-token.timer gitea-caddy-dns-token.service",
 		"journalctl -u gitea-caddy-dns-token",
-		`sudo journalctl CONTAINER_NAME=caddy | grep -E '"logger":"tls\.(obtain|renew)"'`,
+		"journalctl -t gitea-caddy-dns-check",
 		"sudo gitea-caddy-dns-token --check",
 		"make acme-staging-check",
 		"gitea-cicd:certAlertDays",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("documentation lacks %q", want)
+		}
+	}
+	// The minter, its hourly check and make acme-staging-check come with
+	// changes of their own. A line that names one says so, so the e-mail is
+	// right before they land and after.
+	for _, line := range strings.Split(content, "\n") {
+		if strings.Contains(line, "gitea-caddy-dns-") && !strings.Contains(line, "once the Caddy DNS-token change has deployed") {
+			t.Errorf("names the DNS-token change's tools without saying they come with it:\n%s", line)
+		}
+		if strings.Contains(line, "acme-staging-check") && !strings.Contains(line, "once its PR has merged") {
+			t.Errorf("names make acme-staging-check without saying it comes with its own PR:\n%s", line)
 		}
 	}
 }

@@ -76,13 +76,15 @@ func TestCertAlertDaysAccepts(t *testing.T) {
 	}
 }
 
-// A threshold above the days a healthy certificate ever has left fires
-// whatever Caddy does: that is a drill, and `pulumi up` says so.
+// A threshold above the days any healthy certificate has left when Caddy
+// renews it fires whatever Caddy does: that is a drill, and `pulumi up` says
+// so. The longest certificate Let's Encrypt issues is 90 days (until
+// 2027-02-10), renewed at 30 days left, so 30 itself never fires on a healthy
+// one and 31 always does.
 func TestCertAlertIsDrill(t *testing.T) {
-	if !CertAlertIsDrill(120) {
-		t.Error("120 days is a drill value")
-	}
-	if CertAlertIsDrill(18) {
-		t.Error("18 days (the default) is not a drill value")
+	for days, want := range map[int]bool{18: false, 21: false, 25: false, 30: false, 31: true, 120: true} {
+		if got := CertAlertIsDrill(days); got != want {
+			t.Errorf("CertAlertIsDrill(%d) = %v, want %v", days, got, want)
+		}
 	}
 }

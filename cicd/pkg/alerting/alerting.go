@@ -1,6 +1,6 @@
 // Package alerting e-mails the operator when the pipeline rolls prod back,
 // when a rollback itself fails, when a pipeline build fails, and when Gitea's
-// TLS certificate stops renewing or Gitea stops answering from outside.
+// TLS certificate stops renewing or its HTTPS stops answering from outside.
 //
 // The first three are log-match alerts: one e-mail per matching line
 // (rate-limited), with no metric or threshold in between to get wrong. The
@@ -19,7 +19,9 @@
 // fetches /api/healthz over HTTPS from Google's checkers every 15 min,
 // validating the certificate, and records the days it has left; the policy
 // (cert-not-renewing) fires when they drop below gitea-cicd:certAlertDays,
-// or when there has been no reading for an hour.
+// or when there has been no reading for an hour. It is not an outage alert:
+// with Caddy serving TLS and Gitea itself down, the check fails but can still
+// record the days left, and then nothing fires.
 package alerting
 
 import (
@@ -96,7 +98,7 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (pulum
 }
 
 const (
-	certTitle = "Gitea: TLS certificate not renewing, or unreachable from outside"
+	certTitle = "Gitea: TLS certificate not renewing (or HTTPS unreachable)"
 	// Days until the certificate a check was served expires, per check_id.
 	certMetric = "monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires"
 )
@@ -160,9 +162,9 @@ func certAlert(ctx *pulumi.Context, cfg *config.Config, ch *monitoring.Notificat
 				EvaluationMissingData: pulumi.String("EVALUATION_MISSING_DATA_ACTIVE"),
 			},
 		}},
-		// Again every day while it is open; a week with nothing below the
-		// threshold closes it. No notificationRateLimit: that is for
-		// log-match alerts only.
+		// Again every day while it is open. An incident closes as soon as its
+		// condition clears; autoClose closes one after a week with no data at
+		// all. No notificationRateLimit: that is for log-match alerts only.
 		AlertStrategy: &monitoring.AlertPolicyAlertStrategyArgs{
 			AutoClose: pulumi.String("604800s"),
 			NotificationChannelStrategies: monitoring.AlertPolicyAlertStrategyNotificationChannelStrategyArray{
@@ -184,26 +186,39 @@ func certAlert(ctx *pulumi.Context, cfg *config.Config, ch *monitoring.Notificat
 }
 
 // certDoc is the policy's documentation, which the e-mail carries, in
-// markdown. Unreachable first: that one needs action within minutes.
+// markdown. Unreachable first: that one needs action within minutes. The
+// minter, its hourly check and make acme-staging-check come with changes of
+// their own, so each line that names one says so: the e-mail is right before
+// they land and after.
 func certDoc(host, project string, days int) string {
 	return fmt.Sprintf(strings.Join([]string{
 		"The uptime check gitea-https fetches https://%[1]s/api/healthz every 15 min from Google's checkers, " +
-			"outside our network, validating the certificate. This fires on either of two things; " +
-			"`curl -sv https://%[1]s/api/healthz` from outside Google tells them apart: if it fails, it is the first.",
+			"outside our network, validating the certificate, and records the days the certificate has left. " +
+			"This fires when they drop under %[3]d, or when the check has recorded none for an hour. " +
+			"`curl -sv https://%[1]s/api/healthz` from outside Google tells the two apart: if it fails, it is the first.",
 		"",
-		"**1. Unreachable from outside: act within minutes.** No checker has had a reading for an hour: " +
-			"the VM, Caddy or Gitea is down, the way in from the internet is, or the check was deleted.",
+		"This is not an outage alert. If Caddy serves TLS but Gitea itself is down (a 502), expect no e-mail: " +
+			"the check fails, but it can still record the days left.",
+		"",
+		"**1. HTTPS unreachable from outside: act within minutes.** No certificate data for an hour: " +
+			"the VM or Caddy is down, the way in from the internet is, or the check was deleted.",
 		"- `make status` (Caddy, Gitea, nftables, fail2ban) and `make logs`, from a checkout.",
 		"- The check: `gcloud monitoring uptime list-configs --project %[2]s`.",
 		"",
 		"**2. Not renewing: under %[3]d days left.** Caddy renews a certificate when a third of its lifetime is " +
 			"left (about 21 days of a 64-day one) and retries from then on, so it has been failing for days. " +
 			"The site goes down when the certificate expires. First checks, on the VM (`make ssh`):",
-		"- The DNS-01 token minter: `systemctl status gitea-caddy-dns-token.timer gitea-caddy-dns-token.service` " +
-			"and its journal, `sudo journalctl -u gitea-caddy-dns-token --since -2d`.",
 		"- Caddy's own errors: `sudo journalctl CONTAINER_NAME=caddy | grep -E '\"logger\":\"tls\\.(obtain|renew)\"'`.",
-		"- `sudo gitea-caddy-dns-token --check`: 0 it works, 1 a definite failure (it says what), 2 a transient one.",
-		"- From a checkout: `make acme-staging-check`, a certificate end to end against Let's Encrypt's staging CA.",
+		"- How Caddy authenticates for DNS-01, and what to check: docs/runbook.md, \"Caddy cannot get a certificate\".",
+		"- The DNS-01 token minter, once the Caddy DNS-token change has deployed " +
+			"(`systemctl list-timers 'gitea-caddy-dns-*'` lists its timers): " +
+			"`systemctl status gitea-caddy-dns-token.timer gitea-caddy-dns-token.service` " +
+			"and `sudo journalctl -u gitea-caddy-dns-token --since -2d`.",
+		"- Its hourly permission check, once the Caddy DNS-token change has deployed: " +
+			"`sudo journalctl -t gitea-caddy-dns-check --since -1d` (a GITEA_CADDY_DNS_CHECK line an hour), " +
+			"or now, `sudo gitea-caddy-dns-token --check`: 0 it works, 1 a definite failure (it says what), 2 a transient one.",
+		"- From a checkout, once its PR has merged: `make acme-staging-check`, " +
+			"a certificate end to end against Let's Encrypt's staging CA.",
 		"",
 		"A drill (gitea-cicd:certAlertDays raised above the days left) sends this on purpose. " +
 			"More in docs/runbook.md, \"When the certificate alert fires\".",

@@ -206,12 +206,14 @@ This rollback is a re-apply, not an undo:
 - an automatic rollback;
 - a failed rollback (critical);
 - any failed pipeline build;
-- Gitea's TLS certificate not renewing, or Gitea unreachable from outside
+- Gitea's TLS certificate not renewing, or its HTTPS unreachable from outside
   (critical). The uptime check `gitea-https` reads the certificate's days left
   from Google's checkers every 15 min; the alert fires below
   `gitea-cicd:certAlertDays` (default 18) days, or after an hour with no
-  reading, and e-mails again daily while open. What to do, why 18 and the
-  drill: [runbook.md](runbook.md), "When the certificate alert fires".
+  certificate data, and e-mails again daily while open. It is not an outage
+  alert: with Caddy serving TLS and Gitea itself down, expect no e-mail. What
+  to do, why 18 and the drill: [runbook.md](runbook.md), "When the certificate
+  alert fires".
 
 ## The release gate
 
