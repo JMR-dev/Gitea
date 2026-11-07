@@ -314,8 +314,10 @@ ci-drill: ci-clean ## Run drill NAME of PIPELINE through CI (see the comment abo
 # vm-check / vm-apply as CI's own identity (cb-infra), from this commit: the
 # path a deploy takes. APPROVED=1 is needed to apply to prod. Only an apply to
 # prod takes the infra deploy lock: a rehearsal holding it would make a real
-# deploy wait, and a cancelled build leaves its lock behind (removing it by
-# hand, after checking that build is gone, is the fix).
+# deploy wait. A cancelled build leaves its lock behind; the next infra build
+# takes it over once Cloud Build says that build has finished (infra_deploy.py
+# lock). The laptop's `make vm-apply` lock (build "local") is never taken
+# over: if that process dies, check prod, then remove the lock by hand.
 .PHONY: ci-vm-check
 ci-vm-check: ci-clean ## vm-check through Cloud Build as cb-infra
 	gcloud builds submit . --project=$(CI_PROJECT) --region=$(REGION) --config=cloudbuild/infra.yaml \

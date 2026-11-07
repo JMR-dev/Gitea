@@ -275,6 +275,425 @@ class VmConfig(unittest.TestCase):
         pb.assert_called_once_with(src, check=False)
 
 
+class InfraLock(unittest.TestCase):
+    """Deploy.lock: one infra deploy at a time. A cancelled build never reaches
+    unlock(), so a lock whose holder Cloud Build says has finished is taken
+    over; one whose holder can't be proven finished is waited for, and goes
+    stale after LOCK_STALE as before.
+
+    gcloud is faked by argv over one lock object: its live generation and
+    body, plus every generation's body (the deploy-state bucket is versioned,
+    so an old generation still reads). Cloud Build's answers are looked up by
+    (build id, region). The clock moves only when the code sleeps."""
+
+    BUCKET = "gitea-ci-1-deploy-state"
+    URL = "gs://gitea-ci-1-deploy-state/infra.lock"
+    ME = "6f1c2a8e-0b7d-4c55-9e3a-1d2f3a4b5c6d"
+    HOLDER = "0abf2591-ff7f-40b5-a8a8-42f72506a7a6"
+    WINNER = "37925220-7798-489a-8c1f-798f4c21488d"
+    REGION = "us-east5"
+    T0 = 1_794_000_000.0
+    FINISHED = ("SUCCESS", "FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED", "EXPIRED")
+    RUNNING = ("WORKING", "QUEUED", "PENDING", "STATUS_UNKNOWN")
+    NOT_FOUND = (1, "", "ERROR: (gcloud.builds.describe) NOT_FOUND: Requested entity was not found.")
+    DENIED = (1, "", "ERROR: (gcloud.builds.describe) PERMISSION_DENIED: The caller does not have permission "
+                     "(cloudbuild.builds.get)")
+
+    def setUp(self):
+        self.reset()
+
+    def reset(self):
+        self.clock = [self.T0]
+        self.live = None      # (generation, body) of the lock object, or None
+        self.versions = {}    # generation: body, for every generation ever written
+        self.gen = 1_700_000_000_000_000
+        self.builds = {}      # (build id, region): (rc, stdout, stderr) of `gcloud builds describe`
+        self.calls = []       # (argv, clock) of every command, in order
+        self.slept = []
+        self.events = []      # (time, fn): fn runs at the first command once the clock reaches time
+        self.hooks = {}       # one-shot: "describe" (before), "rm" (before), "rm-ok" (after a removal)
+        self.rm_fails = False
+        self.log = ""
+
+    # --- the fake ---------------------------------------------------------
+
+    def stamp(self, t):
+        """A finishTime as gcloud prints it."""
+        return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + ".451932Z"
+
+    def build(self, build_id, status, finished=None, region=REGION):
+        """What Cloud Build says of a build: its status and, if it finished at
+        clock time `finished`, its finishTime."""
+        out = status + (f"\t{self.stamp(finished)}" if finished is not None else "") + "\n"
+        self.builds[(build_id, region)] = (0, out, "")
+
+    def hold(self, build=HOLDER, at=None, region=REGION, raw=None):
+        """Put a lock in place as another build wrote it; its generation."""
+        body = raw if raw is not None else json.dumps(
+            {"build": build, "sha": "old", "at": self.T0 if at is None else at, "region": region})
+        self.gen += 1
+        self.live = (self.gen, body)
+        self.versions[self.gen] = body
+        return self.gen
+
+    def release(self):
+        self.live = None
+
+    def release_at(self, t):
+        self.events.append((t, self.release))
+
+    def hook(self, name):
+        fn = self.hooks.pop(name, None)
+        if fn:
+            fn()
+
+    @staticmethod
+    def flag(cmd, name):
+        for x in cmd:
+            if x.startswith(name + "="):
+                return x.split("=", 1)[1]
+        return None
+
+    def fake(self, cmd, **kw):
+        self.calls.append((list(cmd), self.clock[0]))
+        for ev in list(self.events):
+            if self.clock[0] >= ev[0]:
+                self.events.remove(ev)
+                ev[1]()
+        ok = lambda out="": subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        no = lambda err: subprocess.CompletedProcess(cmd, 1, stdout="", stderr=err)
+        if cmd[:3] == ["gcloud", "storage", "cp"]:
+            self.assertEqual(cmd, ["gcloud", "storage", "cp", "-", self.URL, "--if-generation-match=0"])
+            if self.live:
+                return no("ERROR: At least one of the pre-conditions you specified did not hold. 412")
+            self.gen += 1
+            self.live = (self.gen, kw["stdin"])
+            self.versions[self.gen] = kw["stdin"]
+            return ok()
+        if cmd[:4] == ["gcloud", "storage", "objects", "describe"]:
+            self.assertEqual(cmd, ["gcloud", "storage", "objects", "describe", self.URL, "--format=value(generation)"])
+            self.hook("describe")
+            return ok(f"{self.live[0]}\n") if self.live else no(f"ERROR: {self.URL} not found: 404.")
+        if cmd[:3] == ["gcloud", "storage", "cat"]:
+            url, _, g = cmd[3].partition("#")
+            self.assertEqual((len(cmd), url), (4, self.URL))
+            body = self.versions.get(int(g)) if g.isdigit() else None
+            return ok(body) if body is not None else no(f"ERROR: {cmd[3]} not found: 404.")
+        if cmd[:3] == ["gcloud", "storage", "rm"]:
+            self.assertEqual(cmd[:4], ["gcloud", "storage", "rm", self.URL])
+            self.hook("rm")
+            want = self.flag(cmd, "--if-generation-match")
+            if self.rm_fails or not self.live or (want is not None and want != str(self.live[0])):
+                return no("ERROR: At least one of the pre-conditions you specified did not hold. 412")
+            self.live = None
+            self.hook("rm-ok")
+            return ok()
+        if cmd[:3] == ["gcloud", "builds", "describe"]:
+            rc, out, err = self.builds.get((cmd[3], self.flag(cmd, "--region")), self.NOT_FOUND)
+            return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    def lock(self, **kw):
+        """Deploy.lock() against the fake: (the Deploy, the Failed or None).
+        Its output is in self.log."""
+        a = dict(mode="up", state_bucket=self.BUCKET, build_id=self.ME, sha="new", build_region=self.REGION)
+        a.update(kw)
+        d = D.Deploy(argparse.Namespace(**a))
+        self.addCleanup(shutil.rmtree, d.tmp, True)
+
+        def sleep(s):
+            self.slept.append(s)
+            self.clock[0] += s
+        out, err = io.StringIO(), None
+        with mock.patch.object(D, "run", side_effect=self.fake), \
+                mock.patch.object(D.time, "time", side_effect=lambda: self.clock[0]), \
+                mock.patch.object(D.time, "sleep", side_effect=sleep), redirect_stdout(out):
+            try:
+                d.lock()
+            except D.Failed as e:
+                err = e
+        self.log = out.getvalue()
+        return d, err
+
+    def ran(self, *prefix):
+        return [c for c, _ in self.calls if c[:len(prefix)] == list(prefix)]
+
+    def rms(self):
+        return self.ran("gcloud", "storage", "rm")
+
+    def described(self):
+        """The build ids `gcloud builds describe` was asked about."""
+        return [c[3] for c in self.ran("gcloud", "builds", "describe")]
+
+    def assert_ours(self, d):
+        self.assertTrue(d.locked)
+        self.assertEqual(json.loads(self.live[1])["build"], self.ME)
+
+    # --- the cases --------------------------------------------------------
+
+    def test_the_statuses(self):
+        self.assertEqual(D.FINISHED, set(self.FINISHED))
+        self.assertTrue(D.FINISHED.isdisjoint(self.RUNNING))
+        self.assertEqual(D.LOCK_GRACE, 60)
+
+    def test_utc_seconds(self):
+        self.assertEqual(D.utc_seconds("2026-11-07T03:43:54.451932Z"),
+                         datetime.datetime(2026, 11, 7, 3, 43, 54, tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(D.utc_seconds(self.stamp(self.T0)), self.T0)
+        for bad in ("", "yesterday", "2026-13-01T00:00:00Z", None, 17):
+            self.assertIsNone(D.utc_seconds(bad), repr(bad))
+
+    def test_a_free_lock_is_taken(self):
+        self.build(self.ME, "WORKING")
+        d, err = self.lock()
+        self.assertIsNone(err)
+        self.assert_ours(d)
+        self.assertEqual(json.loads(self.live[1]), {"build": self.ME, "sha": "new", "at": self.T0, "region": self.REGION})
+        self.assertEqual(len(self.ran("gcloud", "storage", "cp")), 1)
+        self.assertEqual(self.rms(), [])
+        # The self-check: this build's own status, from where it runs.
+        desc, = self.ran("gcloud", "builds", "describe")
+        self.assertEqual(desc[3], self.ME)
+        self.assertIn("--project=gitea-ci-1", desc)
+        self.assertIn("--region=us-east5", desc)
+        self.assertIn(f"holding {self.URL} as build {self.ME} in us-east5 (WORKING): should this build die, "
+                      "the next infra build takes the lock over", self.log)
+        self.assertNotIn("WARNING", self.log)
+        self.assertEqual(self.slept, [])
+
+    def test_our_own_status_unreadable_still_locks_with_a_warning(self):
+        for name, kw, cause in (("no cloudbuild.builds.get", {}, "cloudbuild.builds.get"),
+                                ("no BUILD_REGION", {"build_region": ""}, "BUILD_REGION"),
+                                ("a local run", {"build_id": "local"}, "local run")):
+            with self.subTest(name):
+                self.reset()
+                self.builds[(self.ME, self.REGION)] = self.DENIED
+                d, err = self.lock(**kw)
+                self.assertIsNone(err)
+                self.assertTrue(d.locked)
+                self.assertIn("WARNING", self.log)
+                self.assertIn(cause, self.log)
+                self.assertEqual(self.described(), [self.ME] if not kw else [])
+
+    def test_a_finished_holder_is_taken_over(self):
+        for status in self.FINISHED:
+            with self.subTest(status):
+                self.reset()
+                self.build(self.ME, "WORKING")
+                self.build(self.HOLDER, status, finished=self.T0 - 300)
+                g = self.hold()
+                d, err = self.lock()
+                self.assertIsNone(err)
+                self.assert_ours(d)
+                self.assertEqual(self.rms(), [["gcloud", "storage", "rm", self.URL, f"--if-generation-match={g}"]])
+                storage = [c[2] for c, _ in self.calls if c[1] == "storage"]
+                self.assertEqual(storage, ["cp", "objects", "cat", "rm", "cp"])
+                self.assertEqual(self.ran("gcloud", "storage", "cat"), [["gcloud", "storage", "cat", f"{self.URL}#{g}"]])
+                self.assertEqual(self.slept, [])
+                line, = [x for x in self.log.splitlines() if "GITEA_INFRA_LOCK_TAKEOVER" in x]
+                self.assertIn(f"build={self.HOLDER} sha=old: {status} at ", line)
+                self.assertIn(f"still holding {self.URL}; taking it over", line)
+                self.assertEqual("it stopped mid-run" in line, status != "SUCCESS")
+
+    def test_a_running_holder_is_waited_for(self):
+        for status in self.RUNNING:
+            with self.subTest(status):
+                self.reset()
+                self.build(self.ME, "WORKING")
+                self.build(self.HOLDER, status)
+                self.hold()
+                self.release_at(self.T0 + 600)
+                d, err = self.lock()
+                self.assertIsNone(err)
+                self.assert_ours(d)
+                self.assertEqual(self.rms(), [])
+                self.assertGreaterEqual(self.clock[0], self.T0 + 600)
+                self.assertIn(f"another infra deploy holds the lock (build {self.HOLDER}: {status}", self.log)
+                self.assertNotIn("TAKEOVER", self.log)
+
+    def test_a_holder_that_cannot_be_checked_is_never_taken(self):
+        for name, answer in (("permission denied", self.DENIED), ("not found", self.NOT_FOUND),
+                             ("empty", (0, "", "")), ("empty with a tab", (0, "\t\n", "")),
+                             ("garbage", (0, "{]\x00 nonsense\n", "")),
+                             ("a lookalike status", (0, f"SUCCESSFUL\t{self.stamp(self.T0 - 600)}\n", ""))):
+            with self.subTest(name):
+                self.reset()
+                self.builds[(self.HOLDER, self.REGION)] = answer
+                self.hold()
+                d, err = self.lock()
+                self.assertIsInstance(err, D.Failed)
+                self.assertIn(f"waited 45 min for {self.URL} (build {self.HOLDER}: ", str(err))
+                self.assertFalse(d.locked)
+                self.assertEqual(self.rms(), [])
+                if answer[0]:
+                    self.assertIn("Cloud Build did not say: ", str(err))
+
+    def test_old_local_and_garbled_locks_are_waited_for_without_asking(self):
+        lock = lambda **kw: json.dumps({"sha": "old", "at": self.T0, **kw})
+        for name, raw in (("from before takeover: no region", lock(build=self.HOLDER)),
+                          ("a laptop's make vm-apply", lock(build="local", region=self.REGION)),
+                          ("not JSON", "{not json"),
+                          ("not an object", "[1, 2]"),
+                          ("no build", lock(region=self.REGION)),
+                          ("a shell-y build id", lock(build="$(id); --region=x", region=self.REGION)),
+                          ("an upper-case id", lock(build=self.HOLDER.upper(), region=self.REGION)),
+                          ("a shell-y region", lock(build=self.HOLDER, region="us-east5 --project=other")),
+                          ("a region that is not one", lock(build=self.HOLDER, region="global"))):
+            with self.subTest(name):
+                self.reset()
+                self.build(self.ME, "WORKING")
+                # Were it ever asked, Cloud Build would say the holder is gone.
+                self.build(self.HOLDER, "CANCELLED", finished=self.T0 - 600)
+                self.hold(raw=raw)
+                self.release_at(self.T0 + 120)
+                d, err = self.lock()
+                self.assertIsNone(err)
+                self.assert_ours(d)
+                self.assertEqual(self.rms(), [])
+                self.assertEqual(self.described(), [self.ME], "only the self-check, once locked")
+                self.assertIn("another infra deploy holds the lock (build ", self.log)
+
+    def test_an_uncheckable_lock_still_goes_stale(self):
+        for name, raw, answer in (
+                ("no region", json.dumps({"build": self.HOLDER, "sha": "old", "at": self.T0 - 5 * 3600}), None),
+                ("Cloud Build refuses", None, self.DENIED)):
+            with self.subTest(name):
+                self.reset()
+                if answer:
+                    self.builds[(self.HOLDER, self.REGION)] = answer
+                self.hold(raw=raw, at=self.T0 - 5 * 3600)
+                d, err = self.lock()
+                self.assertEqual(str(err), f"{self.URL} is 5.0h old (build {self.HOLDER}). If that build is gone, "
+                                           "check prod, then remove the lock by hand.")
+                self.assertEqual(self.rms(), [])
+
+    def test_a_finished_holder_older_than_the_stale_limit_is_taken_over(self):
+        self.build(self.ME, "WORKING")
+        self.build(self.HOLDER, "TIMEOUT", finished=self.T0 - 4 * 3600)
+        g = self.hold(at=self.T0 - 7 * 3600)
+        d, err = self.lock()
+        self.assertIsNone(err)
+        self.assert_ours(d)
+        self.assertEqual(self.rms(), [["gcloud", "storage", "rm", self.URL, f"--if-generation-match={g}"]])
+        self.assertIn("GITEA_INFRA_LOCK_TAKEOVER", self.log)
+
+    def test_a_just_finished_holder_gets_its_grace(self):
+        finish = self.T0 - 10
+        self.build(self.ME, "WORKING")
+        self.build(self.HOLDER, "CANCELLED", finished=finish)
+        self.hold()
+        d, err = self.lock()
+        self.assertIsNone(err)
+        self.assert_ours(d)
+        (rm, at), = [(c, t) for c, t in self.calls if c[:3] == ["gcloud", "storage", "rm"]]
+        self.assertGreaterEqual(at, finish + D.LOCK_GRACE)
+        self.assertLess(at, finish + D.LOCK_GRACE + 30, "taken over on the first pass past the grace")
+
+    def test_a_finished_holder_without_a_finish_time_is_never_taken(self):
+        for out in ("CANCELLED\n", "CANCELLED\t\n", "CANCELLED\tyesterday\n"):
+            with self.subTest(out):
+                self.reset()
+                self.builds[(self.HOLDER, self.REGION)] = (0, out, "")
+                self.hold()
+                d, err = self.lock()
+                self.assertIn("waited 45 min", str(err))
+                self.assertEqual(self.rms(), [])
+
+    def test_a_build_that_replaces_the_dead_lock_first_wins(self):
+        self.build(self.ME, "WORKING")
+        self.build(self.HOLDER, "CANCELLED", finished=self.T0 - 5 * 3600)
+        self.build(self.WINNER, "WORKING")
+        dead = self.hold(at=self.T0 - 5 * 3600)
+        winner = []
+
+        def taken():  # the other build's takeover lands between our read and our rm
+            self.release()
+            winner.append(self.hold(build=self.WINNER, at=self.clock[0]))
+            self.release_at(self.clock[0] + 300)
+        self.hooks["rm"] = taken
+        d, err = self.lock()
+        self.assertIsNone(err, "no stale error for the 5 h old dead lock")
+        self.assert_ours(d)
+        self.assertEqual(self.rms(), [["gcloud", "storage", "rm", self.URL, f"--if-generation-match={dead}"]])
+        self.assertNotIn(f"--if-generation-match={winner[0]}", sum(self.rms(), []))
+        self.assertIn("but its lock could not be removed (another build may have taken it)", self.log)
+        self.assertIn(f"another infra deploy holds the lock (build {self.WINNER}: WORKING", self.log)
+        self.assertGreaterEqual(self.clock[0], self.T0 + 300)
+
+    def test_a_build_that_creates_first_after_our_rm_wins(self):
+        self.build(self.ME, "WORKING")
+        self.build(self.HOLDER, "CANCELLED", finished=self.T0 - 600)
+        self.build(self.WINNER, "WORKING")
+        self.hold()
+
+        def created():  # the other build's create lands between our rm and our create
+            self.hold(build=self.WINNER, at=self.clock[0])
+            self.release_at(self.clock[0] + 300)
+        self.hooks["rm-ok"] = created
+        d, err = self.lock()
+        self.assertIsNone(err)
+        self.assert_ours(d)
+        self.assertEqual(len(self.rms()), 1)
+        self.assertIn(f"another infra deploy holds the lock (build {self.WINNER}: WORKING", self.log)
+        self.assertGreaterEqual(self.clock[0], self.T0 + 300)
+
+    def test_a_failing_rm_never_spins(self):
+        self.build(self.HOLDER, "CANCELLED", finished=self.T0 - 600)
+        self.hold()
+        self.rm_fails = True
+        d, err = self.lock()
+        self.assertIsInstance(err, D.Failed)
+        self.assertIn(f"waited 45 min for {self.URL} (build {self.HOLDER}: CANCELLED at ", str(err))
+        self.assertIn("could not be removed", str(err))
+        self.assertFalse(d.locked)
+        self.assertGreater(len(self.rms()), 1)
+        self.assertLessEqual(len(self.rms()), D.LOCK_WAIT // 30 + 1)
+        self.assertEqual(set(self.slept), {30})
+        self.assertEqual(len(self.slept), len(self.rms()) - 1)
+
+    def test_a_lock_gone_before_it_is_read_is_tried_again(self):
+        self.build(self.ME, "WORKING")
+        self.hold()
+        self.hooks["describe"] = self.release  # the holder unlocks between our create and our read
+        d, err = self.lock()
+        self.assertIsNone(err)
+        self.assert_ours(d)
+        self.assertEqual(len(self.ran("gcloud", "storage", "cp")), 2)
+        self.assertEqual(self.rms(), [])
+        self.assertEqual(self.slept, [30], "one wait, then the create again")
+
+    def test_the_build_region_reaches_the_lock(self):
+        with open(os.path.join(D.ROOT, "cloudbuild", "infra.yaml")) as f:
+            self.assertIn("      - BUILD_REGION=${LOCATION}\n", f.read())
+        with mock.patch.dict(os.environ, {"BUILD_REGION": "us-east5"}), \
+                mock.patch.object(sys, "argv", ["infra_deploy.py", "preview"]), \
+                mock.patch.object(D, "ensure_auth_plugin_on_path"), \
+                mock.patch.object(D, "Deploy") as deploy, self.assertRaises(SystemExit):
+            D.main()
+        self.assertEqual(deploy.call_args.args[0].build_region, "us-east5")
+
+    def test_a_lock_held_by_this_build_is_ours(self):
+        # A create that went through on the server but reported an error.
+        self.build(self.ME, "WORKING")
+        g = self.hold(build=self.ME)
+        d, err = self.lock()
+        self.assertIsNone(err)
+        self.assert_ours(d)
+        self.assertEqual(self.live[0], g)
+        self.assertEqual(self.rms(), [])
+        self.assertEqual(self.slept, [])
+
+    def test_two_laptop_runs_never_share_the_lock(self):
+        # Every laptop run is build "local": only a Cloud Build id is ever "ours".
+        self.hold(build="local")
+        self.release_at(self.T0 + 120)
+        d, err = self.lock(build_id="local")
+        self.assertIsNone(err)
+        self.assertTrue(d.locked)
+        self.assertGreaterEqual(self.clock[0], self.T0 + 120)
+        self.assertEqual(self.rms(), [])
+
+
 class PreRestore(unittest.TestCase):
     NOW = datetime.datetime(2026, 10, 31, 4, 0, tzinfo=datetime.timezone.utc)
 
