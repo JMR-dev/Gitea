@@ -589,7 +589,17 @@ make vm-apply      # apply it
 ```
 
 If app.ini was not rendered, the run fails saying which Gitea secret was
-unavailable -- check `gcloud secrets versions list gitea-internal-token`.
+unavailable -- check `gcloud secrets versions list <that secret>`. The VM
+never makes one: Gitea's four secrets come from `scripts/bootstrap.sh`, and
+`gitea-vm@` can read them but not add a version, because the next deploy
+installs whatever version is newest and a new `gitea-secret-key` would leave
+everything Gitea encrypted with the old one unreadable. So re-enable a
+disabled version (`gcloud secrets versions enable <n> --secret=<that secret>`)
+rather than replace it, and before running `scripts/bootstrap.sh`: it adds a
+new version to any Gitea secret with no enabled one, which is right only for a
+secret that has never had a value. The rehearsal VM is the one exception:
+`gitea-render-secrets` generates its `gitea-rehearsal-*` secrets, which
+`scripts/rehearsal.sh` creates empty.
 
 ### Gitea or Caddy won't start: "requested ip address … is already allocated"
 

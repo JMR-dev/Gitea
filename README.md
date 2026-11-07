@@ -101,8 +101,10 @@ Between step 5 and step 6 the `:prod` images do not exist yet, so `gitea.service
 and `caddy.service` crash-loop. That is intentional: the units carry
 `Restart=always` with `StartLimitIntervalSec=0`, so they recover on their own
 within 30 seconds of the first successful push. Likewise, `app.ini` is never
-written with empty signing keys: the playbook generates Gitea's secrets once an
-image is there to generate them with, and fails rather than render without them.
+written with empty signing keys: the playbook reads Gitea's secrets, which step
+1 made, and fails rather than render without them. It never generates one. If
+`scripts/bootstrap.sh` couldn't (it needs podman or docker, and warns), every
+deploy fails at app.ini, naming the secret, until you re-run it with one.
 
 ## Day-to-day
 

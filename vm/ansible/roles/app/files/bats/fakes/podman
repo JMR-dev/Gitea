@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# A fake `podman` for gitea-render-secrets.bats: the Gitea image, present or
+# not, and its `generate secret`. Only the calls gitea-render-secrets makes are
+# understood; any other is recorded in $FAKE/unexpected (the tests' teardown
+# fails on it) and fails.
+#
+# State in $FAKE:
+#   image          the one image that exists locally (no file: none does)
+# Records:
+#   generated.log  "<image> <key>" for each `generate secret`
+# A generated value is "generated-<key>".
+
+set -uo pipefail
+
+: "${FAKE:?the fake podman needs FAKE}"
+
+unexpected() {
+  echo "podman $*" >>"$FAKE/unexpected"
+  echo "fake podman: unexpected call: podman $*" >&2
+  exit 99
+}
+
+case "$1 ${2:-}" in
+  "image exists")
+    [[ $# -eq 3 ]] || unexpected "$@"
+    [[ -f "$FAKE/image" && "$3" == "$(cat "$FAKE/image")" ]]
+    ;;
+  "run --rm")
+    # run --rm IMAGE generate secret KEY
+    [[ "${4:-} ${5:-}" == "generate secret" && $# -eq 6 ]] || unexpected "$@"
+    [[ -f "$FAKE/image" && "$3" == "$(cat "$FAKE/image")" ]] || { echo "fake podman: no image $3" >&2; exit 125; }
+    echo "$3 $6" >>"$FAKE/generated.log"
+    # As `gitea generate secret` prints when stdout isn't a terminal: no newline.
+    printf 'generated-%s' "$6"
+    ;;
+  *)
+    unexpected "$@"
+    ;;
+esac
