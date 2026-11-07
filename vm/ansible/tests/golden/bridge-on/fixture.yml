@@ -11,7 +11,6 @@ podman_subnet: 10.89.10.0/24
 podman_gateway: 10.89.10.1
 runner_egress_ip: 34.26.149.196 203.0.113.7
 backup_bucket: example-project-gitea-backups
-caddy_mode: bridge
 runner_token_present: true
 # A dummy watchtower peer (this repo mirrors to GitHub): role logship renders
 # Alloy only when there is one, and this is the systemd-journal gid it finds.

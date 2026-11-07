@@ -34,9 +34,9 @@ Network=gitea.network
 IP=${GITEA_ADDRESS}
 LogDriver=journald
 
-# Git over SSH, public. HTTP is loopback-only: Caddy is the only thing that
-# should reach it, and binding it to 127.0.0.1 keeps the reverse-proxy wiring
-# identical whether Caddy runs on the bridge or on the host network.
+# Git over SSH, public. HTTP is published on the host's loopback only, for the
+# host's own use (Alloy scrapes /metrics there); Caddy reaches it on the gitea
+# network, as gitea:3000.
 PublishPort=2222:2222
 PublishPort=127.0.0.1:3000:3000
 

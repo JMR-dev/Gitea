@@ -89,7 +89,7 @@ on every PR to main:
 | Job | Runs on | Runs |
 |---|---|---|
 | `go` | `heavy` | `make infra-check ci-check`: build, vet and test `infra/`, `cicd/` and `cicd/relay`, and `python3 -m unittest discover -s scripts/cicd` |
-| `scripts` | `ubuntu-latest` | `make scripts-check`: `bash -n`, `shellcheck -S warning`, `py_compile` and the bats tests (`infra/pkg/runner/bats`), with shellcheck, bats and ripgrep from apt |
+| `scripts` | `ubuntu-latest` | `make scripts-check`: `bash -n`, `shellcheck -S warning`, `py_compile` and the bats tests (`infra/pkg/runner/bats`, `scripts/bats`), with shellcheck, bats and ripgrep from apt |
 
 - The contexts are `checks / go (pull_request)` and `checks / scripts
   (pull_request)`, confirmed on a throwaway PR (#44), which also showed each

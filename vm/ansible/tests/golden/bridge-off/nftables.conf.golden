@@ -29,9 +29,9 @@ table inet gitea_filter {
 	# The watchtower tunnel (wg-watchtower, vm/ansible role tunnel) is outbound
 	# only: Alloy pushes through it, and nothing may come in over it but the
 	# replies. Without these, the rules below that name no interface would take
-	# ICMP, and 80, 443 and 2222 on the host network, from the tunnel too, and a
-	# connection DNAT'd to a container (Gitea's 2222, Caddy on the bridge)
-	# never reaches input at all. So new connections from it are dropped here,
+	# ICMP, and 2222 on the host, from the tunnel too, and a connection DNAT'd
+	# to a container (Gitea's 2222, Caddy's 80 and 443) never reaches input at
+	# all. So new connections from it are dropped here,
 	# at prerouting, before netavark's DNAT (dstnat, -100) and after conntrack
 	# (-200), and in input as well, in case this chain is ever lost. iifname,
 	# not iif: the interface exists only while the tunnel is up.
@@ -68,11 +68,11 @@ table inet gitea_filter {
 		# the VPC firewall enforces the same restriction as the outer layer.
 		ip saddr 35.235.240.0/20 tcp dport 22 accept comment "IAP SSH"
 
-		# Only reached when Caddy runs with Network=host (the metadata-server
-		# fallback path). Harmless otherwise: on the bridge these are DNAT'd
-		# before input and never match here.
-		tcp dport { 80, 443 } accept comment "HTTP/HTTPS"
-		udp dport 443 accept comment "HTTP/3"
+		# No 80 or 443 here: Caddy is always a container on the gitea network
+		# (caddy.container), so HTTP, HTTPS and HTTP/3 are DNAT'd to it before
+		# input, as the header says, and nothing on the host serves them. Gitea's
+		# git over SSH (2222) is published by its container and DNAT'd the same
+		# way, so this rule never matches while that port forward is in place.
 		tcp dport 2222 accept comment "git over SSH"
 
 		# Rate-limited logging so a scan cannot fill the disk via journald.
@@ -85,9 +85,9 @@ table inet gitea_filter {
 	# (vm/quadlets/alloy.container) with no user namespace, so its packets leave
 	# through here under uid 473, and the two numbers have to stay the same:
 	# vm/ansible/tests/check and scripts/check-metadata-guard.sh check it. One
-	# uid and no more: Caddy on the host network (uid 1000) needs the server for
-	# DNS-01, and root for gcloud. A bridged container's traffic is forwarded
-	# and never comes here.
+	# uid and no more: root needs the server for gcloud. Caddy, which needs it
+	# for DNS-01, is a container on the gitea network, and a bridged
+	# container's traffic is forwarded and never comes here.
 	#
 	# The same address is GCE's resolver, the one in /etc/resolv.conf, and Alloy
 	# has to look up watchtower and this host's domain, so DNS still goes
@@ -105,8 +105,8 @@ table inet gitea_filter {
 	# traffic is forwarded, so it comes here, from its own address before
 	# netavark's masquerade. Gitea's address is fixed (gitea.container's IP=,
 	# the same 10.89.10.250), and only it is named: Caddy needs the server
-	# for DNS-01, and so does role app's network probe, and the release engine's
-	# one-shot containers have no network at all. Gitea resolves names through
+	# for DNS-01, and the release engine's one-shot containers have no network
+	# at all. Gitea resolves names through
 	# aardvark-dns on the bridge gateway (input, above), which asks upstream as
 	# root on the host, so its DNS is untouched. IPv4 only: the gitea network
 	# and this VM have no IPv6.

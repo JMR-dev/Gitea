@@ -37,8 +37,10 @@ QUADLETS = ["gitea.network", "gitea.container", "caddy.container", "caddy-data.v
 
 
 def bash_env(f):
-    """The environment render_all, setup_nftables and setup_fail2ban exported."""
-    host = f["caddy_mode"] == "host"
+    """The environment render_all, setup_nftables and setup_fail2ban exported.
+    The fixtures no longer say where Caddy runs (it is always the gitea
+    network), so this renders the bash's bridge mode for all of them."""
+    host = f.get("caddy_mode") == "host"
     s = f["secrets"]
     token = "/etc/gitea/runner-token"
     env = {

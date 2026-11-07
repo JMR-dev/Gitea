@@ -35,6 +35,11 @@ every deploy — fails if what renders differs from them.
      that script's envsubst list and to `SECRETS` in `tests/check`.
 
    `tests/check` names whichever of these is missing before it renders.
+   Before it renders it also fails if the playbook could put Caddy anywhere
+   but the gitea network (`caddy_bridge_only()`): `vm/quadlets/caddy.container`
+   must say `Network=gitea.network` itself, nothing may name `caddy_mode` (the
+   retired host-network fallback's switch), and role `app` may name
+   `/etc/gitea/caddy-network`, that fallback's cache, only to remove it.
 3. A new templated file: add it to a role and to `tests/render.yml`.
 4. `make goldens` re-renders the goldens; review `git diff vm/ansible/tests/golden`
    — it is exactly what the change does to the VM's files — and commit it with
@@ -52,7 +57,8 @@ runs the telemetry checks:
   `tests/tunnel-state.yml` over role tunnel's states, and
   `scripts/check-metadata-guard.sh --static`, which checks that the ruleset's
   metadata guard names the uid `alloy.container` runs as and the address
-  `gitea.container` has, and nothing of Caddy's;
+  `gitea.container` has, and nothing of Caddy's, and that `caddy.container`
+  is on the gitea network with a fixed address (`scripts/bats` tests it);
 - in a PR preview, `make check` and by hand, failing hard: `alloy fmt --test`
   and `alloy validate` on every rendered `config.alloy`, and its scrub rules
   over `scripts/testdata/scrub.log` and `scrub.caddy.log`

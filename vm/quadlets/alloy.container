@@ -28,8 +28,8 @@ ContainerName=alloy
 Image=${ALLOY_IMAGE}
 # The host's network, so pushes route through the tunnel interface, and
 # Caddy's metrics (127.0.0.1:2020) and Gitea's (127.0.0.1:3000) are on
-# loopback in either Caddy mode. Alloy's own UI listens on 127.0.0.1:12345 only
-# (Exec= below), and nothing else.
+# loopback, where their quadlets publish them. Alloy's own UI listens on
+# 127.0.0.1:12345 only (Exec= below), and nothing else.
 Network=host
 LogDriver=journald
 Exec=run /etc/alloy/config.alloy --storage.path=/var/lib/alloy/data --server.http.listen-addr=127.0.0.1:12345 --disable-reporting

@@ -11,7 +11,10 @@ Secrets are filled in as files/gitea-render-secrets does on the VM.
 
 Before rendering, every ${VAR} in a templated file is checked against what
 defines it, so a new variable fails here with what to add, not as an Ansible
-"undefined variable" deep in a deploy. The first goldens were written by
+"undefined variable" deep in a deploy. So is that Caddy has no mode but the
+gitea network (caddy_bridge_only): its quadlet's Network= line is literal, and
+nothing sets the old fallback's switch or keeps its probe's cache. The first
+goldens were written by
 tests/make-goldens the way vm/bootstrap.sh rendered, which proved the cutover
 byte for byte; from then on --update is how they change.
 
@@ -23,7 +26,9 @@ checked too (not under --update). Everywhere, as they need nothing downloaded:
   - the watchtower peer script over made-up configs (scripts/check-peer-config.sh);
   - role tunnel's state over every case (tests/tunnel-state.yml);
   - that the metadata guard in the ruleset names Alloy's uid and Gitea's
-    address, and not Caddy's (scripts/check-metadata-guard.sh --static).
+    address, and not Caddy's, and that every fixture's caddy.container is on
+    the gitea network at a fixed address (scripts/check-metadata-guard.sh
+    --static).
 In a PR preview, `make check` and by hand, also, failing hard:
   - `alloy fmt --test` and `alloy validate` on every fixture's rendered config;
   - its scrub rules over scripts/testdata/scrub.log and scrub.caddy.log
@@ -103,6 +108,12 @@ CADDY_DURATION_PART = r"(\d+(?:\.\d+)?)(ns|us|ms|s|m|h|d)"
 SYSTEMD_TIME_UNITS = {"": 1, "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1, "sec": 1, "m": 60,
                       "min": 60, "h": 3600, "hr": 3600}
 SYSTEMD_TIME_PART = r"\s*(\d+(?:\.\d+)?)\s*([a-z]*)"
+# Caddy on the gitea network only (caddy_bridge_only): the one Network= line
+# its quadlet may have; the file role app's network probe cached its answer
+# in, which the role now only removes; and the variable that answer set.
+CADDY_NETWORK_LINE = "Network=gitea.network"
+CADDY_NETWORK_CACHE = "/etc/gitea/caddy-network"
+CADDY_MODE_VAR = "caddy_mode"
 SCRUB_FIXTURE = os.path.join(ROOT, "scripts", "testdata", "scrub.log")
 # infra_deploy.py's modes that change, or read, the VM: the deploy, and `make
 # vm-check`/`vm-apply` (also ci-vm-check/ci-vm-apply). Its other, `preview`, is
@@ -177,6 +188,54 @@ def check_variables():
                     problems.append(
                         f"${{{v}}} is a secret placeholder (left for the VM to fill), but {HELPER} never "
                         f"substitutes it: add it there, and to SECRETS in tests/check")
+    return problems
+
+
+def caddy_bridge_only():
+    """Problems that would let the playbook put Caddy anywhere but the gitea
+    network. Its quadlet says Network=gitea.network itself, not through a
+    variable; nothing the playbook runs or the fixtures set names caddy_mode,
+    the switch the old network probe flipped; and role app names the probe's
+    cache, /etc/gitea/caddy-network, only to remove it, which it does. On the
+    host network Caddy's loopback, its admin API among it, would be every
+    host process's too (vm/quadlets/caddy.container)."""
+    problems = []
+    with open(os.path.join(VM, "quadlets", CADDY_QUADLET)) as fh:
+        networks = [line.strip() for line in fh if line.startswith("Network=")]
+    if networks != [CADDY_NETWORK_LINE]:
+        problems.append(f"vm/quadlets/{CADDY_QUADLET}: its Network= lines are {networks}, not just "
+                        f"{CADDY_NETWORK_LINE}: Caddy runs on the gitea network only, never the host's")
+
+    # The playbook (site.yml, the inventory, the roles) and the fixtures.
+    sources = [os.path.join(ANSIBLE, f) for f in ("site.yml", "inventory.yml", os.path.join("tests", "render.yml"))]
+    sources += [os.path.join(HERE, "golden", d, "fixture.yml") for d in sorted(os.listdir(os.path.join(HERE, "golden")))]
+    for dirpath, _, files in os.walk(os.path.join(ANSIBLE, "roles")):
+        sources += [os.path.join(dirpath, f) for f in sorted(files)]
+    for path in sources:
+        if not os.path.isfile(path):
+            continue
+        with open(path, errors="replace") as fh:
+            if CADDY_MODE_VAR in fh.read():
+                problems.append(f"vm/ansible/{os.path.relpath(path, ANSIBLE)} names {CADDY_MODE_VAR}, the "
+                                "host-network fallback's switch: Caddy has no other mode than the gitea network")
+
+    # Role app may name the cache only in an ansible.builtin.file task that
+    # removes it, and has to have one, so a VM that has the file ends clean.
+    with open(os.path.join(ANSIBLE, "roles", "app", "tasks", "main.yml")) as fh:
+        tasks = yaml.safe_load(fh) or []
+    removals = 0
+    for task in tasks:
+        if CADDY_NETWORK_CACHE not in yaml.safe_dump(task):
+            continue
+        module = task.get("ansible.builtin.file") or task.get("file")
+        if isinstance(module, dict) and module.get("state") == "absent":
+            removals += 1
+        else:
+            problems.append(f"roles/app/tasks/main.yml: task {task.get('name')!r} reads or writes "
+                            f"{CADDY_NETWORK_CACHE}: the network probe is gone, and the role only removes its cache")
+    if removals == 0:
+        problems.append(f"roles/app/tasks/main.yml: no ansible.builtin.file task removes {CADDY_NETWORK_CACHE} "
+                        "(state: absent), so a VM the old probe ran on keeps it")
     return problems
 
 
@@ -440,6 +499,10 @@ def main():
     problems = check_variables()
     if problems:
         print("template variables:\n  " + "\n  ".join(problems))
+        return 1
+    problems = caddy_bridge_only()
+    if problems:
+        print("Caddy on the gitea network only:\n  " + "\n  ".join(problems))
         return 1
 
     failures, checked, written = [], 0, 0

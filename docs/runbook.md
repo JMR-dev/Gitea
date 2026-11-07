@@ -54,8 +54,8 @@ sudo journalctl -u caddy | grep -i 'acme\|challenge'
 ```
 
 Look for the **dns-01** challenge. If Caddy fell back to http-01, the
-googleclouddns plugin or its credentials are not working — check
-`/etc/gitea/caddy-network` and see *Caddy cannot get a certificate* below.
+googleclouddns plugin or its credentials are not working — see *Caddy cannot
+get a certificate* below.
 
 ```bash
 curl -vI https://gitea.jasonmross.dev            # valid Let's Encrypt cert
@@ -527,17 +527,23 @@ to stop `gitea.service`, unpack over `/var/lib/gitea`, fix ownership to
 ### Caddy cannot get a certificate
 
 The most likely cause is the ACME plugin failing to reach the GCE metadata
-server for Application Default Credentials. The playbook (role `app`) probes
-this once, on its first run, and caches the answer:
+server for Application Default Credentials. Caddy runs on the gitea network
+only, at `.251` of the podman subnet, and reaches the server from there; the
+ruleset's forward chain rejects Gitea's `.250` and nothing else. From Caddy's
+own container (the server's e-mail endpoint, so no token is fetched):
 
 ```bash
-cat /etc/gitea/caddy-network     # "bridge" or "host"
+sudo podman exec caddy curl -fsS -m 10 -H 'Metadata-Flavor: Google' -o /dev/null -w '%{http_code}\n' \
+  http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email   # 200
+sudo podman inspect caddy --format '{{.NetworkSettings.Networks.gitea.IPAddress}}'   # .251
+sudo nft list chain inet gitea_filter forward    # one reject, Gitea's address
 ```
 
-To re-probe, delete that file and run `make vm-apply`.
-If the bridge cannot reach `169.254.169.254`, the file will say `host` and Caddy
-is switched to the host network, reaching Gitea over `127.0.0.1:3000` instead.
-Both paths are supported; only the rendering differs.
+There is no host-network fallback any more: the playbook used to probe this
+and, if the bridge couldn't reach the server, move Caddy to the host network,
+caching the answer in `/etc/gitea/caddy-network`. Now it only removes that
+file. On the host network Caddy's loopback, its admin API among it, would be
+every host process's too.
 
 Also verify the zone-scoped grant:
 
@@ -567,7 +573,7 @@ unavailable -- check `gcloud secrets versions list gitea-internal-token`.
 
 ### Gitea or Caddy won't start: "requested ip address … is already allocated"
 
-Gitea and Caddy (on the bridge) have fixed addresses on the gitea network,
+Gitea and Caddy have fixed addresses on the gitea network,
 `.250` and `.251` of the podman subnet (`IP=` in their quadlets; the ruleset
 keeps Gitea's off the metadata server). Nothing else long-lived joins that
 network, and podman forgets its leases at a reboot, so this should not happen.
@@ -646,8 +652,8 @@ through it. Labels `service="gitea"`, `host="gitea-vm"`, `env="production"`.
   169.254.169.254 but for DNS. Its forward chain rejects the Gitea container's
   fixed address on the gitea network (`.250` of the podman subnet,
   `gitea.container`'s `IP=`). Nothing else is touched: Caddy needs the server
-  for DNS-01, on the bridge (fixed at `.251`) or the host network, and so does
-  role app's network probe. `make check-metadata-guard` proves both in
+  for DNS-01, from its own fixed address on the gitea network (`.251`; it has
+  no host-network mode). `make check-metadata-guard` proves both in
   namespaces; a refusal on the VM shows in the counters of
   `sudo nft list chain inet gitea_filter output` and `… forward`.
 - **Never a failed deploy:** a start that fails and the deploy check (Alloy's

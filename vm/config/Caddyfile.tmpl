@@ -25,11 +25,10 @@
 
 # Prometheus metrics for Alloy (vm/config/config.alloy.tmpl), which scrapes
 # 127.0.0.1:2020 from the host. Plain HTTP, since the site has no host name,
-# and never reachable from outside: on the host network it binds loopback; on
-# the bridge it listens inside the container and caddy.container publishes it
-# on the host's loopback only. No log directive, so scrapes are not logged.
+# and never reachable from outside: it listens inside Caddy's container, and
+# caddy.container publishes it on the host's loopback only. No log directive,
+# so scrapes are not logged.
 :2020 {
-	${CADDY_METRICS_BIND}
 	metrics
 }
 
@@ -114,7 +113,7 @@ Disallow: /user/
 	# ---------------------------------------------------------------------
 	@gittransport path_regexp ^/[^/]+/[^/]+/(?:info/refs|git-upload-pack|git-receive-pack|HEAD|objects/.*|info/lfs(?:/.*)?)$
 	handle @gittransport {
-		reverse_proxy ${GITEA_UPSTREAM} {
+		reverse_proxy gitea:3000 {
 			transport http {
 				read_timeout 900s
 				write_timeout 900s
@@ -141,7 +140,7 @@ Disallow: /user/
 	# ---------------------------------------------------------------------
 	@actions path /api/actions/* /api/actions_pipeline/* /twirp/github.actions.results.api.v1.ArtifactService/*
 	handle @actions {
-		reverse_proxy ${GITEA_UPSTREAM} {
+		reverse_proxy gitea:3000 {
 			transport http {
 				read_timeout 900s
 				write_timeout 900s
@@ -198,7 +197,7 @@ Disallow: /user/
 			`
 		}
 
-		reverse_proxy ${GITEA_UPSTREAM} {
+		reverse_proxy gitea:3000 {
 			transport http {
 				read_timeout 900s
 				write_timeout 900s

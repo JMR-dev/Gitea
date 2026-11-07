@@ -38,7 +38,7 @@ SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh 
 	infra/pkg/runner/bats/fakes/docker infra/pkg/runner/bats/fakes/df
 # Bats tests for the shell above that has them. Shellchecked too; `bash -n`
 # can't parse their @test blocks.
-BATS_DIRS  = infra/pkg/runner/bats
+BATS_DIRS  = infra/pkg/runner/bats scripts/bats
 BATS_FILES = $(wildcard $(addsuffix /*.bats,$(BATS_DIRS)))
 
 # Every stage. A PR runs infra-check and ci-check (a heavy runner) and

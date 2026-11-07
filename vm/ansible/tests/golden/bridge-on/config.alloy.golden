@@ -582,10 +582,10 @@ discovery.relabel "alloy" {
 }
 
 // Caddy's metrics site (vm/config/Caddyfile.tmpl's :2020) and Gitea's own
-// /metrics (app.ini [metrics]), both on the host's loopback in either Caddy
-// network mode: gitea.container publishes Gitea's HTTP on 127.0.0.1:3000 only,
-// and Caddy answers /metrics from outside with a 404. Their instance is named,
-// or it would be the address.
+// /metrics (app.ini [metrics]), both on the host's loopback: caddy.container
+// publishes the first on 127.0.0.1:2020, gitea.container Gitea's HTTP on
+// 127.0.0.1:3000 only, and Caddy answers /metrics from outside with a 404.
+// Their instance is named, or it would be the address.
 prometheus.scrape "local" {
 	targets = array.concat(
 		discovery.relabel.unix.output,

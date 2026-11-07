@@ -1,11 +1,13 @@
-# Rendered by vm/bootstrap.sh into /etc/containers/systemd/
+# Rendered by the playbook (vm/ansible, role app) into /etc/containers/systemd/
 #
-# gitea.network is chosen by bootstrap.sh at run time, not by hand:
-# the googleclouddns ACME plugin authenticates via Application Default
-# Credentials, which on GCE means reaching the metadata server at
-# 169.254.169.254. bootstrap.sh probes whether a container on the gitea bridge
-# can do that and falls back to Network=host if it cannot. See
-# gitea-probe-metadata in bootstrap.sh and docs/runbook.md.
+# On the gitea network, always: there is no host-network mode. On the host
+# network Caddy's loopback would be every host process's too, its admin API
+# (127.0.0.1:2019, which can rewrite the whole config) among it; here it is
+# the container's own. The googleclouddns ACME plugin authenticates with
+# Application Default Credentials, from the metadata server at 169.254.169.254,
+# which Caddy reaches from the gitea network: vm/nftables/gitea.nft keeps only
+# Gitea's address and Alloy's uid off it. vm/ansible/tests/check and
+# scripts/check-metadata-guard.sh fail on any other Network=.
 [Unit]
 Description=Caddy (TLS termination, ACME DNS-01 via Google Cloud DNS)
 Documentation=https://caddyserver.com/docs/
@@ -24,12 +26,14 @@ AutoUpdate=registry
 PodmanArgs=--authfile=/etc/containers/ar-auth.json
 Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
 Network=gitea.network
-# On the bridge, a fixed address, so that it never takes Gitea's from podman's
-# allocator while Gitea is down (gitea.container). Caddy keeps the metadata
-# server: the DNS-01 plugin's credentials come from it.
+# A fixed address, so that it never takes Gitea's from podman's allocator
+# while Gitea is down (gitea.container). Caddy keeps the metadata server: the
+# DNS-01 plugin's credentials come from it.
 IP=10.89.10.251
 LogDriver=journald
 
+# The last is the Caddyfile's :2020 metrics site, for Alloy on the host: on
+# the host's loopback only.
 PublishPort=80:80
 PublishPort=443:443
 PublishPort=443:443/udp
@@ -45,10 +49,10 @@ Volume=caddy-config.volume:/config
 Volume=/var/log/caddy:/var/log/caddy:Z
 
 User=1000:1000
-# Caddy binds 80/443 as a non-root user. On the bridge this is a container-local
-# sysctl; podman REJECTS net.* sysctls when Network=host, so bootstrap.sh emits
-# nothing here in that mode and sets the equivalent host sysctl instead. File
-# capabilities are not an option -- NoNewPrivileges blocks them.
+# Caddy binds 80/443 as a non-root user, through this sysctl, local to the
+# container's own network namespace (podman rejects net.* sysctls with
+# Network=host). File capabilities are not an option -- NoNewPrivileges blocks
+# them.
 Sysctl=net.ipv4.ip_unprivileged_port_start=0
 
 # The plugin reads Application Default Credentials; the project must be explicit

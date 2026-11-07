@@ -6,9 +6,10 @@
 #     DNS;
 #   - the Gitea container (its fixed address on the gitea network), through
 #     the forward chain;
-# and from nothing else: other uids on the host, Caddy (which needs it for
-# DNS-01) and any other address on the bridge keep it. The Alloy half is
-# ported from the blog's scripts/check-metadata-guard.sh.
+# and from nothing else: other uids on the host, Caddy's address on the gitea
+# network (it needs the server for DNS-01) and any other address there keep
+# it. The Alloy half is ported from the blog's scripts/check-metadata-guard.sh.
+# scripts/bats/check-metadata-guard.bats tests the --static part.
 #
 #   scripts/check-metadata-guard.sh [--static] [nftables.conf] [alloy.container]
 #                                   [gitea.container] [caddy.container]
@@ -19,8 +20,8 @@
 #     with no user namespace;
 #   - Gitea has a fixed address (IP=) on the gitea network, the one the forward
 #     rule names, and no other rule names it;
-#   - Caddy, if it is on the bridge, has an address of its own, which no rule
-#     names;
+#   - Caddy is on the gitea network, never the host's, with a fixed address of
+#     its own (IP=), which no rule names;
 #   - the forward chain's policy is accept, and nothing else in the ruleset
 #     touches the metadata server.
 # --static stops there; that part needs only bash, sed and grep, so
@@ -179,8 +180,10 @@ inside() {
     nft -f "${rendered}.root"
     alloy=0
   else
-    # Caddy's uid on the host network, which needs the server for DNS-01, and
-    # the uid next to Alloy's, so the rule is seen to name one uid only.
+    # Other uids keep the server: 1000 (Caddy's and Gitea's inside their
+    # containers, whose traffic is forwarded and never comes here, so on the
+    # host just another uid) and the one next to Alloy's, so the rule is seen
+    # to name one uid only.
     probe 1000 tcp 80 reaches
     probe 1000 tcp 443 reaches
     probe "$((alloy + 1))" tcp 80 reaches
@@ -244,11 +247,9 @@ inside() {
   done
   probe_from "$other" tcp 80 reaches
   probe_from "$other" udp 53 reaches
-  # Caddy's, on the bridge: DNS-01 needs the server.
-  if [[ -n "$caddy" ]]; then
-    probe_from "$caddy" tcp 80 reaches
-    probe_from "$caddy" tcp 443 reaches
-  fi
+  # Caddy's: DNS-01 needs the server.
+  probe_from "$caddy" tcp 80 reaches
+  probe_from "$caddy" tcp 443 reaches
   # Gitea's: nothing at all.
   probe_from "$gitea" tcp 80 refused
   probe_from "$gitea" tcp 443 refused
@@ -301,16 +302,18 @@ if grep -qE 'hook forward .*policy drop' <<<"$rules"; then
   fail "a forward chain with a drop policy: it would drop every container's traffic"
 fi
 
-# Caddy: on the bridge, an address of its own, which nothing names.
-caddy_ip="$(sed -n 's/^IP=//p' "$caddy_quadlet")"
+# Caddy: on the gitea network, never the host's, with an address of its own,
+# which nothing names. On the host network its loopback, its admin API among
+# it, would be every host process's too.
 if grep -q '^Network=host$' "$caddy_quadlet"; then
-  [[ -z "$caddy_ip" ]] || fail "caddy.container is on the host network and has an IP="
-else
-  [[ "$caddy_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "caddy.container on the bridge has no fixed IP= (got '${caddy_ip}')"
-  [[ "$caddy_ip" != "$gitea_ip" ]] || fail "Caddy and Gitea have the same address, ${gitea_ip}"
-  if grep -qE "(^|[^0-9.])${caddy_ip//./\\.}([^0-9]|$)" <<<"$rules"; then
-    fail "a rule names Caddy's address ${caddy_ip}: Caddy needs the metadata server for DNS-01"
-  fi
+  fail "caddy.container is on the host network: Caddy runs on the gitea network only"
+fi
+grep -q '^Network=gitea.network$' "$caddy_quadlet" || fail "caddy.container isn't on the gitea network"
+caddy_ip="$(sed -n 's/^IP=//p' "$caddy_quadlet")"
+[[ "$caddy_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "caddy.container has no fixed IP= (got '${caddy_ip}')"
+[[ "$caddy_ip" != "$gitea_ip" ]] || fail "Caddy and Gitea have the same address, ${gitea_ip}"
+if grep -qE "(^|[^0-9.])${caddy_ip//./\\.}([^0-9]|$)" <<<"$rules"; then
+  fail "a rule names Caddy's address ${caddy_ip}: Caddy needs the metadata server for DNS-01"
 fi
 
 # And nothing else touches the metadata server: not a whole subnet, not root.
@@ -318,7 +321,7 @@ fi
   || fail "a rule on the metadata server other than Alloy's two and Gitea's one"
 
 if ((static)); then
-  echo "metadata guard: the ruleset agrees with alloy.container (uid ${alloy_uid}), gitea.container (${gitea_ip}) and caddy.container (${caddy_ip:-host network})"
+  echo "metadata guard: the ruleset agrees with alloy.container (uid ${alloy_uid}), gitea.container (${gitea_ip}) and caddy.container (${caddy_ip})"
   exit 0
 fi
 
@@ -326,10 +329,10 @@ self="${BASH_SOURCE[0]}"
 if unshare --user --map-auto --map-root-user --net true 2>/dev/null \
     && unshare --user --map-auto --map-root-user --net setpriv --reuid "$alloy_uid" --regid "$alloy_uid" --clear-groups true 2>/dev/null; then
   count="$(unshare --user --map-auto --map-root-user --net "$self" --inside "$ruleset" 0 "$alloy_uid" "$gitea_ip" "$caddy_ip")"
-  echo "metadata guard: ${count} probes in namespaces, as uids ${alloy_uid}, $((alloy_uid + 1)), 1000 and 0 and forwarded from ${gitea_ip}, ${caddy_ip:-(no bridge address for Caddy)} and others: all as they should be"
+  echo "metadata guard: ${count} probes in namespaces, as uids ${alloy_uid}, $((alloy_uid + 1)), 1000 and 0 and forwarded from ${gitea_ip}, ${caddy_ip} and others: all as they should be"
 elif unshare --user --map-root-user --net true 2>/dev/null; then
   count="$(unshare --user --map-root-user --net "$self" --inside "$ruleset" 1 "$alloy_uid" "$gitea_ip" "$caddy_ip")"
-  echo "metadata guard: ${count} probes in namespaces as root only (no subordinate uids here, the uid rule aimed at root), and forwarded from ${gitea_ip} and others: all as they should be"
+  echo "metadata guard: ${count} probes in namespaces as root only (no subordinate uids here, the uid rule aimed at root), and forwarded from ${gitea_ip}, ${caddy_ip} and others: all as they should be"
 else
   fail "can't make a user and network namespace here"
 fi

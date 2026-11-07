@@ -1,6 +1,7 @@
-# Caddy on the host network, no runner token, the WAF only detecting (jail
-# off), no runner-egress-ip, an app name with a space, no backup bucket, and
-# no ACME contact.
+# The WAF only detecting (jail off), no runner token, no runner-egress-ip, an
+# app name with a space, no backup bucket, no ACME contact, and another
+# project and podman subnet. Until Caddy's host-network mode was retired, this
+# was host-detection, with Caddy on the host network.
 app_name: Our Gitea
 domain: git.example.test
 require_signin_view: "false"
@@ -12,10 +13,8 @@ podman_subnet: 10.89.20.0/24
 podman_gateway: 10.89.20.1
 runner_egress_ip: ""
 backup_bucket: ""
-caddy_mode: host
 runner_token_present: false
-# A dummy watchtower peer, as in bridge-on: Alloy on a VM whose Caddy is on
-# the host network.
+# A dummy watchtower peer, as in bridge-on.
 watchtower_peer_secret: projects/example-observe/secrets/wireguard-example-peer
 logship_journal_gid: "190"
 secrets:
