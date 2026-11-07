@@ -579,6 +579,32 @@ sudo podman inspect <name> --format '{{.NetworkSettings.Networks.gitea.IPAddress
 sudo podman rm -f <name> && sudo systemctl start gitea caddy
 ```
 
+### Caddy's stop budget
+
+On a stop (a deploy's restart, `systemctl stop caddy`, a reboot) podman sends
+Caddy SIGTERM and SIGKILLs it `StopTimeout` seconds later. Caddy waits for open
+connections to close, and with no limit it waits forever: a browser's idle
+HTTP/3 (QUIC) connection is closed only by the browser. So every stop used to
+run out podman's 10 s and end in SIGKILL (status 137), skipping Caddy's
+graceful shutdown. Now the Caddyfile's global `grace_period 5s` ends the wait
+under `caddy.container`'s `StopTimeout=10` (podman's default, written out).
+`tests/check` holds `shutdown_delay` + `grace_period` + 3 s within
+`StopTimeout`, and `StopTimeout` under `TimeoutStopSec` (systemd's 90 s), so
+change them together.
+
+A clean stop, in watchtower:
+
+```logql
+# systemd: "caddy.service: Deactivated successfully", not status=137
+{host="gitea-vm", unit="init.scope"} |= "caddy.service"
+# Caddy: "grace period initiated" (5 s), then "shutdown complete"; an
+# "eternal grace period" with no "shutdown complete" is the old SIGKILL
+{host="gitea-vm", container="caddy"} |~ "grace period|shutdown complete"
+```
+
+The deploy that ships this still ends in one last 137: it stops the old
+container, which has no grace period.
+
 ### Telemetry to watchtower
 
 The VM ships its journal and its metrics to watchtower (our Loki and Mimir,
