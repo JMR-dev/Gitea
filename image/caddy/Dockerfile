@@ -21,6 +21,8 @@ FROM golang:${GOLANG_TAG} AS build
 ARG CADDY_VERSION
 ARG CORAZA_VERSION
 ARG XCADDY_VERSION=latest
+# The googleclouddns plugin version the build must produce (asserted below).
+ARG GOOGLECLOUDDNS_VERSION=v1.1.0
 
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local
@@ -44,7 +46,16 @@ RUN set -eux; \
         || { echo "googleclouddns module missing"; cat /tmp/modules.txt; exit 1; }; \
     grep -qiE 'coraza|waf' /tmp/modules.txt \
         || { echo "coraza module missing"; cat /tmp/modules.txt; exit 1; }; \
-    echo "WAF/DNS modules present:"; grep -iE 'coraza|waf|googleclouddns' /tmp/modules.txt
+    # Assert the DNS plugin is GOOGLECLOUDDNS_VERSION, as the binary itself
+    # records it. Certificate renewal runs through this plugin's auth path, so
+    # any other version -- `latest` moving, or another module's go.mod pulling
+    # it up -- fails here instead of reaching prod unreviewed.
+    /out/caddy build-info > /tmp/build-info.txt; \
+    gcdns="$(awk '$1 == "dep" && $2 == "github.com/caddy-dns/googleclouddns" {print $3}' /tmp/build-info.txt)"; \
+    test "${gcdns}" = "${GOOGLECLOUDDNS_VERSION}" \
+        || { echo "googleclouddns plugin is ${gcdns:-missing}, want ${GOOGLECLOUDDNS_VERSION}"; grep googleclouddns /tmp/build-info.txt; exit 1; }; \
+    echo "WAF/DNS modules present:"; grep -iE 'coraza|waf|googleclouddns' /tmp/modules.txt; \
+    echo "googleclouddns plugin: ${gcdns}"
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime.
