@@ -229,10 +229,16 @@ Until it passes, run `make build` manually to pick up base-image security fixes.
 |---|---|---|
 | gitea | 105 MB | 375 MB |
 | caddy + Coraza + full CRS | 50 MB | 51 MB |
-| alloy (telemetry, capped) | not yet measured | 256 MiB at most |
+| alloy (telemetry, capped) | 52 MiB Go heap, 137 MB resident | 71 MiB heap, 89 MiB Go runtime in all; 288 MB resident while reading 7 h of journal at its first start |
 
 Alloy, the telemetry shipper, is capped at 256 MiB (`--memory`, with
-`GOMEMLIMIT=200MiB` under it), so an OOM kills it and not Gitea.
+`GOMEMLIMIT=200MiB` under it), so an OOM kills it and not Gitea. Its figures
+were measured 2026-11-07, over its first three hours, from its own metrics in
+watchtower (`job="alloy"`, `host="gitea-vm"`): no restart, and the VM never
+under 53% of its memory available. Resident memory counts the journal files
+Alloy maps, which the kernel may charge to journald rather than to Alloy, so it
+can pass the cap without an OOM; the Go heap and runtime figures are what Alloy
+itself holds.
 
 The WAF is not the memory story — CRS costs about 50 MB and does not grow under
 load. Git subprocesses are: `index-pack` and `gc` scale with what is being
