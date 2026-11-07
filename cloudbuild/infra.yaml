@@ -94,6 +94,11 @@ steps:
       - COMMIT_SHA=${_SHA}
       - GITEA_DRILL_OK=${_DRILL_OK}
       - BUILD_ID=${BUILD_ID}
+      # The region this build runs in (a built-in; the launcher picks one of
+      # gitea-cicd:pipelineRegions), not _REGION, the app's. The infra lock
+      # records it, so the next infra build can ask Cloud Build whether this
+      # one has finished -- a cancelled build never removes its lock.
+      - BUILD_REGION=${LOCATION}
       # Compiling pulumi-gcp from a cold cache is memory-heavy. The public build
       # pool caps a build at 10 CPUs, so the most RAM here is E2_HIGHCPU_8's
       # 8 GB. Compile one package at a time (-p=1) and GC aggressively (GOGC=30)

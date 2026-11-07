@@ -5,7 +5,11 @@
 
   1. release gate: the code that can roll this deploy back must have passed
      drill D5 (scripts/cicd/release_gate.py), unless a person approved
-  2. lock: one infra deploy at a time (gs://<deploy-state>/infra.lock)
+  2. lock: one infra deploy at a time (gs://<deploy-state>/infra.lock). A
+     cancelled build dies before it unlocks, so a lock whose holder Cloud
+     Build says has finished is taken over (GITEA_INFRA_LOCK_TAKEOVER); one
+     whose holder can't be proven finished is waited for, and is stale after
+     LOCK_STALE
   3. superseded check: a commit older than the last one deployed is skipped,
      so builds that finish out of order never put old infrastructure back
   4. guard: a replacement or deletion of the VM, a disk, a bucket, the
@@ -43,6 +47,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -118,6 +123,16 @@ PROTECTED_TYPES = {
 DESTRUCTIVE_OPS = {"replace", "create-replacement", "delete-replaced", "delete", "discard"}
 LOCK_WAIT = 45 * 60
 LOCK_STALE = 4 * 3600
+# A cancelled build dies before unlock(), leaving its lock behind. The lock
+# names its build and the region it ran in, so the next infra build asks Cloud
+# Build about it and takes the lock over once the holder has provably finished:
+# one of these statuses, with a finishTime at least LOCK_GRACE ago. Anything
+# else -- WORKING, QUEUED, PENDING, STATUS_UNKNOWN, an error, no answer --
+# counts as still running.
+FINISHED = {"SUCCESS", "FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED", "EXPIRED"}
+LOCK_GRACE = 60
+CLOUD_BUILD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+GCP_REGION = re.compile(r"[a-z]+-[a-z]+[0-9]+")  # as cicd/pkg/config
 GO_CACHE_PREFIX = "infra-go-cache-"
 SSH_KEY_TTL = "1h"  # as scripts/ops/gitea_ops.py: the sync's OS Login key
 ANSIBLE_DIR = os.path.join("vm", "ansible")
@@ -165,6 +180,16 @@ def nftables_restarts(src):
                     if any(f"state: {st}" in near for st in ("restarted", "reloaded", "stopped")):
                         bad.append(f"{os.path.relpath(p, src)}:{i + 1}")
     return bad
+
+
+def utc_seconds(stamp):
+    """Seconds since the epoch of a Cloud Build time (2026-11-07T03:43:54.451932Z),
+    read to the second as UTC; None if it isn't one."""
+    try:
+        t = datetime.datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return t.replace(tzinfo=datetime.timezone.utc).timestamp()
 
 
 def log(msg):
@@ -289,6 +314,14 @@ class Deploy:
         bucket (both are <ci-project>-<name>). None without a state bucket."""
         sb, suffix = self.a.state_bucket, "-deploy-state"
         return sb[: -len(suffix)] + "-build-cache" if sb and sb.endswith(suffix) else None
+
+    def ci_project(self):
+        """The CI project, where the infra builds run: the deploy-state bucket
+        is <ci-project>-deploy-state. None without one."""
+        sb, suffix = getattr(self.a, "state_bucket", "") or "", "-deploy-state"
+        if not sb.endswith(suffix) or sb == suffix:
+            return None
+        return sb[: -len(suffix)]
 
     def go_cache_dir(self):
         return os.path.join(self.tmp, "gocache")
@@ -433,28 +466,150 @@ class Deploy:
         r = run(["gcloud", "storage", "cat", f"gs://{self.a.state_bucket}/{name}"], check=False, capture=True)
         return r.stdout if r.returncode == 0 else None
 
+    # The lock. build_id and build_region are read with getattr: the Makefile's
+    # ansible-check and goldens build a Deploy from a Namespace without them.
+
+    def read_lock(self):
+        """(generation, body) of the lock as it is now, or None if it is gone
+        or can't be read. The body is read at that generation, so a takeover
+        removes (--if-generation-match) only the lock it judged. A body that
+        isn't a JSON object is {}."""
+        r = run(["gcloud", "storage", "objects", "describe", self.lockurl, "--format=value(generation)"],
+                check=False, capture=True)
+        gen = r.stdout.strip() if r.returncode == 0 and r.stdout else ""
+        if not gen.isdigit():
+            return None
+        r = run(["gcloud", "storage", "cat", f"{self.lockurl}#{gen}"], check=False, capture=True)
+        if r.returncode != 0:
+            return None
+        try:
+            info = json.loads(r.stdout or "")
+        except ValueError:
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        return gen, info
+
+    def build_status(self, build, region):
+        """What Cloud Build says of a build in the CI project: ((status,
+        finishTime), None), or (None, why) when it can't be asked or didn't
+        answer. Only a Cloud Build id in a real region is ever asked about, so
+        a lock from before takeover (no region), a laptop's ("local") or a
+        garbled one is never described: it can't be proven finished."""
+        project = self.ci_project()
+        if not build:
+            return None, "the lock names no build"
+        if build == "local":
+            return None, "a local run's lock (make vm-apply), never taken over"
+        if not isinstance(build, str) or not CLOUD_BUILD_ID.fullmatch(build):
+            return None, f"not a Cloud Build id: {build!r}"
+        if not region:
+            return None, "the lock names no region (written before takeover existed, or without BUILD_REGION)"
+        if not isinstance(region, str) or not GCP_REGION.fullmatch(region):
+            return None, f"not a region: {region!r}"
+        if not project:
+            return None, f"no CI project in the state bucket's name ({getattr(self.a, 'state_bucket', '')!r})"
+        r = run(["gcloud", "builds", "describe", build, f"--project={project}", f"--region={region}",
+                 "--format=value(status,finishTime)"], check=False, capture=True)
+        out = (r.stdout or "").strip()
+        if r.returncode != 0 or not out:
+            return None, f"Cloud Build did not say: {(r.stderr or '').strip()[-300:] or 'no output'}"
+        status, _, finish = out.partition("\t")
+        return (status.strip(), finish.strip()), None
+
+    def holder_gone(self, info):
+        """(True, "<STATUS> at <finishTime>") if the build a lock names has
+        provably finished: a FINISHED status and a finishTime at least
+        LOCK_GRACE ago. Otherwise (False, why). No finishTime is never gone."""
+        st, why = self.build_status(info.get("build"), info.get("region"))
+        if st is None:
+            return False, why
+        status, finish = st
+        if status not in FINISHED:
+            return False, f"{status}, not finished"
+        if not finish:
+            return False, f"{status} with no finishTime"
+        done = utc_seconds(finish)
+        if done is None:
+            return False, f"{status} at {finish!r}, which does not parse"
+        if time.time() - done < LOCK_GRACE:
+            return False, f"{status} at {finish}, under {LOCK_GRACE} s ago"
+        return True, f"{status} at {finish}"
+
+    def say_who_holds(self, region):
+        """Once locked: check that a next build could tell if this one died,
+        by asking Cloud Build about this build as it would. Only ever logs."""
+        build = getattr(self.a, "build_id", "") or ""
+        try:
+            st, why = self.build_status(build, region)
+            if st is not None:
+                log(f"holding {self.lockurl} as build {build} in {region} ({st[0]}): should this build die, "
+                    "the next infra build takes the lock over")
+                return
+            if not CLOUD_BUILD_ID.fullmatch(build):
+                cause = f"a local run (build {build or '?'}), whose lock is never taken over"
+            elif not region:
+                cause = "no BUILD_REGION, so the lock names no region"
+            elif not GCP_REGION.fullmatch(region):
+                cause = f"BUILD_REGION {region!r} is not a region"
+            else:
+                cause = f"no cloudbuild.builds.get on {self.ci_project()}? {why}"
+            log(f"WARNING: holding {self.lockurl}, but the next infra build could not tell if this one died "
+                f"({cause}): it would wait for the lock, which goes stale after {LOCK_STALE // 3600} h")
+        except Exception as e:  # a self-check: never fails the run
+            log(f"WARNING: holding {self.lockurl}; could not check this build's own status ({e!r})")
+
     def lock(self):
-        body = json.dumps({"build": self.a.build_id, "sha": self.a.sha, "at": time.time()})
+        me = getattr(self.a, "build_id", "") or ""
+        region = getattr(self.a, "build_region", "") or ""
+        body = json.dumps({"build": me, "sha": self.a.sha, "at": time.time(), "region": region})
         deadline = time.time() + LOCK_WAIT
         while True:
             r = run(["gcloud", "storage", "cp", "-", self.lockurl, "--if-generation-match=0"],
                     check=False, capture=True, stdin=body)
             if r.returncode == 0:
                 self.locked = True
-                log(f"holding {self.lockurl}")
+                self.say_who_holds(region)
                 return
-            held = self.read_state("infra.lock")
-            try:
-                info = json.loads(held or "{}")
-            except ValueError:
-                info = {}
-            age = time.time() - float(info.get("at", time.time()))
-            if age > LOCK_STALE:
-                raise Failed(f"{self.lockurl} is {age / 3600:.1f}h old (build {info.get('build')}). If that "
-                             "build is gone, check prod, then remove the lock by hand.")
-            if time.time() > deadline:
-                raise Failed(f"waited {LOCK_WAIT // 60} min for {self.lockurl} (build {info.get('build')})")
-            log(f"another infra deploy holds the lock (build {info.get('build')}); waiting")
+            held, dead = self.read_lock(), False
+            if held is None:
+                # Gone between the create and the read (or unreadable): a wait
+                # pass like any other, then the create again.
+                info, why = {}, "gone or unreadable when read"
+            else:
+                gen, info = held
+                # Ours already: a create that went through on the server but
+                # reported an error. Only a Cloud Build id is unique; every
+                # laptop run is "local".
+                if CLOUD_BUILD_ID.fullmatch(me) and info.get("build") == me:
+                    self.locked = True
+                    log(f"{self.lockurl} already names this build (a create that reported an error went through)")
+                    self.say_who_holds(region)
+                    return
+                dead, why = self.holder_gone(info)
+                if dead:
+                    note = "" if why.startswith("SUCCESS") else \
+                        " (it stopped mid-run: prod may be part-way through its change; this run applies its own tree)"
+                    log(f"GITEA_INFRA_LOCK_TAKEOVER build={info.get('build')} sha={info.get('sha')}: {why}, "
+                        f"still holding {self.lockurl}; taking it over{note}")
+                    rm = run(["gcloud", "storage", "rm", self.lockurl, f"--if-generation-match={gen}"],
+                             check=False, capture=True)
+                    if rm.returncode == 0:
+                        continue
+                    # Never straight back to the create: a persistent rm error
+                    # would spin. Wait like any other pass instead.
+                    why += ", but its lock could not be removed (another build may have taken it)"
+            if not dead:
+                try:
+                    age = time.time() - float(info.get("at", time.time()))
+                except (TypeError, ValueError):
+                    age = 0
+                if age > LOCK_STALE:
+                    raise Failed(f"{self.lockurl} is {age / 3600:.1f}h old (build {info.get('build')}). If that "
+                                 "build is gone, check prod, then remove the lock by hand.")
+            if time.time() >= deadline:
+                raise Failed(f"waited {LOCK_WAIT // 60} min for {self.lockurl} (build {info.get('build')}: {why})")
+            log(f"another infra deploy holds the lock (build {info.get('build')}: {why}); waiting")
             time.sleep(30)
 
     def unlock(self):
@@ -834,6 +989,10 @@ def main():
                    "(default: this checkout)")
     p.add_argument("--sha", default=e("_SHA") or e("COMMIT_SHA", ""))
     p.add_argument("--build-id", default=e("BUILD_ID", "local"))
+    # Cloud Build's $LOCATION: the region this build runs in (the launcher picks
+    # one of gitea-cicd:pipelineRegions), not _REGION, the app's region. The lock
+    # records it so the next infra build can ask whether this one finished.
+    p.add_argument("--build-region", default=e("BUILD_REGION", ""))
     p.add_argument("--app-project", default=e("_APP_PROJECT", "gitea-496920"))
     p.add_argument("--region", default=e("_REGION", "us-east1"))
     p.add_argument("--zone", default=e("_ZONE", "us-east1-b"))

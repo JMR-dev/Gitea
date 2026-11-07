@@ -105,6 +105,13 @@ var telemetryInfraRoles = []string{
 	"roles/pubsub.admin",
 }
 
+// infraCIRoles is what cb-infra gets on the CI project, where its builds run:
+// read them, so a deploy can ask Cloud Build whether the build holding the
+// infra lock has finished and take a cancelled one's lock over
+// (scripts/cicd/infra_deploy.py lock). Reading only: nothing that could cancel
+// or retry another build. The preview identity never takes the lock.
+var infraCIRoles = []string{"roles/cloudbuild.builds.viewer"}
+
 // appInfraRoles is everything cb-infra gets on the app project.
 func appInfraRoles(cfg *config.Config) []string {
 	if cfg.WatchtowerReader == "" {
@@ -240,6 +247,12 @@ func New(ctx *pulumi.Context, cfg *config.Config, b *cistorage.Buckets, deps []p
 	// The infra deploy lock and the last-good marker and tarball.
 	if err := bucketRole("infra-deploy-state", b.DeployState, "roles/storage.objectAdmin", member(a.Infra)); err != nil {
 		return nil, err
+	}
+	// The lock's takeover check: whether the build holding it has finished.
+	for _, role := range infraCIRoles {
+		if err := projectRole("infra-ci-"+role, cfg.Project, role, member(a.Infra)); err != nil {
+			return nil, err
+		}
 	}
 	// The infra build's Go module/compile cache (scripts/cicd/infra_deploy.py):
 	// one object per infra/go.sum, restored before `go build` and written only

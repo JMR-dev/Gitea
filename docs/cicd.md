@@ -40,7 +40,7 @@ whose permissions have been proven for real.
 | Account | Runs | Holds |
 |---|---|---|
 | `cb-launcher` | the deploy, gated and rebuild triggers' own build | submit builds as `cb-infra` and `cb-image`, the source bucket |
-| `cb-infra` | `cloudbuild/infra.yaml` for main | the app project roles Pulumi needs (`cicd/pkg/identity`), including `roles/logging.configWriter` and `roles/pubsub.admin` while `gitea-cicd:watchtowerReader` is set |
+| `cb-infra` | `cloudbuild/infra.yaml` for main | the app project roles Pulumi needs (`cicd/pkg/identity`), including `roles/logging.configWriter` and `roles/pubsub.admin` while `gitea-cicd:watchtowerReader` is set; `roles/cloudbuild.builds.viewer` on the CI project, for the lock (is its holder finished?) |
 | `cb-image` | `cloudbuild/image.yaml` for main | push to AR `gitea`, see the cluster, start Jobs in `gitea-ops` (via `gitea:opsLaunchers`), read and add (never replace) drill passes |
 | `cb-launcher-preview` | the preview trigger's own build | submit builds as the two below **only**, the source bucket |
 | `cb-infra-preview` | a PR's `cloudbuild/infra.yaml` | `roles/dns.reader` + `roles/browser` on the app project, read the app stack's state, its passphrase, read drill passes |
@@ -166,7 +166,12 @@ make approve BUILD=<id>      # gcloud beta builds approve (there is no GA comman
 - Infra runs before image, and an image is never released after a failed
   infra deploy.
 - Infra deploys take a lock, `gs://gitea-ci-781388-deploy-state/infra.lock`,
-  and wait up to 45 minutes for one already running.
+  and wait up to 45 minutes for one already running. The lock names its build
+  and the region it runs in. A cancelled build dies before it can remove it,
+  so a lock whose holder Cloud Build says has finished (any final status, at
+  least a minute ago) is taken over, with a `GITEA_INFRA_LOCK_TAKEOVER` line
+  in the log. A lock whose holder can't be proven finished is waited for, and
+  is stale after 4 hours, as before.
 - Releases wait for a running engine Job.
 - **A commit older than one already deployed is skipped**, so builds that
   finish out of order never put old code back:
@@ -241,9 +246,10 @@ this page.
 | D5 | `make ci-infra-up` once (it creates last-good), then a harmless change on a branch (a bucket label) and `make ci-drill PIPELINE=infra NAME=fail-verify` | the last-good tree is re-applied; the label is gone, and the preview at last-good is clean | a config sync |
 | D6 | D3–D5 above | each sends the rollback e-mail, and each failed check shows on Gitea | none |
 
-D2 last ran by hand before the 28 upgrade (2026-10-20, PASS). D3, D4 and D5
-last passed on 2026-11-06, for infra code `be18bfc` and image code `5716844`
-(the drill log at the bottom of this page). The 28 release itself succeeded, so
+D2 last ran by hand before the 28 upgrade (2026-10-20, PASS). D5 last passed on
+2026-11-07, for infra code `ef5df59` (the self-clearing deploy lock); D3 and D4
+on 2026-11-06, for image code `5716844` (the drill log at the bottom of this
+page). The 28 release itself succeeded, so
 its automatic rollback never ran either.
 
 **Re-run D3–D5 whenever the release code changes.** The gate enforces this for
@@ -462,6 +468,13 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
   it runs out, and `--ssh-key-expire-after=1h` in the config sync in
   `scripts/cicd/infra_deploy.py`), and each Job / infra run first removes its
   account's keys that never expire or already have.
+- A laptop's `make vm-apply` against prod holds the infra lock as build
+  `local`, which no build can ask Cloud Build about, so it is never taken
+  over: if that process dies, check prod, then remove the lock by hand. The
+  same goes for a lock written before takeover existed (it names no region).
+  Takeover also needs cb-infra's `roles/cloudbuild.builds.viewer`
+  (`make ci-up`); without it, every infra build logs a WARNING when it takes
+  the lock, and a dead build's lock is waited for, as before.
 
 ## Drill log
 
@@ -489,3 +502,4 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-11-06 | D5 infra fail-verify (the Ansible VM and engine, #35–#38) | 4c15ceb | `b9ea62dc` | PASS: infra code `be18bfc` attested; re-applied last-good 4c15ceb through the playbook; 14.2 min. Run after 15 minutes with no Gitea Actions run or CI build |
 | 2026-11-06 | D3 image fail-verify (Path A, the engine's Ansible steps) | 4c15ceb | `e5cfa416` | PASS: image code `5716844` attested; promoted, rolled back to `:previous`; 17.3 min |
 | 2026-11-06 | D4 image fail-after-migrate (Path B) | 4c15ceb | `e2d9cc09` | PASS: image code `5716844`; restored from `gitea-data-pre-release-20261106t234625z` (12,888 files, inventory matching the snapshot), drill marker absent; down 23:49:11–23:51:13 and 23:56:35–23:59:23 UTC (the VM's systemd stop and start lines for Gitea and Caddy, read from Watchtower), about 5 min in all; 16.8 min |
+| 2026-11-07 | D5 infra fail-verify (self-clearing deploy lock, #43) | b02d619 | `3a02de34` | PASS: infra code `ef5df59` attested; took over a seeded lock naming the build cancelled on 2026-10-25 (`GITEA_INFRA_LOCK_TAKEOVER build=6c20fb83… CANCELLED`), removed at its generation; the self-check logged `holding … as build 3a02de34 in us-east1 (WORKING)`, proving cb-infra's `cloudbuild.builds.viewer` and the region wiring; re-applied last-good a7fa20f; 18.9 min |
