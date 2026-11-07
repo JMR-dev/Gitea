@@ -12,21 +12,24 @@
      LOCK_STALE
   3. superseded check: a commit older than the last one deployed is skipped,
      so builds that finish out of order never put old infrastructure back
-  4. guard: a replacement or deletion of the VM, a disk, a bucket, the
+  4. stack lock: a Pulumi lock left on the stack (a cancelled `pulumi up`, a
+     killed laptop `make up`) fails the deploy here, before anything changes
+     (GITEA_INFRA_STACK_LOCKED). It is never cleared automatically
+  5. guard: a replacement or deletion of the VM, a disk, a bucket, the
      cluster, an address or a DNS record needs approval; anything else goes
-  5. backup: the release engine's backup Job (dump, config tarball, online
+  6. backup: the release engine's backup Job (dump, config tarball, online
      snapshot -- a consistent one when an approved change replaces something)
-     plus a `pulumi stack export`. From step 3 to the end, a placeholder pod
-     holds the ops pool's node, so this Job and step 7's both start on a warm
+     plus a `pulumi stack export`. From step 5 to the end, a placeholder pod
+     holds the ops pool's node, so this Job and step 8's both start on a warm
      node with the engine image already pulled
-  6. pulumi up, then the VM config (vm_sync): the tree being applied decides
+  7. pulumi up, then the VM config (vm_sync): the tree being applied decides
      how. With vm/bootstrap.sh the VM pulls its own config, so the sync is
      `systemctl start gitea-config-sync` over SSH; with vm/ansible/site.yml
      the playbook is pushed over the same IAP SSH. A replaced VM is waited
      for first: SSH, then boot, then (after its config) HTTPS
-  7. verify: the release engine's status checks, then a preview that must show
+  8. verify: the release engine's status checks, then a preview that must show
      nothing left to change
-  8. on success, this commit's tree becomes last-good; on a failure in 6-7, the
+  9. on success, this commit's tree becomes last-good; on a failure in 7-8, the
      last-good tree is re-applied (pulumi up, sync, verify) and the build fails
 
 A rollback is a re-apply, not an undo: a replaced VM is replaced again, and
@@ -50,6 +53,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -162,6 +166,11 @@ else:
     with zstd.open(path, "rb") as f:
         shutil.copyfileobj(f, sys.stdout.buffer, 8 << 20)
 """
+# infra/Pulumi.yaml's name. `pulumi up` holds a lock on the stack while it
+# runs, as an object under stack_lock_dir; a cancelled build or a killed
+# laptop `make up` leaves it behind, and every later `pulumi up` refuses the
+# stack until someone removes it (check_stack_lock).
+PULUMI_PROJECT = "gitea"
 SSH_KEY_TTL = "1h"  # as scripts/ops/gitea_ops.py: the sync's OS Login key
 ANSIBLE_DIR = os.path.join("vm", "ansible")
 PROD_VM = "gitea-vm"  # vm-apply refuses it without --approved
@@ -359,11 +368,31 @@ def size_text(n):
     return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
 
 
+def stack_lock_dir(backend, project, stack):
+    """Where Pulumi's diy backend keeps a project-scoped stack's locks: one
+    <id>.json per `pulumi up` holding it."""
+    return f"{backend.rstrip('/')}/.pulumi/locks/organization/{project}/{stack}/"
+
+
+def describe_stack_lock(url, body):
+    """A stack lock as Pulumi names it: "<url>: created by user@host (pid N)
+    at TS". Its body is {pid, username, hostname, timestamp}."""
+    try:
+        info = json.loads(body or "")
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        return f"{url}: (unreadable)"
+    return (f"{url}: created by {info.get('username', '?')}@{info.get('hostname', '?')} "
+            f"(pid {info.get('pid', '?')}) at {info.get('timestamp', '?')}")
+
+
 class Deploy:
     def __init__(self, a):
         self.a = a
         self.lockurl = f"gs://{a.state_bucket}/infra.lock" if a.state_bucket else None
         self.locked = False
+        self.took_over = None  # (body, why) of a finished build's lock this run removed
         self.stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.applied = False  # pulumi up has started: from here a failure rolls back
         # Outside the source tree, which is what gets archived as last-good.
@@ -701,15 +730,15 @@ class Deploy:
             return False, f"{status} at {finish}, under {LOCK_GRACE} s ago"
         return True, f"{status} at {finish}"
 
-    def say_who_holds(self, region):
+    def say_who_holds(self, region, host):
         """Once locked: check that a next build could tell if this one died,
         by asking Cloud Build about this build as it would. Only ever logs."""
         build = getattr(self.a, "build_id", "") or ""
         try:
             st, why = self.build_status(build, region)
             if st is not None:
-                log(f"holding {self.lockurl} as build {build} in {region} ({st[0]}): should this build die, "
-                    "the next infra build takes the lock over")
+                log(f"holding {self.lockurl} as build {build} in {region} on {host} ({st[0]}): should this build "
+                    "die, the next infra build takes the lock over")
                 return
             if not CLOUD_BUILD_ID.fullmatch(build):
                 cause = f"a local run (build {build or '?'}), whose lock is never taken over"
@@ -719,22 +748,24 @@ class Deploy:
                 cause = f"BUILD_REGION {region!r} is not a region"
             else:
                 cause = f"no cloudbuild.builds.get on {self.ci_project()}? {why}"
-            log(f"WARNING: holding {self.lockurl}, but the next infra build could not tell if this one died "
-                f"({cause}): it would wait for the lock, which goes stale after {LOCK_STALE // 3600} h")
+            log(f"WARNING: holding {self.lockurl} on {host}, but the next infra build could not tell if this one "
+                f"died ({cause}): it would wait for the lock, which goes stale after {LOCK_STALE // 3600} h")
         except Exception as e:  # a self-check: never fails the run
-            log(f"WARNING: holding {self.lockurl}; could not check this build's own status ({e!r})")
+            log(f"WARNING: holding {self.lockurl} on {host}; could not check this build's own status ({e!r})")
 
     def lock(self):
         me = getattr(self.a, "build_id", "") or ""
         region = getattr(self.a, "build_region", "") or ""
-        body = json.dumps({"build": me, "sha": self.a.sha, "at": time.time(), "region": region})
+        # The host tells a laptop's lock (build "local") from another's.
+        host = socket.gethostname()
+        body = json.dumps({"build": me, "sha": self.a.sha, "at": time.time(), "region": region, "host": host})
         deadline = time.time() + LOCK_WAIT
         while True:
             r = run(["gcloud", "storage", "cp", "-", self.lockurl, "--if-generation-match=0"],
                     check=False, capture=True, stdin=body)
             if r.returncode == 0:
                 self.locked = True
-                self.say_who_holds(region)
+                self.say_who_holds(region, host)
                 return
             held, dead = self.read_lock(), False
             if held is None:
@@ -749,7 +780,7 @@ class Deploy:
                 if CLOUD_BUILD_ID.fullmatch(me) and info.get("build") == me:
                     self.locked = True
                     log(f"{self.lockurl} already names this build (a create that reported an error went through)")
-                    self.say_who_holds(region)
+                    self.say_who_holds(region, host)
                     return
                 dead, why = self.holder_gone(info)
                 if dead:
@@ -760,6 +791,9 @@ class Deploy:
                     rm = run(["gcloud", "storage", "rm", self.lockurl, f"--if-generation-match={gen}"],
                              check=False, capture=True)
                     if rm.returncode == 0:
+                        # A build killed in `pulumi up` leaves the stack's own
+                        # lock too: check_stack_lock names it as the likely holder.
+                        self.took_over = (info, why)
                         continue
                     # Never straight back to the create: a persistent rm error
                     # would spin. Wait like any other pass instead.
@@ -781,6 +815,49 @@ class Deploy:
         if self.locked:
             run(["gcloud", "storage", "rm", self.lockurl], check=False)
             self.locked = False
+
+    def check_stack_lock(self):
+        """Fail, before anything changes, if a Pulumi lock is left on the
+        stack (PULUMI_PROJECT). Otherwise `pulumi up` refuses the stack only
+        after the backup, which makes it a rollback whose own `pulumi up` is
+        refused too. Never cleared here: its holder may still be running. A
+        listing that fails only warns, since `pulumi up` still enforces it."""
+        stack = self.a.stack
+        where = stack_lock_dir(self.pulumi_backend(), PULUMI_PROJECT, stack)
+        r = run(["gcloud", "storage", "ls", where], check=False, capture=True)
+        if r.returncode != 0:
+            err = (r.stderr or "").strip()
+            if "matched no objects" in err:
+                log(f"no Pulumi lock on stack {stack}")
+            else:
+                log(f"WARNING: could not list {where} ({err[-300:] or 'no output'}); going ahead, "
+                    "as `pulumi up` still refuses a locked stack")
+            return
+        # Each object directly under it is a lock, as Pulumi counts them; a
+        # subdirectory is not.
+        locks = [u for u in (line.strip() for line in r.stdout.splitlines())
+                 if u.startswith(where) and len(u) > len(where) and not u.endswith("/")]
+        if not locks:
+            log(f"no Pulumi lock on stack {stack}")
+            return
+        held = []
+        for url in locks:
+            c = run(["gcloud", "storage", "cat", url], check=False, capture=True)
+            held.append(describe_stack_lock(url, c.stdout if c.returncode == 0 else None))
+        log(f"GITEA_INFRA_STACK_LOCKED stack={stack} locks={len(locks)}")
+        lines = [f"stack {stack} has {len(locks)} Pulumi lock(s) left on it, so `pulumi up` would refuse it; "
+                 "nothing was changed:", *(f"  {h}" for h in held)]
+        if self.took_over:
+            info, why = self.took_over
+            lines.append(f"Most likely a build killed in `pulumi up` left it: this run took the infra lock over "
+                         f"from build {info.get('build')} ({why}).")
+        lines += [
+            "A laptop's `make up` takes this lock but not the infra lock: check none is still running. Then clear it,",
+            f"  either: cd infra && pulumi login {self.pulumi_backend()} && pulumi cancel --stack {stack} --yes",
+            f"  or:     gcloud storage rm {' '.join(locks)}",
+            f"If the state then shows pending operations (`pulumi stack export --stack {stack}`: pending_operations), "
+            f"run `pulumi refresh --stack {stack}` first. Then re-run this build."]
+        raise Failed("\n".join(lines))
 
     def superseded(self):
         """True if a newer commit than this one has already been deployed."""
@@ -1079,6 +1156,7 @@ class Deploy:
             if self.superseded():
                 log(f"{self.a.sha} is older than the last deployed commit; nothing to do")
                 return 0
+            self.check_stack_lock()
             # Before the build, so the pool scales up while it compiles.
             self.warm_ops()
             infra = self.prepare(ROOT)

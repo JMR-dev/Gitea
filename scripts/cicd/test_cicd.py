@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -784,15 +785,18 @@ class InfraLock(unittest.TestCase):
         d, err = self.lock()
         self.assertIsNone(err)
         self.assert_ours(d)
-        self.assertEqual(json.loads(self.live[1]), {"build": self.ME, "sha": "new", "at": self.T0, "region": self.REGION})
+        host = socket.gethostname()
+        self.assertEqual(json.loads(self.live[1]), {"build": self.ME, "sha": "new", "at": self.T0, "region": self.REGION,
+                                                    "host": host})
         self.assertEqual(len(self.ran("gcloud", "storage", "cp")), 1)
         self.assertEqual(self.rms(), [])
+        self.assertIsNone(d.took_over)
         # The self-check: this build's own status, from where it runs.
         desc, = self.ran("gcloud", "builds", "describe")
         self.assertEqual(desc[3], self.ME)
         self.assertIn("--project=gitea-ci-1", desc)
         self.assertIn("--region=us-east5", desc)
-        self.assertIn(f"holding {self.URL} as build {self.ME} in us-east5 (WORKING): should this build die, "
+        self.assertIn(f"holding {self.URL} as build {self.ME} in us-east5 on {host} (WORKING): should this build die, "
                       "the next infra build takes the lock over", self.log)
         self.assertNotIn("WARNING", self.log)
         self.assertEqual(self.slept, [])
@@ -809,6 +813,7 @@ class InfraLock(unittest.TestCase):
                 self.assertTrue(d.locked)
                 self.assertIn("WARNING", self.log)
                 self.assertIn(cause, self.log)
+                self.assertIn(f"on {socket.gethostname()}", self.log)
                 self.assertEqual(self.described(), [self.ME] if not kw else [])
 
     def test_a_finished_holder_is_taken_over(self):
@@ -830,6 +835,9 @@ class InfraLock(unittest.TestCase):
                 self.assertIn(f"build={self.HOLDER} sha=old: {status} at ", line)
                 self.assertIn(f"still holding {self.URL}; taking it over", line)
                 self.assertEqual("it stopped mid-run" in line, status != "SUCCESS")
+                # Named again should the stack's own Pulumi lock be left too.
+                info, why = d.took_over
+                self.assertEqual((info["build"], why), (self.HOLDER, f"{status} at {self.stamp(self.T0 - 300)}"))
 
     def test_a_running_holder_is_waited_for(self):
         for status in self.RUNNING:
@@ -952,6 +960,7 @@ class InfraLock(unittest.TestCase):
         self.assert_ours(d)
         self.assertEqual(self.rms(), [["gcloud", "storage", "rm", self.URL, f"--if-generation-match={dead}"]])
         self.assertNotIn(f"--if-generation-match={winner[0]}", sum(self.rms(), []))
+        self.assertIsNone(d.took_over, "its rm failed: this run took nothing over")
         self.assertIn("but its lock could not be removed (another build may have taken it)", self.log)
         self.assertIn(f"another infra deploy holds the lock (build {self.WINNER}: WORKING", self.log)
         self.assertGreaterEqual(self.clock[0], self.T0 + 300)
@@ -982,6 +991,7 @@ class InfraLock(unittest.TestCase):
         self.assertIn(f"waited 45 min for {self.URL} (build {self.HOLDER}: CANCELLED at ", str(err))
         self.assertIn("could not be removed", str(err))
         self.assertFalse(d.locked)
+        self.assertIsNone(d.took_over)
         self.assertGreater(len(self.rms()), 1)
         self.assertLessEqual(len(self.rms()), D.LOCK_WAIT // 30 + 1)
         self.assertEqual(set(self.slept), {30})
@@ -1028,6 +1038,184 @@ class InfraLock(unittest.TestCase):
         self.assertTrue(d.locked)
         self.assertGreaterEqual(self.clock[0], self.T0 + 120)
         self.assertEqual(self.rms(), [])
+
+
+class StackLock(unittest.TestCase):
+    """Deploy.check_stack_lock: a Pulumi lock left on the stack (a cancelled
+    `pulumi up`, a killed laptop `make up`) fails the deploy before anything
+    changes, rather than `pulumi up` refusing it after the backup and the
+    rollback refusing it again. Never cleared here; Pulumi's own lock stays
+    the authority, so a listing that fails only warns."""
+
+    BACKEND = "gs://gitea-496920-pulumi-state"
+    DIR = "gs://gitea-496920-pulumi-state/.pulumi/locks/organization/gitea/prod/"
+    LOCK = DIR + "5c1e7a52-7a3f-4f0e-9a51-3b1b0f2b8c11.json"
+    OTHER = DIR + "9e2d4b10-0c6a-4d8e-b7f3-2a9c5e1d7f40.json"
+    THIRD = DIR + "c0ffee00-1111-4222-8333-444455556666.json"
+    BODY = json.dumps({"pid": 4242, "username": "root", "hostname": "6f1c2a8e0b7d",
+                       "timestamp": "2026-11-07T03:43:54.451932123Z"})
+    NONE = (1, "", "ERROR: (gcloud.storage.ls) One or more URLs matched no objects.")
+
+    def deploy(self, **kw):
+        a = dict(mode="up", state_bucket="gitea-ci-1-deploy-state", app_project="gitea-496920", stack="prod",
+                 sha="new", build_id="local", build_region="", drill="", approved=False, zone="z", region="r")
+        a.update(kw)
+        d = D.Deploy(argparse.Namespace(**a))
+        self.addCleanup(shutil.rmtree, d.tmp, True)
+        return d
+
+    def check(self, d, ls, bodies=None):
+        """d.check_stack_lock() with gcloud faked: ls is the listing's (rc,
+        stdout, stderr), bodies each lock's body (None: its cat fails).
+        (the Failed or None, the log, every command)."""
+        calls, bodies = [], bodies or {}
+
+        def fake(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:3] == ["gcloud", "storage", "ls"]:
+                return subprocess.CompletedProcess(cmd, *ls)
+            if cmd[:3] == ["gcloud", "storage", "cat"]:
+                body = bodies.get(cmd[3])
+                return subprocess.CompletedProcess(cmd, 0 if body is not None else 1, stdout=body or "",
+                                                   stderr="" if body is not None else "ERROR: 403")
+            raise AssertionError(f"unexpected command: {cmd}")
+        err = None
+        with mock.patch.object(D, "run", side_effect=fake), redirect_stdout(io.StringIO()) as out:
+            try:
+                d.check_stack_lock()
+            except D.Failed as e:
+                err = e
+        return err, out.getvalue(), calls
+
+    def test_the_lock_dir_is_the_prod_stacks(self):
+        self.assertEqual(D.stack_lock_dir(self.BACKEND, D.PULUMI_PROJECT, "prod"), self.DIR)
+        with open(os.path.join(D.ROOT, "infra", "Pulumi.yaml")) as f:
+            self.assertEqual(D.PULUMI_PROJECT, re.search(r"^name:\s*(\S+)\s*$", f.read(), re.M).group(1))
+        err, log, calls = self.check(self.deploy(), self.NONE)
+        self.assertEqual(calls, [["gcloud", "storage", "ls", self.DIR]], "that dir exactly, not the bucket's others")
+
+    def test_no_lock_goes_ahead(self):
+        for name, ls in (("nothing there", self.NONE), ("only a subdirectory", (0, self.DIR + "sub/\n", ""))):
+            with self.subTest(name):
+                err, log, calls = self.check(self.deploy(), ls)
+                self.assertIsNone(err)
+                self.assertIn("no Pulumi lock on stack prod", log)
+                self.assertEqual(len(calls), 1, "nothing read")
+
+    def test_a_lock_fails_the_deploy_before_anything_changes(self):
+        err, log, calls = self.check(self.deploy(), (0, self.LOCK + "\n", ""), {self.LOCK: self.BODY})
+        self.assertIsInstance(err, D.Failed)
+        msg = str(err)
+        self.assertIn(f"{self.LOCK}: created by root@6f1c2a8e0b7d (pid 4242) at 2026-11-07T03:43:54.451932123Z", msg)
+        self.assertIn("nothing was changed", msg)
+        self.assertIn("`make up`", msg)
+        self.assertIn(f"cd infra && pulumi login {self.BACKEND} && pulumi cancel --stack prod --yes", msg)
+        self.assertIn(f"gcloud storage rm {self.LOCK}", msg)
+        self.assertIn("pulumi refresh", msg)
+        self.assertNotIn("took the infra lock over", msg)
+        self.assertIn("GITEA_INFRA_STACK_LOCKED stack=prod locks=1", log)
+        self.assertEqual(calls, [["gcloud", "storage", "ls", self.DIR], ["gcloud", "storage", "cat", self.LOCK]])
+
+    def test_several_and_unreadable_locks_are_all_named(self):
+        listing = f"{self.LOCK}\n{self.DIR}sub/\n{self.OTHER}\n{self.THIRD}\n"
+        err, log, calls = self.check(self.deploy(), (0, listing, ""),
+                                     {self.LOCK: self.BODY, self.OTHER: None, self.THIRD: "{not json"})
+        msg = str(err)
+        self.assertIn(f"{self.LOCK}: created by root@6f1c2a8e0b7d (pid 4242)", msg)
+        self.assertIn(f"{self.OTHER}: (unreadable)", msg)
+        self.assertIn(f"{self.THIRD}: (unreadable)", msg)
+        self.assertNotIn(self.DIR + "sub/", msg)
+        self.assertIn(f"gcloud storage rm {self.LOCK} {self.OTHER} {self.THIRD}", msg)
+        self.assertIn("GITEA_INFRA_STACK_LOCKED stack=prod locks=3", log)
+        self.assertEqual(D.describe_stack_lock(self.LOCK, "[1, 2]"), f"{self.LOCK}: (unreadable)")
+
+    def test_a_listing_error_warns_and_goes_ahead(self):
+        for name, stderr in (("permission", "ERROR: (gcloud.storage.ls) [cb-infra@x] does not have "
+                                            "storage.objects.list access to the Google Cloud Storage bucket. 403"),
+                             ("network", "ERROR: (gcloud.storage.ls) Connection reset by peer")):
+            with self.subTest(name):
+                err, log, calls = self.check(self.deploy(), (1, "", stderr))
+                self.assertIsNone(err)
+                self.assertIn("WARNING", log)
+                self.assertIn(stderr[-40:], log)
+                self.assertEqual(len(calls), 1)
+
+    def test_a_takeover_this_run_made_is_named(self):
+        d = self.deploy()
+        d.took_over = ({"build": InfraLock.HOLDER, "sha": "old"}, "CANCELLED at 2026-11-07T03:43:54.451932Z")
+        err, _, _ = self.check(d, (0, self.LOCK + "\n", ""), {self.LOCK: self.BODY})
+        self.assertIn(f"this run took the infra lock over from build {InfraLock.HOLDER} "
+                      "(CANCELLED at 2026-11-07T03:43:54.451932Z)", str(err))
+
+    def test_the_marker_feeds_no_alert(self):
+        # The alerts match substrings of a build's log; this failure is the
+        # failed-build alert's, not a rollback's.
+        with open(os.path.join(G.ROOT, "cicd/pkg/alerting/alerting.go")) as f:
+            src = f.read()
+        patterns = re.findall(r'(?:textPayload:|jsonPayload\.msg=)"([^"]+)"', src)
+        self.assertGreaterEqual(len(patterns), 5)
+        err, log, _ = self.check(self.deploy(), (0, self.LOCK + "\n", ""), {self.LOCK: self.BODY})
+        for p in patterns:
+            self.assertNotIn(p, "GITEA_INFRA_STACK_LOCKED")
+            self.assertNotIn(p, log + str(err))
+
+    # --- where up() checks ----------------------------------------------------
+
+    def up(self, *, superseded=False, locked=False):
+        """d.up() with every step faked: the steps, in order."""
+        d, order = self.deploy(), []
+
+        def step(name, result=None, exc=None):
+            def f(*a, **kw):
+                order.append(name)
+                if exc:
+                    raise exc
+                return result
+            return f
+        ok = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        steps = {"lock": None, "superseded": superseded, "warm_ops": None, "prepare": "/infra",
+                 "preview_json": {"steps": []}, "save_go_cache": None, "ansible_checks": None, "ops": None,
+                 "pulumi": ok, "apply": None, "rollback": True, "save_last_good": None, "unwarm_ops": None,
+                 "unlock": None}
+        patches = [mock.patch.object(d, n, side_effect=step(n, r)) for n, r in steps.items()]
+        patches.append(mock.patch.object(d, "check_stack_lock", side_effect=step(
+            "check_stack_lock", exc=D.Failed("stack prod has 1 Pulumi lock(s) left") if locked else None)))
+        patches.append(mock.patch.object(D, "run", side_effect=lambda cmd, **kw: order.append(
+            "gate" if "release_gate.py" in " ".join(cmd) else cmd[2]) or ok))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            try:
+                rc = d.up()
+            except D.Failed:
+                rc = "Failed"
+        return rc, order
+
+    def test_up_checks_after_superseded_and_before_anything_else(self):
+        rc, order = self.up()
+        self.assertEqual(rc, 0)
+        self.assertEqual(order[:6], ["gate", "lock", "superseded", "check_stack_lock", "warm_ops", "prepare"])
+        self.assertEqual(order[-2:], ["unwarm_ops", "unlock"])
+
+    def test_a_lock_stops_up_before_the_build_and_the_backup_and_still_unlocks(self):
+        rc, order = self.up(locked=True)
+        self.assertEqual(rc, "Failed")
+        self.assertEqual(order, ["gate", "lock", "superseded", "check_stack_lock", "unwarm_ops", "unlock"])
+
+    def test_a_superseded_build_never_checks(self):
+        rc, order = self.up(superseded=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(order, ["gate", "lock", "superseded", "unwarm_ops", "unlock"])
+
+    def test_a_preview_never_checks(self):
+        d = self.deploy(mode="preview")
+        ok = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(d, "ansible_checks"), mock.patch.object(d, "prepare", return_value="/infra"), \
+                mock.patch.object(d, "pulumi"), mock.patch.object(D, "run", return_value=ok), \
+                mock.patch.object(d, "check_stack_lock") as check, redirect_stdout(io.StringIO()):
+            self.assertEqual(d.preview(), 0)
+        check.assert_not_called()
 
 
 class PreRestore(unittest.TestCase):
