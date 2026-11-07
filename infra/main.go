@@ -93,8 +93,9 @@ func main() {
 		}
 
 		// The zone already exists and is delegated; this only adds the A record
-		// and the zone-scoped permission Caddy needs for DNS-01.
-		if _, err := dns.New(ctx, cfg, net.Address, accounts.VM.Email, apis); err != nil {
+		// and the zone-scoped permissions Caddy needs for DNS-01, for gitea-vm@
+		// and for the Caddy DNS account.
+		if _, err := dns.New(ctx, cfg, net.Address, accounts, apis); err != nil {
 			return err
 		}
 
@@ -146,6 +147,7 @@ func main() {
 		ctx.Export("configHash", pulumi.String(buckets.ConfigHash))
 		ctx.Export("vmServiceAccount", accounts.VM.Email)
 		ctx.Export("imageServiceAccount", accounts.Image.Email)
+		ctx.Export("caddyDnsServiceAccount", accounts.CaddyDNS.Email)
 		// Printed so the runbook never has to guess the flags.
 		ctx.Export("sshCommand", pulumi.Sprintf(
 			"gcloud compute ssh %s --zone=%s --tunnel-through-iap --project=%s",
