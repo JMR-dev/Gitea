@@ -21,7 +21,10 @@
 #   - the docker label's job image (IMAGE_PRUNE_KEEP), which every job needs;
 #   - while a job runs, any image used, pulled, built or tagged since the
 #     earliest running container started, i.e. anything that job may still
-#     want, such as an image it built and hasn't pushed yet.
+#     want, such as an image it built and hasn't pushed yet. No job outlasts
+#     the runner's timeout (IMAGE_PRUNE_JOB_MAX_SECONDS), so neither does this:
+#     a container left running for longer (a `docker run -d` a job never
+#     cleaned up) keeps its own image but doesn't freeze everything newer.
 # Build cache a running build is using is kept by BuildKit itself.
 #
 # Settings (env, from infra/pkg/runner; no defaults, so Go and this can't
@@ -30,6 +33,7 @@
 #   IMAGE_PRUNE_MIN_FREE_KIB  prune when free space is this many KiB or less
 #   IMAGE_PRUNE_KEEP          image reference never removed
 #   IMAGE_PRUNE_STATE         file of "<image id> <last used, epoch seconds>"
+#   IMAGE_PRUNE_JOB_MAX_SECONDS  the runner's job timeout
 # For checks by hand (docs/runners.md):
 #   IMAGE_PRUNE_DRY_RUN=1     list every image it would remove, in order, and
 #                             the build cache steps; remove and save nothing
@@ -49,6 +53,7 @@ DATA_ROOT="${IMAGE_PRUNE_DATA_ROOT:?}"
 MIN_FREE_KIB="${IMAGE_PRUNE_MIN_FREE_KIB:?}"
 KEEP="${IMAGE_PRUNE_KEEP:?}"
 STATE="${IMAGE_PRUNE_STATE:?}"
+JOB_MAX="${IMAGE_PRUNE_JOB_MAX_SECONDS:?}"
 DRY_RUN="${IMAGE_PRUNE_DRY_RUN:-0}"
 ONCE="${IMAGE_PRUNE_ONCE:-0}"
 INTERVAL="${IMAGE_PRUNE_INTERVAL:-30}"
@@ -71,6 +76,7 @@ declare -A size_mb=()  # image ID -> its content (compressed) size in MB, for th
 keep_id=""             # IMAGE_PRUNE_KEEP's image ID, if it's present
 job_started=""         # epoch seconds the earliest running container started
 errors=()              # what this pass couldn't read, for report_errors
+warnings=()            # what this pass found odd, for report_errors
 
 # The readiness probe only proves dockerd answers. A Docker whose output this
 # can't read would otherwise leave it pruning nothing while looking healthy, so
@@ -90,9 +96,13 @@ now() {
   date +%s
 }
 
-# Free KiB on the filesystem holding the data root.
+# Free KiB on the filesystem holding the data root. Fails, printing nothing,
+# if df's answer isn't a number.
 free_kib() {
-  df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $4 }'
+  local kib
+  kib="$(df -Pk "$DATA_ROOT" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  [[ "$kib" =~ ^[0-9]+$ ]] || return 1
+  echo "$kib"
 }
 
 # "2026-11-07T02:26:05.123456789Z" -> epoch seconds, or nothing if it isn't
@@ -127,14 +137,17 @@ save_state() {
 # Reads what the daemon has now. Returns non-zero if docker didn't answer.
 observe() {
   local t containers images image running started tagged epoch size refs
-  local listed=0 read_count=0 bad_dates=0 bad_starts=0
+  local listed=0 read_count=0 bad_dates=0 bad_starts=0 too_long=0 floor
   t="$(now)"
+  # No job started before this, so no container that did is a job's.
+  floor=$((t - JOB_MAX))
   in_use=()
   recency=()
   names=()
   size_mb=()
   job_started=""
   errors=()
+  warnings=()
 
   containers="$(docker ps -aq --no-trunc)" || return 1
   if [[ -n "$containers" ]]; then
@@ -145,11 +158,17 @@ observe() {
       in_use[$image]=1
       [[ "$running" == true ]] || continue
       last_used[$image]="$t"
-      # A start time that doesn't parse can't say what the job touched, so
-      # the job counts as running since forever (epoch 0): everything is kept.
+      # A start time that doesn't parse can't say what the job touched, so it
+      # counts as the earliest a job could have started: everything a job
+      # could have touched is kept.
       if ! started="$(rfc3339_to_epoch "$started")" || [[ ! "$started" =~ ^[0-9]+$ ]]; then
         bad_starts=$((bad_starts + 1))
-        started=0
+        started="$floor"
+      elif ((started < floor)); then
+        # Running longer than a job can: not a job's (or not one still
+        # running). It keeps its own image, as in_use, and nothing more.
+        too_long=$((too_long + 1))
+        started="$floor"
       fi
       if [[ -z "$job_started" ]] || ((started < job_started)); then
         job_started="$started"
@@ -157,7 +176,10 @@ observe() {
     done < <(docker container inspect --format '{{.Image}} {{.State.Running}} {{.State.StartedAt}}' $containers 2>/dev/null)
   fi
   if ((bad_starts > 0)); then
-    errors+=("${bad_starts} running containers have a StartedAt it can't read; keeping every image until they stop")
+    errors+=("${bad_starts} running containers have a StartedAt it can't read; keeping every image touched in the last $((JOB_MAX / 3600)) hours")
+  fi
+  if ((too_long > 0)); then
+    warnings+=("${too_long} containers have run longer than a job can ($((JOB_MAX / 3600)) hours); they keep only their own images")
   fi
 
   images="$(docker image ls --no-trunc --format '{{.ID}}' | sort -u)" || return 1
@@ -209,14 +231,17 @@ observe() {
   return 0
 }
 
-# Logs what observe couldn't read, as ERROR lines: on the first pass it
-# happens, then every ERROR_LOG_EVERY seconds while it lasts.
+# Logs what this pass couldn't read (ERROR) or found odd (WARNING): on the
+# first pass it happens, then every ERROR_LOG_EVERY seconds while it lasts.
 report_errors() {
   local e
-  ((${#errors[@]} > 0)) || return 0
+  ((${#errors[@]} + ${#warnings[@]} > 0)) || return 0
   if ((last_error_log == 0 || $(now) - last_error_log >= ERROR_LOG_EVERY)); then
     for e in "${errors[@]}"; do
       log "ERROR: $e"
+    done
+    for e in "${warnings[@]}"; do
+      log "WARNING: $e"
     done
     last_error_log="$(now)"
   fi
@@ -273,10 +298,18 @@ prune_build_cache() {
   fi
 }
 
+# Re-reads free space during a prune, into the caller's $free. Without a
+# number there's no knowing when to stop, so the prune stops instead.
+reread_free() {
+  free="$(free_kib)" && return 0
+  log "ERROR: can't read free space on ${DATA_ROOT} from df; stopping this prune"
+  return 1
+}
+
 prune() {
   local before free list image removed=0 why mode="" was
-  before="$(free_kib)"
-  free="$before"
+  reread_free || return 0
+  before="$free"
   list="$(candidates)"
 
   # Nothing left that may be removed, and build cache was just tried: a running
@@ -307,7 +340,7 @@ prune() {
     if remove_image "$image"; then
       removed=$((removed + 1))
       was="$free"
-      free="$(free_kib)"
+      reread_free || return 0
       log "removed $(describe "$image"): freed $((free - was)) KiB, free now ${free} KiB"
     else
       log "could not remove $(describe "$image"); skipped"
@@ -316,11 +349,11 @@ prune() {
 
   if [[ "$DRY_RUN" == 1 ]] || ((free <= MIN_FREE_KIB)); then
     prune_build_cache "--filter until=24h"
-    free="$(free_kib)"
+    reread_free || return 0
   fi
   if [[ "$DRY_RUN" == 1 ]] || ((free <= MIN_FREE_KIB)); then
     prune_build_cache ""
-    free="$(free_kib)"
+    reread_free || return 0
   fi
 
   log "pass done: free ${before} -> ${free} KiB (freed $((free - before)) KiB), removed ${removed} images"
@@ -337,15 +370,17 @@ until docker info >/dev/null 2>&1; do
 done
 
 load_state
-log "watching ${DATA_ROOT}: prunes at ${MIN_FREE_KIB} KiB free or less; free now $(free_kib) KiB; keeps ${KEEP}"
+log "watching ${DATA_ROOT}: prunes at ${MIN_FREE_KIB} KiB free or less; free now $(free_kib || echo '?') KiB; keeps ${KEEP}"
 last_status="$(now)"
 
 while true; do
   if observe; then
+    free="$(free_kib)" || errors+=("can't read free space on ${DATA_ROOT} from df; skipping this pass")
     report_errors
     save_state
-    free="$(free_kib)"
-    if [[ "$DRY_RUN" == 1 ]] || ((free <= MIN_FREE_KIB)); then
+    if [[ -z "$free" ]]; then
+      : # nothing to compare with the line; reported above
+    elif [[ "$DRY_RUN" == 1 ]] || ((free <= MIN_FREE_KIB)); then
       prune
     elif (($(now) - last_status >= STATUS_EVERY)); then
       log "status: free ${free} KiB, ${#recency[@]} images, line ${MIN_FREE_KIB} KiB"

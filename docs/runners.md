@@ -516,7 +516,10 @@ container runs a third s6 service beside dockerd and the runner,
 It never removes an image a container uses, the `docker` label's job image
 (`runner-images:ubuntu-latest`), or, while a job runs, anything used, pulled,
 built or tagged since that job started, such as an image it built and hasn't
-pushed yet. Volumes are left alone: `silverbullet-trivy-cache` (1.7 GB on
+pushed yet. That last protection reaches back at most the runner's job
+timeout (3 hours): a container left running longer, such as a `docker run -d`
+a job never cleaned up, keeps its own image but doesn't stop everything newer
+from being pruned, and it's logged as a `WARNING`. Volumes are left alone: `silverbullet-trivy-cache` (1.7 GB on
 2026-11-07) is a cache on purpose. The container's command is `start.sh`,
 which installs the service and then runs the image's own entrypoint,
 `s6-svscan /etc/s6`. The service has no `finish` script, so if it dies s6
@@ -524,10 +527,11 @@ restarts it rather than stopping the runner. Its log lines start with
 `image-prune:` and reach Watchtower with the runner's: a line when it starts,
 one an hour, and one for each image it removes. If pruning can't get back
 above the line, it logs `still below line`. If it can't read what Docker tells
-it (no images back from `image inspect`, or a `LastTagTime` or a running
-container's `StartedAt` it can't parse; the last also makes it keep every
-image until that container stops), it logs `image-prune: ERROR: …` at once
-and every 10 minutes while that lasts:
+it (no images back from `image inspect`, a `LastTagTime` or a running
+container's `StartedAt` it can't parse, or free space `df` doesn't give as a
+number; an unreadable `StartedAt` also makes it keep everything touched in the
+last 3 hours, and unreadable free space skips the pass), it logs
+`image-prune: ERROR: …` at once and every 10 minutes while that lasts:
 the readiness probe only checks dockerd, so that line is what shows a prune
 loop that has gone blind. Tests: `infra/pkg/runner/bats` (`make check`). The arm64 runner needs none of
 this: each job's dockerd has an `emptyDir` data root that goes with the pod.

@@ -14,6 +14,7 @@ setup() {
   export IMAGE_PRUNE_MIN_FREE_KIB="$LINE"
   export IMAGE_PRUNE_KEEP=docker.io/gitea/runner-images:ubuntu-latest
   export IMAGE_PRUNE_STATE="$BATS_TEST_TMPDIR/state"
+  export IMAGE_PRUNE_JOB_MAX_SECONDS=10800
   export IMAGE_PRUNE_ONCE=1
   echo $((LINE + 1)) >"$FAKE/free"
 }
@@ -37,6 +38,11 @@ below_line() {
 
 removed() {
   cat "$FAKE/rm.log" 2>/dev/null | tr '\n' ' '
+}
+
+# An RFC 3339 time $1 seconds ago.
+ago() {
+  date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%S.5Z
 }
 
 @test "it refuses to start without each setting Go gives it" {
@@ -108,11 +114,16 @@ removed() {
 }
 
 @test "while a job runs, anything touched since it started is kept" {
-  three_images
-  echo "sha256:dddd4444dddd4444 2026-11-02T12:00:00.5Z 1 job:1" >>"$FAKE/images"
+  # Times relative to now: a job can only have started in the last 3 hours.
+  cat >"$FAKE/images" <<EOF
+$OLD $(ago 7200) 1 old:1
+$MID $(ago 5400) 1 mid:1
+$NEW $(ago 600) 1 new:1
+sha256:dddd4444dddd4444 $(ago 3700) 1 job:1
+EOF
   below_line
-  # The job started between mid's tag and new's.
-  echo "sha256:dddd4444dddd4444 true 2026-11-02T12:00:00.123Z" >"$FAKE/containers"
+  # The job started an hour ago: after mid's tag, before new's.
+  echo "sha256:dddd4444dddd4444 true $(ago 3600)" >"$FAKE/containers"
   run bash "$SCRIPT"
   [ "$(removed)" = "old:1 mid:1 " ]
   [[ "$output" == *"keeping new:1 "*": touched by the running job"* ]]
@@ -191,14 +202,37 @@ EOF
   [ "$(removed)" = "mid:1 old:1 " ]
 }
 
-@test "ERROR when a running container's StartedAt doesn't parse, and everything is kept" {
+@test "ERROR when a running container's StartedAt doesn't parse; it keeps what a job could have touched" {
   three_images
+  echo "sha256:eeee5555eeee5555 $(ago 600) 1 recent:1" >>"$FAKE/images"
   below_line
   echo "sha256:dddd4444dddd4444 true not-a-date" >"$FAKE/containers"
   run bash "$SCRIPT"
-  [[ "$output" == *"image-prune: ERROR: 1 running containers have a StartedAt it can't read"* ]]
+  [[ "$output" == *"image-prune: ERROR: 1 running containers have a StartedAt it can't read; keeping every image touched in the last 3 hours"* ]]
+  [ "$(removed)" = "old:1 mid:1 new:1 " ]
+  [[ "$output" == *"keeping recent:1 "*": touched by the running job"* ]]
+}
+
+@test "a container running longer than any job can doesn't protect newer images" {
+  three_images
+  echo "sha256:eeee5555eeee5555 $(ago 600) 1 recent:1" >>"$FAKE/images"
+  below_line
+  # Started days ago, like a `docker run -d` a job never cleaned up.
+  echo "sha256:dddd4444dddd4444 true 2026-10-30T00:00:00Z" >"$FAKE/containers"
+  run bash "$SCRIPT"
+  [ "$(removed)" = "old:1 mid:1 new:1 " ]
+  [[ "$output" == *"keeping recent:1 "*": touched by the running job"* ]]
+  [[ "$output" == *"1 containers have run longer than a job can (3 hours)"* ]]
+}
+
+@test "ERROR when df's free space can't be read, and nothing is pruned" {
+  three_images
+  echo garbage >"$FAKE/free"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"image-prune: ERROR: can't read free space on /fake/data"* ]]
   [ "$(removed)" = "" ]
-  [[ "$output" == *"keeping old:1 "*": touched by the running job"* ]]
+  [[ "$output" != *"syntax error"* ]]
 }
 
 @test "a never-tagged image (LastTagTime year 1) is no error and goes last" {

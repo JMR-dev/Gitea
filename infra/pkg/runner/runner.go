@@ -37,7 +37,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -113,6 +114,11 @@ const (
 	// the runner-data PVC so it survives restarts.
 	pruneMinFreeKiB = 4 * 1024 * 1024
 	pruneStateFile  = "/data/image-prune.state"
+
+	// jobTimeoutHours is every runner's runner.timeout: no job runs longer. It
+	// also bounds image-prune's protection of what a running job touched, so a
+	// container left running past it doesn't freeze pruning.
+	jobTimeoutHours = 3
 
 	spcName   = "gitea-runner-registration-token"
 	tokenDir  = "/var/run/secrets/gitea-runner"
@@ -724,7 +730,7 @@ runner:
   # Without it a recreated pod registers as a NEW runner and leaves a stale one.
   file: /data/.runner
   capacity: %d
-  timeout: 3h
+  timeout: %dh
   shutdown_timeout: %s
   fetch_interval: 2s
   labels:
@@ -733,7 +739,7 @@ cache:
   enabled: true
   dir: /data/cache
   port: %d
-`, capacity, shutdown, strings.TrimRight(lb.String(), "\n"), cachePort)
+`, capacity, jobTimeoutHours, shutdown, strings.TrimRight(lb.String(), "\n"), cachePort)
 }
 
 // dindConfig is the DinD runner's config.yaml.
@@ -783,11 +789,23 @@ func dindConfigMapData(cfg *config.Config, daemon string) map[string]string {
 // these are the only place they're set.
 func pruneEnv() map[string]string {
 	return map[string]string{
-		"IMAGE_PRUNE_DATA_ROOT":    dockerDataRoot,
-		"IMAGE_PRUNE_MIN_FREE_KIB": strconv.Itoa(pruneMinFreeKiB),
-		"IMAGE_PRUNE_KEEP":         dockerJobImage,
-		"IMAGE_PRUNE_STATE":        pruneStateFile,
+		"IMAGE_PRUNE_DATA_ROOT":       dockerDataRoot,
+		"IMAGE_PRUNE_MIN_FREE_KIB":    strconv.Itoa(pruneMinFreeKiB),
+		"IMAGE_PRUNE_KEEP":            dockerJobImage,
+		"IMAGE_PRUNE_STATE":           pruneStateFile,
+		"IMAGE_PRUNE_JOB_MAX_SECONDS": strconv.Itoa(jobTimeoutHours * 3600),
 	}
+}
+
+// dindConfigFiles are the ConfigMap keys the DinD runner's config volume
+// projects into configDir. daemon.json goes to dockerConfigDir on its own.
+var dindConfigFiles = []string{"config.yaml", "start.sh", "image-prune.sh"}
+
+// dindCommand is the DinD runner container's command: start.sh installs the
+// image-prune s6 service, then execs the image's own entrypoint, s6-svscan.
+// Run through sh, so the projected file needs no exec mode.
+func dindCommand() []string {
+	return []string{"/bin/sh", configDir + "/start.sh"}
 }
 
 // podsConfig is the pod runner's config.yaml.
@@ -1314,14 +1332,8 @@ func statefulSet(
 						&corev1.VolumeArgs{
 							Name: pulumi.String("config"),
 							ConfigMap: &corev1.ConfigMapVolumeSourceArgs{
-								Name: cm.Metadata.Name(),
-								// The scripts are run through sh and bash, so they
-								// need no exec mode.
-								Items: corev1.KeyToPathArray{
-									&corev1.KeyToPathArgs{Key: pulumi.String("config.yaml"), Path: pulumi.String("config.yaml")},
-									&corev1.KeyToPathArgs{Key: pulumi.String("start.sh"), Path: pulumi.String("start.sh")},
-									&corev1.KeyToPathArgs{Key: pulumi.String("image-prune.sh"), Path: pulumi.String("image-prune.sh")},
-								},
+								Name:  cm.Metadata.Name(),
+								Items: keyToPaths(dindConfigFiles),
 							},
 						},
 						&corev1.VolumeArgs{
@@ -1343,11 +1355,9 @@ func statefulSet(
 
 					Containers: corev1.ContainerArray{
 						&corev1.ContainerArgs{
-							Name:  pulumi.String(ContainerName),
-							Image: pulumi.String(cfg.RunnerImage()),
-							// start.sh installs the image-prune s6 service, then
-							// execs the image's own entrypoint, s6-svscan.
-							Command: pulumi.ToStringArray([]string{"/bin/sh", configDir + "/start.sh"}),
+							Name:    pulumi.String(ContainerName),
+							Image:   pulumi.String(cfg.RunnerImage()),
+							Command: pulumi.ToStringArray(dindCommand()),
 							// Rootless dockerd still needs a privileged container
 							// for its user namespaces and mounts -- but the daemon
 							// runs as uid 1000, so a job that escapes its own
@@ -1599,14 +1609,18 @@ func env(name, value string) *corev1.EnvVarArgs {
 // envVars turns a map into env vars, sorted by name so the pod template, and so
 // the preview, doesn't change from one run to the next.
 func envVars(m map[string]string) corev1.EnvVarArray {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make(corev1.EnvVarArray, 0, len(keys))
-	for _, k := range keys {
+	var out corev1.EnvVarArray
+	for _, k := range slices.Sorted(maps.Keys(m)) {
 		out = append(out, env(k, m[k]))
+	}
+	return out
+}
+
+// keyToPaths projects each ConfigMap key to a file of the same name.
+func keyToPaths(keys []string) corev1.KeyToPathArray {
+	var out corev1.KeyToPathArray
+	for _, k := range keys {
+		out = append(out, &corev1.KeyToPathArgs{Key: pulumi.String(k), Path: pulumi.String(k)})
 	}
 	return out
 }

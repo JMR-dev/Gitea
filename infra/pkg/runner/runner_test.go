@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+
 	"gitea-infra/pkg/config"
 )
 
@@ -53,9 +56,23 @@ func TestDinDImagePrune(t *testing.T) {
 		{"the kept image is the docker label's", strings.Contains(dindConfig(cfg), `- "docker:docker://`+env["IMAGE_PRUNE_KEEP"]+`"`)},
 		{"free space is measured on dockerd's data root", env["IMAGE_PRUNE_DATA_ROOT"] == dockerDataRoot},
 		{"the state is on the runner-data PVC (/data)", strings.HasPrefix(env["IMAGE_PRUNE_STATE"], "/data/")},
+		// A job can't outlast the runner's timeout, so neither can its protection.
+		{"the job protection lasts as long as the runner's job timeout", strings.Contains(dindConfig(cfg), "\n  timeout: 3h\n") && env["IMAGE_PRUNE_JOB_MAX_SECONDS"] == "10800"},
+		// The container's command and the script start.sh runs are both files the
+		// config volume projects into configDir, from keys the ConfigMap has.
+		{"the command is start.sh in configDir", slices.Equal(dindCommand(), []string{"/bin/sh", configDir + "/start.sh"})},
+		{"the config volume projects start.sh", slices.Contains(dindConfigFiles, "start.sh")},
+		{"the config volume projects image-prune.sh", slices.Contains(dindConfigFiles, "image-prune.sh")},
+		{"the config volume projects config.yaml", slices.Contains(dindConfigFiles, "config.yaml")},
 	} {
 		if !c.ok {
 			t.Errorf("want: %s", c.want)
+		}
+	}
+
+	for _, f := range dindConfigFiles {
+		if _, ok := data[f]; !ok {
+			t.Errorf("the config volume projects %s, which the ConfigMap doesn't have", f)
 		}
 	}
 
@@ -67,5 +84,18 @@ func TestDinDImagePrune(t *testing.T) {
 	slices.Sort(required)
 	if set := slices.Sorted(maps.Keys(env)); !slices.Equal(required, set) {
 		t.Errorf("image-prune.sh requires %v, pruneEnv sets %v", required, set)
+	}
+}
+
+// Env vars come out sorted by name, so the pod template doesn't change from one
+// run to the next.
+func TestEnvVarsAreSorted(t *testing.T) {
+	var got []string
+	for _, v := range envVars(map[string]string{"B": "2", "C": "3", "A": "1"}) {
+		e := v.(*corev1.EnvVarArgs)
+		got = append(got, string(e.Name.(pulumi.String))+"="+string(e.Value.(pulumi.String)))
+	}
+	if want := []string{"A=1", "B=2", "C=3"}; !slices.Equal(got, want) {
+		t.Errorf("envVars gave %v, want %v", got, want)
 	}
 }
