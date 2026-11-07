@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# A fake `gcloud` for gitea-render-secrets.bats: Secret Manager, served from
+# $FAKE. Only the two calls gitea-render-secrets makes are understood; any
+# other is recorded in $FAKE/unexpected (the tests' teardown fails on it) and
+# fails.
+#
+# State in $FAKE:
+#   secrets/<name>  the secret's latest version (no file: it has none)
+# Records:
+#   added.log       "<name> <project>" for each `versions add`, never the value
+#
+# A `versions add` succeeds, as it did while gitea-vm@ held version-adder: so
+# a test shows what the script itself refuses to do.
+
+set -uo pipefail
+
+: "${FAKE:?the fake gcloud needs FAKE}"
+
+unexpected() {
+  echo "gcloud $*" >>"$FAKE/unexpected"
+  echo "fake gcloud: unexpected call: gcloud $*" >&2
+  exit 99
+}
+
+case "$1 ${2:-} ${3:-} ${4:-}" in
+  "secrets versions access latest")
+    # access latest --secret=NAME --project=PROJECT
+    [[ "${5:-}" == --secret=* && "${6:-}" == --project=* && $# -eq 6 ]] || unexpected "$@"
+    name=${5#--secret=}
+    if [[ ! -f "$FAKE/secrets/$name" ]]; then
+      echo "ERROR: (gcloud.secrets.versions.access) NOT_FOUND: Secret Version [$name/latest] not found." >&2
+      exit 1
+    fi
+    cat "$FAKE/secrets/$name"
+    ;;
+  "secrets versions add "*)
+    # add NAME --project=PROJECT --data-file=-
+    [[ "${5:-}" == --project=* && "${6:-}" == --data-file=- && $# -eq 6 ]] || unexpected "$@"
+    name=$4
+    mkdir -p "$FAKE/secrets"
+    cat >"$FAKE/secrets/$name"
+    echo "$name ${5#--project=}" >>"$FAKE/added.log"
+    ;;
+  *)
+    unexpected "$@"
+    ;;
+esac

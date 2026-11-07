@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# A fake `chown` for gitea-render-secrets.bats, which doesn't run as root: it
+# records "<owner> <path>" in $FAKE/chown.log and changes nothing.
+
+set -uo pipefail
+
+: "${FAKE:?the fake chown needs FAKE}"
+
+echo "$*" >>"$FAKE/chown.log"

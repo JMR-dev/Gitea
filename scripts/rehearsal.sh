@@ -12,8 +12,9 @@
 #
 # Like prod (infra/pkg/compute) but cut off from it:
 #   - its own service account, which reads only gitea-rehearsal-* secrets
-#     (created empty here; the playbook generates them, as it would for a
-#     new project), the image repository, and in --legacy the config bucket;
+#     (created empty here; the playbook generates them, which it does for
+#     this prefix only -- prod's come from scripts/bootstrap.sh), the image
+#     repository, and in --legacy the config bucket;
 #   - domain rehearsal.invalid, so Caddy never gets a certificate and no DNS
 #     record is touched, and no backup bucket;
 #   - no watchtower-peer-secret, so no tunnel to watchtower and no Alloy;
