@@ -1,0 +1,4 @@
+# actionlint's config, for `make workflow-lint`. actionlint knows GitHub's
+# runner labels only; heavy is this Gitea's own (docs/runners.md).
+self-hosted-runner:
+  labels: [heavy]
