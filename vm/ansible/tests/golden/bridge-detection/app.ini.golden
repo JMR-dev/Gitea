@@ -63,7 +63,7 @@ SECRET_KEY     = k2
 INTERNAL_TOKEN = t2
 ; Without these two, Gitea sees Caddy's address as the client for every request
 ; and fail2ban ends up banning the reverse proxy, locking everyone out.
-REVERSE_PROXY_TRUSTED_PROXIES = 10.89.20.0/24,127.0.0.1/32
+REVERSE_PROXY_TRUSTED_PROXIES = 10.89.20.251/32
 REVERSE_PROXY_LIMIT           = 1
 PASSWORD_HASH_ALGO            = argon2
 

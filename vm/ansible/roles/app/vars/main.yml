@@ -16,12 +16,13 @@ IMAGE_CADDY: "{{ image_caddy }}"
 PODMAN_SUBNET: "{{ podman_subnet }}"
 PODMAN_GATEWAY: "{{ podman_gateway }}"
 
-# The gitea network, where Caddy has its address. A host process that reaches
-# Gitea on 127.0.0.1:3000 (Alloy's /metrics scrape) arrives from the bridge
-# gateway, inside the same CIDR: rootful podman SNATs host-loopback traffic.
-# 127.0.0.1/32 is left from when Caddy could run on the host network; only
-# Gitea's own container connects from it now.
-TRUSTED_PROXIES: "{{ podman_subnet }},127.0.0.1/32"
+# Whom Gitea takes the client's address from (X-Forwarded-For): Caddy, at its
+# fixed address, and nothing else. Not the gitea network's CIDR: a host
+# process that reaches Gitea on 127.0.0.1:3000 (Alloy's /metrics scrape)
+# arrives from the bridge gateway, inside it, as rootful podman SNATs
+# host-loopback traffic, and could name any client, for fail2ban to ban.
+# tests/check holds every fixture to this (caddy_only_proxy).
+TRUSTED_PROXIES: "{{ CADDY_ADDRESS }}/32"
 
 # Left as placeholders: files/gitea-render-secrets fills them in on the VM.
 GITEA_SECRET_KEY: "${GITEA_SECRET_KEY}"

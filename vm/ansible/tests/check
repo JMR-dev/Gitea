@@ -22,6 +22,9 @@ checked too (not under --update). Everywhere, as they need nothing downloaded:
   - Caddy's stop budget (caddy_stop_budget): every fixture's Caddyfile sets a
     grace_period, and its shutdown_delay + grace_period + 3 s fits in
     caddy.container's explicit StopTimeout, itself under TimeoutStopSec;
+  - that Gitea trusts X-Forwarded-For from Caddy alone (caddy_only_proxy):
+    every fixture's app.ini names caddy.container's IP= as a /32 and nothing
+    else;
   - what Caddy's retired host-network mode left, over every case
     (tests/caddy-network.yml): preflight stops a VM still in it, and tidies up
     after any other;
@@ -99,6 +102,7 @@ ALLOY_CONFIG = "config.alloy"  # the rendered name of vm/config/config.alloy.tmp
 # podman's SIGKILL; and systemd's TimeoutStopSec when a unit sets none.
 CADDYFILE = "Caddyfile"
 CADDY_QUADLET = "caddy.container"
+APP_INI = "app.ini"  # the rendered name of vm/config/app.ini.tmpl (caddy_only_proxy)
 CADDY_STOP_MARGIN = 3
 SYSTEMD_STOP_TIMEOUT = 90
 # A Caddy duration (caddy.ParseDuration): Go's, a sequence such as 5s, 500ms or
@@ -408,6 +412,30 @@ def caddy_stop_budget():
     return problems
 
 
+def caddy_only_proxy():
+    """Problems with whom Gitea takes a client's address from, in every
+    fixture's goldens: app.ini's REVERSE_PROXY_TRUSTED_PROXIES must be
+    caddy.container's IP= alone, as a /32. Anything wider trusts more than
+    Caddy. The gitea network's CIDR holds its gateway, which every host process
+    that reaches Gitea on 127.0.0.1:3000 arrives from (podman SNATs
+    host-loopback traffic to it), so any of them could name the client in
+    X-Forwarded-For, and fail2ban would ban whoever it named."""
+    problems = []
+    for name in sorted(os.listdir(os.path.join(HERE, "golden"))):
+        d = os.path.join(HERE, "golden", name)
+        caddy_ip = unit_keys(os.path.join(d, CADDY_QUADLET + ".golden")).get("Container", {}).get("IP")
+        trusted = None
+        with open(os.path.join(d, APP_INI + ".golden")) as fh:
+            for line in fh:
+                key, sep, value = line.partition("=")
+                if sep and key.strip() == "REVERSE_PROXY_TRUSTED_PROXIES":
+                    trusted = value.strip()
+        if trusted != f"{caddy_ip}/32":
+            problems.append(f"{name}/{APP_INI}: REVERSE_PROXY_TRUSTED_PROXIES is {trusted!r}, not {caddy_ip}/32, "
+                            "caddy.container's IP= alone: anything wider lets more than Caddy name the client")
+    return problems
+
+
 def caddy_network_cases():
     """Runs tests/caddy-network.yml over the cases Caddy's retired host-network
     mode can leave a VM in: preflight stops one whose Caddy is still on the
@@ -530,6 +558,11 @@ def main():
         return 1
     print(f"tests/check: Caddy's stop budget holds in every fixture: shutdown_delay + grace_period + "
           f"{CADDY_STOP_MARGIN}s <= StopTimeout < TimeoutStopSec")
+    problems = caddy_only_proxy()
+    if problems:
+        print("Gitea's trusted proxies:\n  " + "\n  ".join(problems))
+        return 1
+    print("tests/check: Gitea trusts X-Forwarded-For from Caddy's address alone in every fixture")
     if not caddy_network_cases():
         print("tests/check: tests/caddy-network.yml failed: Caddy's old host-network cache and sysctl")
         return 1

@@ -40,11 +40,13 @@ rules and fail2ban's bans. Every container not restarted afterwards loses its
 published ports, with nothing in `podman ps` to show it. If it happens anyway,
 `sudo systemctl restart gitea caddy` puts the port forwards back.
 
-**Subnet agreement** — a mismatch here is what silently breaks fail2ban:
+**Subnet agreement** — a mismatch here is what silently breaks fail2ban. Gitea
+trusts Caddy's address alone, `.251` of the network's subnet:
 
 ```bash
 sudo podman network inspect gitea --format '{{range .Subnets}}{{.Subnet}}{{end}}'
-sudo grep REVERSE_PROXY_TRUSTED_PROXIES /etc/gitea/app.ini
+sudo podman inspect caddy --format '{{.NetworkSettings.Networks.gitea.IPAddress}}'
+sudo grep REVERSE_PROXY_TRUSTED_PROXIES /etc/gitea/app.ini   # that address, /32
 ```
 
 ### TLS / DNS-01
