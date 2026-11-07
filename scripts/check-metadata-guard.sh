@@ -24,7 +24,7 @@
 #     its own (IP=), which no rule names;
 #   - the forward chain's policy is accept, and nothing else in the ruleset
 #     touches the metadata server.
-# --static stops there; that part needs only bash, sed and grep, so
+# --static stops there; that part needs only bash, sed, grep and realpath, so
 # vm/ansible/tests/check runs it everywhere, deploys included.
 #
 # Then it loads the ruleset in a throwaway user and network namespace and
@@ -273,6 +273,12 @@ fi
 for f in "$ruleset" "$alloy_quadlet" "$gitea_quadlet" "$caddy_quadlet"; do
   [[ -f "$f" ]] || fail "need ${f}"
 done
+# Absolute, as the live part runs this file again inside the namespaces, and
+# that run starts with cd /.
+ruleset="$(realpath "$ruleset")"
+alloy_quadlet="$(realpath "$alloy_quadlet")"
+gitea_quadlet="$(realpath "$gitea_quadlet")"
+caddy_quadlet="$(realpath "$caddy_quadlet")"
 md="${metadata//./\\.}"
 # The ruleset's rules, comments and blank lines left out.
 rules="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$ruleset")"
@@ -290,7 +296,7 @@ grep -q '^Network=host$' "$alloy_quadlet" || fail "alloy.container isn't on the 
 # Gitea: a fixed address on the gitea network, the one the forward rule names.
 gitea_ip="$(sed -n 's/^IP=//p' "$gitea_quadlet")"
 [[ "$gitea_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "gitea.container has no fixed IP= (got '${gitea_ip}')"
-grep -q '^Network=gitea.network$' "$gitea_quadlet" || fail "gitea.container isn't on the gitea network"
+grep -qxF 'Network=gitea.network' "$gitea_quadlet" || fail "gitea.container isn't on the gitea network"
 gi="${gitea_ip//./\\.}"
 [[ "$(grep -cE "^\s*ip saddr ${gi} ip daddr ${md} .*\breject\b" <<<"$rules")" -eq 1 ]] \
   || fail "the ruleset should have one rule rejecting ${gitea_ip}, gitea.container's IP=, to the metadata server"
@@ -308,7 +314,7 @@ fi
 if grep -q '^Network=host$' "$caddy_quadlet"; then
   fail "caddy.container is on the host network: Caddy runs on the gitea network only"
 fi
-grep -q '^Network=gitea.network$' "$caddy_quadlet" || fail "caddy.container isn't on the gitea network"
+grep -qxF 'Network=gitea.network' "$caddy_quadlet" || fail "caddy.container isn't on the gitea network"
 caddy_ip="$(sed -n 's/^IP=//p' "$caddy_quadlet")"
 [[ "$caddy_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "caddy.container has no fixed IP= (got '${caddy_ip}')"
 [[ "$caddy_ip" != "$gitea_ip" ]] || fail "Caddy and Gitea have the same address, ${gitea_ip}"
