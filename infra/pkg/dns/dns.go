@@ -12,6 +12,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"gitea-infra/pkg/config"
+	"gitea-infra/pkg/iam"
 )
 
 type DNS struct {
@@ -19,14 +20,19 @@ type DNS struct {
 	Record *dns.RecordSet
 }
 
+// acmeRoleID is the custom role for DNS-01. A custom role's ID stays reserved
+// for 37 days after it is deleted, so never rename it casually.
+const acmeRoleID = "giteaAcmeDns01"
+
 // New looks up the existing managed zone, points an A record at the static
-// address, and grants the VM service account permission to write ACME challenge
-// records -- scoped to this one zone rather than the whole project.
+// address, and grants permission to write ACME challenge records -- scoped to
+// this one zone rather than the whole project -- to the VM service account,
+// which Caddy uses today, and to the Caddy DNS account it will move to.
 func New(
 	ctx *pulumi.Context,
 	cfg *config.Config,
 	addr *compute.Address,
-	vmServiceAccountEmail pulumi.StringOutput,
+	accounts *iam.Accounts,
 	deps []pulumi.Resource,
 ) (*DNS, error) {
 	zone, err := dns.LookupManagedZone(ctx, &dns.LookupManagedZoneArgs{
@@ -56,7 +62,7 @@ func New(
 	if _, err := dns.NewDnsManagedZoneIamMember(ctx, "gitea-vm-dns-admin", &dns.DnsManagedZoneIamMemberArgs{
 		ManagedZone: pulumi.String(zone.Name),
 		Role:        pulumi.String("roles/dns.admin"),
-		Member:      pulumi.Sprintf("serviceAccount:%s", vmServiceAccountEmail),
+		Member:      pulumi.Sprintf("serviceAccount:%s", accounts.VM.Email),
 	}, pulumi.DependsOn(deps)); err != nil {
 		return nil, err
 	}
@@ -70,7 +76,57 @@ func New(
 	if _, err := projects.NewIAMMember(ctx, "gitea-vm-dns-reader", &projects.IAMMemberArgs{
 		Project: pulumi.String(cfg.Project),
 		Role:    pulumi.String("roles/dns.reader"),
-		Member:  pulumi.Sprintf("serviceAccount:%s", vmServiceAccountEmail),
+		Member:  pulumi.Sprintf("serviceAccount:%s", accounts.VM.Email),
+	}, pulumi.DependsOn(deps)); err != nil {
+		return nil, err
+	}
+
+	// The same two grants for the Caddy DNS account (package iam), which Caddy
+	// does not use yet; gitea-vm@ keeps the two above until it does.
+	//
+	// First the project-level read, for the zone listing, as above. It is
+	// also the fresh account's first grant, and the role below waits for it:
+	// IAM can briefly report a new account as not found, and if that failed
+	// the deploy after the role was made, the rollback would soft-delete the
+	// role and its ID would be unusable from 7 to 37 days later.
+	reader, err := projects.NewIAMMember(ctx, "gitea-caddy-dns-reader", &projects.IAMMemberArgs{
+		Project: pulumi.String(cfg.Project),
+		Role:    pulumi.String("roles/dns.reader"),
+		Member:  pulumi.Sprintf("serviceAccount:%s", accounts.CaddyDNS.Email),
+	}, pulumi.DependsOn(deps))
+	if err != nil {
+		return nil, err
+	}
+
+	// Then the writes, through a custom role rather than roles/dns.admin: that
+	// also holds dns.managedZones.setIamPolicy (grant anyone anything on the
+	// zone), .update and .delete. These six are what the googleclouddns plugin
+	// calls to create, read and remove the _acme-challenge TXT records. They
+	// reach every record in the zone, as IAM cannot narrow them to one name,
+	// but not the zone itself or who may change it.
+	role, err := projects.NewIAMCustomRole(ctx, "gitea-acme-dns01", &projects.IAMCustomRoleArgs{
+		Project:     pulumi.String(cfg.Project),
+		RoleId:      pulumi.String(acmeRoleID),
+		Title:       pulumi.String("Gitea ACME DNS-01"),
+		Description: pulumi.String("Write ACME challenge records in the zone; no zone or IAM changes"),
+		Permissions: pulumi.ToStringArray([]string{
+			"dns.changes.create",
+			"dns.resourceRecordSets.create",
+			"dns.resourceRecordSets.delete",
+			"dns.resourceRecordSets.get",
+			"dns.resourceRecordSets.list",
+			"dns.resourceRecordSets.update",
+		}),
+	}, pulumi.DependsOn(deps), pulumi.DependsOn([]pulumi.Resource{reader}))
+	if err != nil {
+		return nil, err
+	}
+	// role.Name, not a name spelled out: the output makes the binding wait
+	// for the role.
+	if _, err := dns.NewDnsManagedZoneIamMember(ctx, "gitea-caddy-dns-acme", &dns.DnsManagedZoneIamMemberArgs{
+		ManagedZone: pulumi.String(zone.Name),
+		Role:        role.Name,
+		Member:      pulumi.Sprintf("serviceAccount:%s", accounts.CaddyDNS.Email),
 	}, pulumi.DependsOn(deps)); err != nil {
 		return nil, err
 	}
