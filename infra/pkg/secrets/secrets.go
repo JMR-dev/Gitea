@@ -17,9 +17,10 @@
 // require owning the resource.
 package secrets
 
-// Names are the Secret Manager secret ids. vm/bootstrap.sh maps each one to its
-// `gitea generate secret` argument by suffix, so renaming these means updating
-// fetch_or_create_secret too.
+// Names are the Secret Manager secret ids. scripts/bootstrap.sh generates each
+// one with its `gitea generate secret` argument, and gitea-render-secrets
+// (vm/ansible/roles/app/files) maps each to its app.ini key by suffix, so
+// renaming these means updating both. The VM only reads them (iam.GrantSecrets).
 var Names = []string{
 	"gitea-secret-key",
 	"gitea-internal-token",

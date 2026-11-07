@@ -27,6 +27,12 @@ var (
 	caddyMember = "serviceAccount:" + mockEmail("gitea-caddy-dns")
 )
 
+const (
+	secretIAMMember = "gcp:secretmanager/secretIamMember:SecretIamMember"
+	accessor        = "roles/secretmanager.secretAccessor"
+	versionAdder    = "roles/secretmanager.secretVersionAdder"
+)
+
 // registered is one resource as the program registered it.
 type registered struct {
 	typ    string
@@ -125,6 +131,47 @@ func everything(t *testing.T) (map[string]registered, *Accounts) {
 	return r.got, accounts
 }
 
+// --- gitea-vm@ and Gitea's secrets -------------------------------------------
+
+// gitea-vm@ reads each Gitea secret, one binding per secret: app.ini needs
+// all four.
+func TestGrantSecretsLetsTheVMReadEachSecret(t *testing.T) {
+	got, _ := everything(t)
+	for _, name := range secrets.Names {
+		g, ok := got["vm-read-"+name]
+		if !ok {
+			t.Errorf("no vm-read-%s: gitea-vm@ can't read %s", name, name)
+			continue
+		}
+		if g.typ != secretIAMMember || str(g.inputs, "secretId") != name ||
+			str(g.inputs, "role") != accessor || str(g.inputs, "member") != vmMember {
+			t.Errorf("vm-read-%s: %s %v, want a %s of %s on %s for %s",
+				name, g.typ, g.inputs, secretIAMMember, accessor, name, vmMember)
+		}
+	}
+}
+
+// No account can add a version to any secret: the next deploy would install
+// whatever is newest, and a new SECRET_KEY leaves everything Gitea encrypted
+// with the old one unreadable. scripts/bootstrap.sh makes them.
+func TestGrantSecretsGivesTheVMNoVersionAdder(t *testing.T) {
+	got, _ := everything(t)
+	if _, ok := got["vm-read-"+secrets.Names[0]]; !ok {
+		t.Fatalf("GrantSecrets registered no read grant either: %v", got)
+	}
+	for name, g := range got {
+		if str(g.inputs, "role") == versionAdder {
+			t.Errorf("%s (%s) grants %s %s on %s",
+				name, g.typ, str(g.inputs, "member"), versionAdder, str(g.inputs, "secretId"))
+		}
+		if strings.HasPrefix(name, "vm-add-") {
+			t.Errorf("%s is registered: gitea-vm@ needs no grant beyond reading the secret", name)
+		}
+	}
+}
+
+// --- the Caddy DNS account ---------------------------------------------------
+
 func TestCaddyDNSAccount(t *testing.T) {
 	got, accounts := everything(t)
 	if accounts.CaddyDNS == nil {
@@ -203,14 +250,15 @@ func TestCaddyDNSAccountGetsNothingHere(t *testing.T) {
 			}
 		}
 	}
-	// Proof the loop above saw the secret grants it is checking.
-	if want := 2*len(secrets.Names) + 2; secretGrants != want {
+	// Proof the loop above saw the secret grants it is checking: gitea-vm@'s
+	// read grant on each Gitea secret, the ACME email and the runner token.
+	if want := len(secrets.Names) + 2; secretGrants != want {
 		t.Errorf("%d secret grants, want %d", secretGrants, want)
 	}
 }
 
-// gitea-vm@ keeps every role it had. The Caddy account is an addition here, not
-// a replacement.
+// gitea-vm@ keeps every project role it had. The Caddy account is an addition
+// here, not a replacement.
 func TestVMAccountUnchanged(t *testing.T) {
 	got, _ := everything(t)
 	if id := str(got["gitea-vm-sa"].inputs, "accountId"); id != "gitea-vm" {
