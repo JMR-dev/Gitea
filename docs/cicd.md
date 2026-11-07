@@ -18,6 +18,7 @@ Cloud Scheduler (Sun 04:00 UTC) ---------------------------> Pub/Sub ci-rebuild
                               gcloud builds submit cloudbuild/infra.yaml, then image.yaml
 cloud-builds topic --push, OIDC--> build-status fn (private) --> Gitea commit status
 rollback / failure log lines --> log-match alerts --> e-mail to the operator
+uptime check gitea-https (Gitea's certificate, from outside) --> threshold alert --> e-mail
 ```
 
 | Piece | Where |
@@ -204,7 +205,13 @@ This rollback is a re-apply, not an undo:
 **Alerts** go to the operator by e-mail (`cicd/pkg/alerting`):
 - an automatic rollback;
 - a failed rollback (critical);
-- any failed pipeline build.
+- any failed pipeline build;
+- Gitea's TLS certificate not renewing, or Gitea unreachable from outside
+  (critical). The uptime check `gitea-https` reads the certificate's days left
+  from Google's checkers every 15 min; the alert fires below
+  `gitea-cicd:certAlertDays` (default 18) days, or after an hour with no
+  reading, and e-mails again daily while open. What to do, why 18 and the
+  drill: [runbook.md](runbook.md), "When the certificate alert fires".
 
 ## The release gate
 

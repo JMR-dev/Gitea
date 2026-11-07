@@ -307,4 +307,6 @@ keep:g28 2026/11/06 14:07:01 modules/ssh/ssh.go:227:publicKeyHandler() [W] Inval
 keep:g29 2026/11/06 14:07:02 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username fake USER729 [uid: 0, name: x] - must use git for all git operations via ssh
 keep:g30 2026/11/06 14:07:03 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username fakeUSER730 - must use root for all git operations via ssh - must use git for all git operations via ssh
 keep:g31 2026/11/06 14:07:04 modules/ssh/ssh.go:227:publicKeyHandler() [W] Invalid SSH username correct horse fakeLEAK731 battery - must use git for all git operations via ssh
+keep:t01 gitea-caddy-dns-token: minted a token for gitea-caddy-dns@example-project.iam.gserviceaccount.com; Caddy is told it lasts 1500 s
+keep:t02 gitea-caddy-dns-token: kept the token minted 12 min ago: 48 min of its 60 left
 same:59 2026-10-26 03:12:45 mimir ingester ring healthy, 150000 series

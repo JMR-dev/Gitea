@@ -54,7 +54,8 @@ func main() {
 		if err := schedule.New(ctx, cfg, rl.Topics[relay.TopicRebuild], apis); err != nil {
 			return err
 		}
-		if err := alerting.New(ctx, cfg, apis); err != nil {
+		certCheckID, err := alerting.New(ctx, cfg, apis)
+		if err != nil {
 			return err
 		}
 		// Nothing unless gitea-cicd:watchtowerReader is set.
@@ -71,6 +72,9 @@ func main() {
 		// infra/ needs this in gitea:opsLaunchers before CI can launch a release.
 		ctx.Export("imageServiceAccount", acc.Image.Email)
 		ctx.Export("infraServiceAccount", acc.Infra.Email)
+		// The uptime check behind the certificate alert: its metrics carry this
+		// as check_id (docs/runbook.md, "Drilling the certificate alert").
+		ctx.Export("certCheckId", certCheckID)
 		return nil
 	})
 }

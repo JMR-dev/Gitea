@@ -53,3 +53,36 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestCertAlertDaysDefault(t *testing.T) {
+	if got, err := certAlertDays(""); err != nil || got != 18 {
+		t.Fatalf("unset: got %d, %v; want 18", got, err)
+	}
+}
+
+func TestCertAlertDaysRejects(t *testing.T) {
+	for _, raw := range []string{"0", "-1", "366", "1.5", "18.0", "abc", "18d", " 18", "1e2"} {
+		if got, err := certAlertDays(raw); err == nil || !strings.Contains(err.Error(), "gitea-cicd:certAlertDays") {
+			t.Errorf("%q: got %d, %v; want an error naming gitea-cicd:certAlertDays", raw, got, err)
+		}
+	}
+}
+
+func TestCertAlertDaysAccepts(t *testing.T) {
+	for raw, want := range map[string]int{"1": 1, "18": 18, "120": 120, "365": 365} {
+		if got, err := certAlertDays(raw); err != nil || got != want {
+			t.Errorf("%q: got %d, %v; want %d", raw, got, err, want)
+		}
+	}
+}
+
+// A threshold above the days a healthy certificate ever has left fires
+// whatever Caddy does: that is a drill, and `pulumi up` says so.
+func TestCertAlertIsDrill(t *testing.T) {
+	if !CertAlertIsDrill(120) {
+		t.Error("120 days is a drill value")
+	}
+	if CertAlertIsDrill(18) {
+		t.Error("18 days (the default) is not a drill value")
+	}
+}

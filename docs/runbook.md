@@ -71,6 +71,88 @@ occasionally, but Let's Encrypt allows 5 duplicate certificates per week, so
 several replacements in a few days can lock issuance out until the window
 rolls over.
 
+#### When the certificate alert fires
+
+"Gitea: TLS certificate not renewing, or unreachable from outside" (critical)
+comes from the CI project (`cicd/pkg/alerting`). Its uptime check,
+`gitea-https`, fetches `https://gitea.jasonmross.dev/api/healthz` every 15 min
+from Google's checkers, validating the certificate, and records the days the
+certificate has left. The alert fires on either of two things, and e-mails
+again every day while it is open:
+
+1. **Unreachable from outside: act within minutes.** No checker has had a
+   reading for an hour: the VM, Caddy or Gitea is down, the way in from the
+   internet is, or the check was deleted. From outside Google,
+   `curl -sv https://gitea.jasonmross.dev/api/healthz`: if that fails, it is
+   this one. Then `make status` and `make logs`. The check itself:
+   `gcloud monitoring uptime list-configs --project gitea-ci-781388`.
+2. **Not renewing: fewer than `gitea-cicd:certAlertDays` days left** (default
+   18). Caddy renews when a third of the certificate's lifetime is left and
+   retries from then on, so by now it has been failing for days, and the site
+   goes down when the certificate expires. First checks, on the VM (`make ssh`):
+
+   ```bash
+   systemctl status gitea-caddy-dns-token.timer gitea-caddy-dns-token.service
+   sudo journalctl -u gitea-caddy-dns-token --since -2d   # the DNS-01 token minter
+   sudo journalctl CONTAINER_NAME=caddy | grep -E '"logger":"tls\.(obtain|renew)"'
+   sudo gitea-caddy-dns-token --check   # 0 works; 1 definite, saying what; 2 transient
+   ```
+
+   Then, from a checkout, `make acme-staging-check`: a certificate end to end
+   against Let's Encrypt's staging CA. *Caddy cannot get a certificate*, below,
+   has the rest.
+
+**Why 18 days.** Caddy (certmagic) renews when a third of the lifetime is
+left. Let's Encrypt issues 64-day certificates from 2027-02-10, so renewal
+starts at about 21.3 days left: 18 leaves Caddy at least 3 days of retries
+before the e-mail, and you 18 days to fix it. **Before 2028-02-16**, when
+Let's Encrypt moves to 45-day certificates (renewal from 15 days left), the
+default must drop to about 10: set `CertLifetimeDays` in `cicd/pkg/config` to
+45, and `TestDefaultThresholdLeavesCaddyItsRetries` fails until
+`DefaultCertAlertDays` follows.
+
+**On watchtower,** the same lines ship scrubbed, and a rule must match what
+ships. The minter's success line comes out as
+`gitea-caddy-dns-token: [REDACTED-SECRET] a token for [REDACTED-EMAIL]; Caddy is told it lasts 1500 s`:
+the key=value rule reads `gitea-caddy-dns-token:` as a key ending in "token"
+and takes the word after it, and the email rule takes the account. So match
+`Caddy is told it lasts`, never `minted`. A failed mint's line loses its first
+word the same way:
+`gitea-caddy-dns-token: [REDACTED-SECRET] the token minted 12 min ago: 48 min of its 60 left`.
+Caddy's `tls.renew` / `tls.obtain` JSON ships whole. `scripts/testdata/scrub.expect`
+pins all three (`keep:t01`, `keep:t02`, `keep:c16`), so a scrub change that
+alters them fails `make check`.
+
+#### Drilling the certificate alert
+
+A threshold above the days the certificate has left fires on purpose. Pulumi
+warns "drill value: this alert will fire" for anything above 21. From the
+repo root:
+
+```bash
+(cd cicd && pulumi config set gitea-cicd:certAlertDays 120) && make ci-up
+```
+
+Expect the e-mail within about 65–95 minutes: the next reading (15 min at
+most), then an hour below the threshold, in half-hour alignment windows. Then
+put it back, and make sure the drill value is never committed:
+
+```bash
+(cd cicd && pulumi config rm gitea-cicd:certAlertDays) && make ci-up
+git checkout cicd/Pulumi.prod.yaml
+```
+
+The incident closes once a reading is back above 18. Meanwhile
+`cd cicd && pulumi stack output certCheckId` is the check's ID, and Metrics
+Explorer, on `monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires`
+filtered to that `check_id`, shows the days left.
+
+Drill log:
+
+| Date | certAlertDays | Days left | E-mail after | Result |
+|---|---|---|---|---|
+| _not yet run_ | | | | |
+
 ### fail2ban — drill it, do not trust the status output
 
 Two jails read Gitea's log, through the two modes of `vm/fail2ban/filter.d/gitea.conf`:
