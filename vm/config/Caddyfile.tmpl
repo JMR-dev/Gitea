@@ -12,6 +12,11 @@
 	# HTTP request metrics for every site. They are served only by the :2020
 	# site below.
 	metrics
+	# How long a stop waits for open connections. Without it Caddy waits
+	# forever, for idle HTTP/3 ones among them, and podman SIGKILLs it at the
+	# quadlet's StopTimeout. Must stay below StopTimeout (caddy.container);
+	# tests/check enforces it.
+	grace_period 5s
 	# Required by coraza-caddy: Caddy has no built-in ordering for a third-party
 	# directive, and the WAF must run before anything that could act on the
 	# request. Applies inside handle blocks too.
