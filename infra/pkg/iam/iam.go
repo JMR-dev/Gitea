@@ -147,6 +147,12 @@ func GrantRegistry(ctx *pulumi.Context, cfg *config.Config, a *Accounts, repo *a
 // GrantSecrets gives the VM read access to each Gitea secret individually --
 // not roles/secretmanager.secretAccessor across the project.
 //
+// Read only: the VM cannot add a version. scripts/bootstrap.sh makes these,
+// and the next deploy installs whatever version is newest, so a version the
+// VM added would replace them -- and a new SECRET_KEY leaves everything Gitea
+// encrypted with the old one unreadable. A missing one fails the app.ini
+// render instead (vm/ansible/roles/app/files/gitea-render-secrets).
+//
 // Takes ids rather than resources because the secrets are created by
 // scripts/bootstrap.sh, not by Pulumi; see package secrets for why.
 func GrantSecrets(ctx *pulumi.Context, cfg *config.Config, a *Accounts, names []string) error {
@@ -154,22 +160,12 @@ func GrantSecrets(ctx *pulumi.Context, cfg *config.Config, a *Accounts, names []
 		if err := GrantSecretRead(ctx, cfg, a, name); err != nil {
 			return err
 		}
-		// vm/bootstrap.sh's safety net adds a version if one is somehow missing.
-		if _, err := secretmanager.NewSecretIamMember(ctx, "vm-add-"+name, &secretmanager.SecretIamMemberArgs{
-			Project:  pulumi.String(cfg.Project),
-			SecretId: pulumi.String(name),
-			Role:     pulumi.String("roles/secretmanager.secretVersionAdder"),
-			Member:   pulumi.Sprintf("serviceAccount:%s", a.VM.Email),
-		}); err != nil {
-			return err
-		}
 	}
 	return nil
 }
 
-// GrantSecretRead gives the VM read-only access to one secret. On its own it is
-// for operator-supplied values the VM must never write; GrantSecrets adds
-// version-adder on top for the ones it may generate.
+// GrantSecretRead gives the VM read-only access to one secret. The VM writes
+// to none of its secrets.
 func GrantSecretRead(ctx *pulumi.Context, cfg *config.Config, a *Accounts, name string) error {
 	_, err := secretmanager.NewSecretIamMember(ctx, "vm-read-"+name, &secretmanager.SecretIamMemberArgs{
 		Project:  pulumi.String(cfg.Project),

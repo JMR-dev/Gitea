@@ -59,10 +59,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install shellcheck, bats and ripgrep
-        # ripgrep: the bats fakes (infra/pkg/runner/bats/fakes) use rg.
+      - name: Install shellcheck, bats, ripgrep and envsubst
+        # ripgrep: the bats fakes (infra/pkg/runner/bats/fakes) and tests use
+        # rg. gettext-base: envsubst, which gitea-render-secrets renders
+        # app.ini with in its bats tests (vm/ansible/roles/app/files/bats).
         run: |
           apt=(apt-get); [[ $(id -u) -eq 0 ]] || apt=(sudo apt-get)
           "${apt[@]}" update -qq
-          "${apt[@]}" install -y -qq --no-install-recommends shellcheck bats ripgrep
+          "${apt[@]}" install -y -qq --no-install-recommends shellcheck bats ripgrep gettext-base
       - run: make scripts-check

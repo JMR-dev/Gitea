@@ -137,7 +137,8 @@ for name in "${!GITEA_SECRETS[@]}"; do
     fi
     if [[ -z "${runner}" ]]; then
         echo "    WARNING: no podman/docker available; cannot generate ${name}." >&2
-        echo "             Install one and re-run, or the VM will skip rendering app.ini." >&2
+        echo "             Install one and re-run this: the VM never generates it, so until" >&2
+        echo "             it has a version every deploy fails at app.ini." >&2
         continue
     fi
     log "generating ${name}"
