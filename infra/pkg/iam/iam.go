@@ -24,6 +24,10 @@ type Accounts struct {
 	// Image builds and pushes container images, then triggers the rollout over
 	// an IAP tunnel.
 	Image *serviceaccount.Account
+	// CaddyDNS is Caddy's ACME DNS-01 identity and nothing else: package dns
+	// grants it the challenge records in the one zone. It has no key; gitea-vm@
+	// mints its short-lived tokens. Caddy does not use it yet.
+	CaddyDNS *serviceaccount.Account
 }
 
 func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (*Accounts, error) {
@@ -42,6 +46,19 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (*Acco
 		AccountId:   pulumi.String("cb-image"),
 		DisplayName: pulumi.String("Cloud Build: images"),
 		Description: pulumi.String("Builds and pushes container images, then rolls them out"),
+	}, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Kept apart from gitea-vm@, which also reads Gitea's secrets, so a stolen
+	// Caddy token can change records in the one zone and nothing more: no
+	// secret, no IAM, not the zone itself. It gets no key: a timer on the VM
+	// mints its tokens as gitea-vm@ (below), and they expire within the hour.
+	caddyDNS, err := serviceaccount.NewAccount(ctx, "gitea-caddy-dns-sa", &serviceaccount.AccountArgs{
+		AccountId:   pulumi.String("gitea-caddy-dns"),
+		DisplayName: pulumi.String("Caddy ACME DNS-01"),
+		Description: pulumi.String("Caddy's ACME DNS-01 identity: challenge records in the Gitea zone, nothing else"),
 	}, opts)
 	if err != nil {
 		return nil, err
@@ -91,7 +108,18 @@ func New(ctx *pulumi.Context, cfg *config.Config, deps []pulumi.Resource) (*Acco
 		return nil, err
 	}
 
-	return &Accounts{VM: vm, Image: img}, nil
+	// The Caddy account's only member: gitea-vm@ may mint its access tokens,
+	// which a host timer hands to Caddy. Anyone added here could write DNS
+	// records.
+	if _, err := serviceaccount.NewIAMMember(ctx, "vm-mints-caddy-dns", &serviceaccount.IAMMemberArgs{
+		ServiceAccountId: caddyDNS.Name,
+		Role:             pulumi.String("roles/iam.serviceAccountTokenCreator"),
+		Member:           pulumi.Sprintf("serviceAccount:%s", vm.Email),
+	}, opts); err != nil {
+		return nil, err
+	}
+
+	return &Accounts{VM: vm, Image: img, CaddyDNS: caddyDNS}, nil
 }
 
 // GrantRegistry scopes image pull/push to the one repository rather than

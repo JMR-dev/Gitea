@@ -54,7 +54,7 @@ check: ci-check infra-check scripts-check ansible-check check-metadata-guard wor
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
 .PHONY: infra-check
 infra-check: ## Build, vet and test the app's Pulumi program (infra/)
-	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/runner ./pkg/telemetry
+	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/dns ./pkg/iam ./pkg/runner ./pkg/telemetry
 
 # shellcheck and bats are both required: a PR runs this stage as a status
 # check, so a missing tool must fail it, not skip it.
