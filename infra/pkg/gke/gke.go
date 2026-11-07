@@ -155,6 +155,30 @@ func New(ctx *pulumi.Context, cfg *config.Config, net *network.Network, deps []p
 		SecretManagerConfig: &container.ClusterSecretManagerConfigArgs{Enabled: pulumi.Bool(true)},
 		EnableShieldedNodes: pulumi.Bool(true),
 
+		// Only GKE's free system metrics, the kubernetes.io/* ones. GKE's
+		// defaults add Managed Prometheus and its packages (kube-state-metrics,
+		// cAdvisor, Kubelet, DCGM and the rest), which bill per sample: about
+		// $14.58/month in November 2026, growing with CI pod churn, and nothing
+		// reads them. Watchtower's GCP pull reads only kubernetes.io/*.
+		//
+		// The two settings change together: kube-state-metrics needs managed
+		// collection, so managed collection can only go off with it.
+		//
+		// The revert trap: monitoringConfig is Optional+Computed. Deleting these
+		// lines doesn't bring GKE's defaults back -- the provider just keeps
+		// whatever the cluster has -- and neither does a rollback to the last
+		// good commit. Turning any of it back on means setting the packages and
+		// managedPrometheus.enabled here, explicitly.
+		//
+		// LoggingConfig stays unset, at GKE's default of SYSTEM_COMPONENTS and
+		// WORKLOADS: package telemetry's sink needs both.
+		MonitoringConfig: &container.ClusterMonitoringConfigArgs{
+			EnableComponents: pulumi.ToStringArray([]string{"SYSTEM_COMPONENTS"}),
+			ManagedPrometheus: &container.ClusterMonitoringConfigManagedPrometheusArgs{
+				Enabled: pulumi.Bool(false),
+			},
+		},
+
 		// Private nodes: no external IPs, all egress through the NAT in
 		// package network. EnablePrivateEndpoint is not a choice here: with IP
 		// endpoints disabled below, the provider reads it back as true, so
