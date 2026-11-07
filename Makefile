@@ -30,12 +30,18 @@ fmt: ## Format Go sources
 
 # -o gitea-infra: Pulumi.yaml points the go runtime at this prebuilt binary, so
 #   Pulumi runs it rather than compiling. Without it preview/up fail outright.
-# Shell that runs on the VM (shipped by the playbook) or for it, and the
-# telemetry checks' own.
+# Shell that runs on the VM (shipped by the playbook) or for it, the
+# telemetry checks' own, and the DinD runner container's (infra/pkg/runner).
 SHELL_SCRIPTS = scripts/bootstrap.sh scripts/ops/ansible/files/gitea-ops-lib.sh scripts/rehearsal.sh \
 	vm/ansible/roles/app/files/gitea-render-secrets vm/ansible/roles/helpers/files/gitea-ar-auth \
 	vm/ansible/roles/helpers/files/gitea-reboot-if-needed vm/ansible/roles/tunnel/files/gitea-watchtower-peer \
-	scripts/check-alloy-scrub.sh scripts/check-peer-config.sh scripts/check-metadata-guard.sh
+	scripts/check-alloy-scrub.sh scripts/check-peer-config.sh scripts/check-metadata-guard.sh \
+	infra/pkg/runner/start.sh infra/pkg/runner/image-prune.sh \
+	infra/pkg/runner/bats/fakes/docker infra/pkg/runner/bats/fakes/df
+# Bats tests for the shell above that has them. Shellchecked too; `bash -n`
+# can't parse their @test blocks.
+BATS_DIRS  = infra/pkg/runner/bats
+BATS_FILES = $(wildcard $(addsuffix /*.bats,$(BATS_DIRS)))
 .PHONY: check
 check: ci-check ansible-check check-metadata-guard ## Build and vet both Pulumi programs and the relay, test them, and check the scripts and the playbook
 	cd infra && go build -o gitea-infra . && go vet ./... && go test ./pkg/config ./pkg/runner ./pkg/telemetry
@@ -44,8 +50,10 @@ check: ci-check ansible-check check-metadata-guard ## Build and vet both Pulumi 
 	python3 -m py_compile scripts/ops/gitea_ops.py scripts/ops/launch_job.py
 	@# if/else, not `a && b || c`: that reports "not installed" and exits 0 when
 	@# shellcheck runs and finds something, so the check could never fail.
-	@if command -v shellcheck >/dev/null; then shellcheck -S warning $(SHELL_SCRIPTS); \
+	@if command -v shellcheck >/dev/null; then shellcheck -S warning $(SHELL_SCRIPTS) $(BATS_FILES); \
 	else echo "shellcheck not installed -- skipped"; fi
+	@# Required, unlike shellcheck: these are the scripts' tests, not a lint.
+	bats $(BATS_DIRS)
 
 # The checks a PR preview and a deploy run on vm/ansible (infra_deploy.py's
 # ansible_checks), with the pinned ansible-core: no nftables restart/reload,

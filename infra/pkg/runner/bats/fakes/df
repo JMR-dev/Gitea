@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# A fake `df -Pk <path>` for image-prune.bats: reports $FAKE/free KiB available,
+# in df's POSIX format, whatever the path.
+
+set -uo pipefail
+
+: "${FAKE:?the fake df needs FAKE}"
+
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 20000000 0 $(cat "$FAKE/free") 0% /fake"
