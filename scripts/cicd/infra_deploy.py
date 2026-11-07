@@ -43,11 +43,13 @@ Everything comes from the environment Cloud Build maps its substitutions into;
 see cloudbuild/infra.yaml.
 """
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -134,6 +136,32 @@ LOCK_GRACE = 60
 CLOUD_BUILD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 GCP_REGION = re.compile(r"[a-z]+-[a-z]+[0-9]+")  # as cicd/pkg/config
 GO_CACHE_PREFIX = "infra-go-cache-"
+GO_CACHE_EXT = ".tar.zst"
+GO_CACHE_SALT = b"plugins-2+zstd"  # part of every object's name: a new format never reads an old one
+GO_CACHE_ZSTD_LEVEL = 3
+GO_CACHE_KEEP = 2  # zstd objects a save leaves: its own and the newest other
+# The deploy image has no zstd binary and its python3 (3.13) has no
+# compression.zstd, but the Cloud SDK's bundled Python (3.14) has, wherever
+# the SDK sits (as ensure_auth_plugin_on_path). Not a TOOLS download: a cache
+# must never fail the deploy, and fetch_tools fails it when a download does.
+ZSTD_PYTHONS = tuple(f"{d}/google-cloud-sdk/platform/bundledpythonunix/bin/python3" for d in ("/usr/lib", "/usr/lib64"))
+# The cache's compressor, run as `<python> -I -c ZSTD_FILTER pack OUT LEVEL`
+# (a tar on stdin) or `... unpack IN` (the tar to stdout). Inline, so the
+# release code stays the files release_gate.py hashes. Every core packs, and
+# the frame checksum makes a truncated or corrupt object fail its unpack.
+ZSTD_FILTER = """\
+import os, shutil, sys
+from compression import zstd
+P = zstd.CompressionParameter
+how, path = sys.argv[1:3]
+if how == "pack":
+    opts = {P.compression_level: int(sys.argv[3]), P.nb_workers: os.cpu_count() or 1, P.checksum_flag: 1}
+    with zstd.open(path, "wb", options=opts) as f:
+        shutil.copyfileobj(sys.stdin.buffer, f, 8 << 20)
+else:
+    with zstd.open(path, "rb") as f:
+        shutil.copyfileobj(f, sys.stdout.buffer, 8 << 20)
+"""
 SSH_KEY_TTL = "1h"  # as scripts/ops/gitea_ops.py: the sync's OS Login key
 ANSIBLE_DIR = os.path.join("vm", "ansible")
 PROD_VM = "gitea-vm"  # vm-apply refuses it without --approved
@@ -196,6 +224,17 @@ def log(msg):
     print(f"==> {msg}", flush=True)
 
 
+def remove_tree(path):
+    """rm -rf path, never raising. Go leaves its module cache read-only, and
+    only root can remove entries from a read-only directory, so each
+    directory is made writable first."""
+    for d, dirs, _ in os.walk(path):
+        for sub in dirs:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(d, sub), 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 class Failed(Exception):
     pass
 
@@ -213,6 +252,24 @@ def run(cmd, *, cwd=ROOT, check=True, capture=False, stdin=None, env=None):
         raise Failed(f"{cmd[0]} {' '.join(cmd[1:3])} exited {r.returncode}"
                      + (f": {r.stderr.strip()[-800:]}" if capture and r.stderr else ""))
     return r
+
+
+def pipe(first, second, *, show, cwd=ROOT):
+    """first | second, without a shell: True only when both exit 0. Logs
+    `show` rather than the commands, since one can be a whole program
+    (ZSTD_FILTER)."""
+    log("$ " + show)
+    with subprocess.Popen(first, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE) as producer:
+        try:
+            consumer = subprocess.Popen(second, cwd=cwd, stdin=producer.stdout)
+        except BaseException:
+            producer.kill()
+            raise
+        # The consumer holds the pipe now: should it exit early, the producer
+        # gets SIGPIPE rather than blocking on a full pipe.
+        producer.stdout.close()
+        consumer_rc = consumer.wait()
+    return producer.returncode == 0 and consumer_rc == 0
 
 
 def destructive_steps(preview):
@@ -253,20 +310,53 @@ def go_cache_name(go_mod, go_sum, go_version):
     compile cache records no paths and still hits after being restored under a
     different temp dir; without it every cache key named the random dir, and
     nothing ever hit."""
-    h = hashlib.sha256(b"plugins-2\0" + go_version.encode())
+    h = hashlib.sha256(GO_CACHE_SALT + b"\0" + go_version.encode())
     for part in (json.dumps(TOOLS, sort_keys=True).encode(), go_mod, go_sum):
         h.update(b"\0" + part)
-    return f"{GO_CACHE_PREFIX}{h.hexdigest()[:16]}.tar"
+    return f"{GO_CACHE_PREFIX}{h.hexdigest()[:16]}{GO_CACHE_EXT}"
+
+
+def cache_objects(ls_long):
+    """The (time, gs:// URL) of each object in `gcloud storage ls -l` output."""
+    out = []
+    for line in ls_long.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2].startswith("gs://"):
+            out.append((parts[1], parts[2]))
+    return out
 
 
 def newest_object(ls_long):
     """The newest gs:// URL in `gcloud storage ls -l` output, or None."""
-    best = None
-    for line in ls_long.splitlines():
-        parts = line.split()
-        if len(parts) == 3 and parts[2].startswith("gs://") and (best is None or parts[1] > best[0]):
-            best = (parts[1], parts[2])
-    return best[1] if best else None
+    objects = cache_objects(ls_long)
+    return max(objects, key=lambda o: o[0])[1] if objects else None
+
+
+def stale_cache_objects(ls_long, saved_url, keep=GO_CACHE_KEEP):
+    """The objects in `gcloud storage ls -l` output that a save of saved_url
+    leaves behind, newest first: every other one in its bucket named as
+    go_cache_name names them, but the newest keep-1. Never saved_url, and
+    never a .tar or .tar.gz one, which the bucket's 30-day rule retires."""
+    bucket = saved_url[len("gs://"):].split("/", 1)[0]
+    ours = re.compile(re.escape(f"gs://{bucket}/{GO_CACHE_PREFIX}") + "[0-9a-f]{16}" + re.escape(GO_CACHE_EXT))
+    others = sorted(((t, u) for t, u in cache_objects(ls_long) if u != saved_url and ours.fullmatch(u)),
+                    reverse=True)
+    return [u for _, u in others[max(keep - 1, 0):]]
+
+
+def tree_size(*paths):
+    """Bytes in the files under paths, links not followed."""
+    total = 0
+    for path in paths:
+        for d, _, files in os.walk(path):
+            for f in files:
+                with contextlib.suppress(OSError):
+                    total += os.lstat(os.path.join(d, f)).st_size
+    return total
+
+
+def size_text(n):
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
 
 
 class Deploy:
@@ -281,6 +371,7 @@ class Deploy:
         self.go_cache = None         # this go.sum's cache object, once restore has run
         self.go_cache_hit = False    # restored exactly that object
         self.go_cache_saved = False
+        self.zstd_py = None          # the Python ZSTD_FILTER runs on, once probed ("" for none)
         self.ops_warm = None         # (kube, pod path) while the warm-up pod exists
         self.ssh_pruned = False
 
@@ -301,11 +392,17 @@ class Deploy:
         # Best-effort: a missing, broken or unreadable cache just means a cold
         # build, never a failed deploy. -trimpath is what lets the compile cache
         # hit at all, since the directory differs every run (go_cache_name).
-        self.use_cache_dirs()
+        # The restore comes first: it moves a whole unpacked tree into place,
+        # and use_cache_dirs then adds any dir that tree lacks.
         self.restore_go_cache(infra)
+        self.use_cache_dirs()
         run(["go", "build", "-trimpath", "-o", "gitea-infra", "."], cwd=infra)
-        run(["pulumi", "login", f"gs://{self.a.app_project}-pulumi-state"], cwd=infra)
+        run(["pulumi", "login", self.pulumi_backend()], cwd=infra)
         return infra
+
+    def pulumi_backend(self):
+        """The app stack's state bucket (Pulumi's diy backend)."""
+        return f"gs://{self.a.app_project}-pulumi-state"
 
     # --- Go build cache (best-effort; a cache error never fails the deploy) ---
 
@@ -326,6 +423,25 @@ class Deploy:
     def go_cache_dir(self):
         return os.path.join(self.tmp, "gocache")
 
+    def zstd_python(self):
+        """The Python that runs ZSTD_FILTER: this one if it has
+        compression.zstd, else the first of ZSTD_PYTHONS that has. Probed
+        once a run. None, with a WARNING, if none has it: the cache is then
+        neither restored nor saved, so every build is cold."""
+        if self.zstd_py is None:
+            self.zstd_py = ""
+            for py in (sys.executable, *ZSTD_PYTHONS):
+                try:
+                    if py and run([py, "-I", "-c", "import compression.zstd"], check=False, capture=True).returncode == 0:
+                        self.zstd_py = py
+                        break
+                except OSError:  # not on this image
+                    continue
+            if not self.zstd_py:
+                log("WARNING: go cache: no Python here has compression.zstd (the deploy image's Cloud SDK "
+                    f"dropped its bundled Python? {ZSTD_PYTHONS[0]}); building without the cache")
+        return self.zstd_py or None
+
     def use_cache_dirs(self):
         """Point Go and Pulumi at the cache dir, for this whole process: Pulumi's
         Go language host reads the module cache too, to find which plugins the
@@ -336,65 +452,114 @@ class Deploy:
             os.makedirs(os.environ[var], exist_ok=True)
 
     def restore_go_cache(self, infra):
+        """Unpack this go.sum's object, or else the newest one, into a staging
+        dir, and move that into place only once all of it has unpacked: a
+        failure anywhere leaves no cache at all (a cold build), never part of
+        one."""
         if self.go_cache is not None:  # once per run
             return
         self.go_cache = ""
         bucket = self.cache_bucket()
         if not bucket:
             return
+        stage = os.path.join(self.tmp, "gocache-restore")
+        zst = os.path.join(self.tmp, "go-cache-in" + GO_CACHE_EXT)
+        restored = False
         try:
+            py = self.zstd_python()
+            if not py:
+                log("go cache: nothing here can unpack it (cold build)")
+                return
             # GOTOOLCHAIN=local: the image's Go, without downloading the one
             # go.mod may ask for (that download belongs in the cache dir).
             gov = run(["go", "env", "GOVERSION"], cwd=infra, check=False, capture=True,
-                      env=dict(os.environ, GOTOOLCHAIN="local")).stdout.strip()
+                      env=dict(os.environ, GOTOOLCHAIN="local"))
+            if gov.returncode != 0 or not gov.stdout.strip():
+                log("go cache: no Go version to key it on (cold build)")
+                return
             with open(os.path.join(infra, "go.mod"), "rb") as fm, open(os.path.join(infra, "go.sum"), "rb") as fs:
-                self.go_cache = go_cache_name(fm.read(), fs.read(), gov)
+                self.go_cache = go_cache_name(fm.read(), fs.read(), gov.stdout.strip())
             exact = f"gs://{bucket}/{self.go_cache}"
             if run(["gcloud", "storage", "ls", exact], check=False, capture=True).returncode == 0:
                 src, self.go_cache_hit = exact, True
             else:
                 # None for this go.sum yet (a dependency bump): start from the
                 # newest one, which still holds every module that did not change.
-                ls = run(["gcloud", "storage", "ls", "-l", f"gs://{bucket}/{GO_CACHE_PREFIX}*.tar"],
+                ls = run(["gcloud", "storage", "ls", "-l", f"gs://{bucket}/{GO_CACHE_PREFIX}*{GO_CACHE_EXT}"],
                          check=False, capture=True)
                 src = newest_object(ls.stdout) if ls.returncode == 0 else None
             if not src:
                 log("go cache: nothing to restore (cold build)")
                 return
-            tar = os.path.join(self.tmp, "go-cache-in.tar")
-            if run(["gcloud", "storage", "cp", src, tar], check=False, capture=True).returncode != 0 \
-                    or run(["tar", "-xf", tar, "-C", self.go_cache_dir()], check=False).returncode != 0:
-                self.go_cache_hit = False
-                log("go cache: restore failed (cold build)")
+            start = time.monotonic()
+            if run(["gcloud", "storage", "cp", src, zst], check=False, capture=True).returncode != 0:
+                log(f"go cache: could not download {src} (cold build)")
                 return
-            os.remove(tar)
-            log(f"go cache: restored ({'exact' if self.go_cache_hit else 'partial'}) from {src}")
+            fetched = time.monotonic()
+            os.makedirs(stage)
+            if not pipe([py, "-I", "-c", ZSTD_FILTER, "unpack", zst], ["tar", "-xf", "-", "-C", stage],
+                        show=f"unpack {zst} (zstd) | tar -xf - -C {stage}"):
+                log(f"go cache: could not unpack {src} (cold build)")
+                return
+            os.rename(stage, self.go_cache_dir())
+            restored, done = True, time.monotonic()
+            log(f"go cache: restored ({'exact' if self.go_cache_hit else 'partial'}) "
+                f"{size_text(tree_size(self.go_cache_dir()))} from {src} ({size_text(os.path.getsize(zst))} packed) "
+                f"in {done - start:.0f} s (download {fetched - start:.0f} s, unpack {done - fetched:.0f} s)")
         except Exception as e:  # caching must never fail the deploy
-            self.go_cache_hit = False
-            log(f"go cache: restore skipped ({e!r})")
+            log(f"go cache: restore failed ({e!r}) (cold build)")
+        finally:
+            if not restored:
+                self.go_cache_hit = False
+                remove_tree(stage)
+            with contextlib.suppress(OSError):
+                os.remove(zst)
 
     def save_go_cache(self):
         # Only a deploy writes it (a preview's account can only read), at most
         # once a run, and only when this go.sum had no object of its own: after
-        # an exact hit there is nothing new worth the upload. Not compressed --
-        # gzip of the cache took minutes, and the bucket is in the build's region.
+        # an exact hit there is nothing new worth the upload. zstd on every
+        # core at level 3 (gzip took minutes), by the Python zstd_python finds;
+        # with none, there is no save.
         if self.a.mode != "up" or self.go_cache_saved or self.go_cache_hit or not self.go_cache:
             return
         self.go_cache_saved = True
         bucket = self.cache_bucket()
         if not bucket:
             return
-        url, tar = f"gs://{bucket}/{self.go_cache}", os.path.join(self.tmp, "go-cache-out.tar")
-        plugins = os.path.join("pulumi", "plugins")
-        parts = ["build", "mod"] + ([plugins] if os.path.isdir(os.path.join(self.go_cache_dir(), plugins)) else [])
+        url, out = f"gs://{bucket}/{self.go_cache}", os.path.join(self.tmp, "go-cache-out" + GO_CACHE_EXT)
+        base, plugins = self.go_cache_dir(), os.path.join("pulumi", "plugins")
+        parts = ["build", "mod"] + ([plugins] if os.path.isdir(os.path.join(base, plugins)) else [])
         try:
-            if run(["tar", "-cf", tar, "-C", self.go_cache_dir(), *parts], check=False).returncode == 0 \
-                    and run(["gcloud", "storage", "cp", tar, url], check=False).returncode == 0:
-                log(f"go cache: saved to {url}")
-            if os.path.exists(tar):
-                os.remove(tar)
+            py = self.zstd_python()
+            if not py:
+                log("go cache: not saved (nothing here can pack it)")
+                return
+            start = time.monotonic()
+            if not pipe(["tar", "-cf", "-", "-C", base, *parts],
+                        [py, "-I", "-c", ZSTD_FILTER, "pack", out, str(GO_CACHE_ZSTD_LEVEL)],
+                        show=f"tar -cf - -C {base} {' '.join(parts)} | pack {out} (zstd -{GO_CACHE_ZSTD_LEVEL})"):
+                log("go cache: could not pack it; not saved")
+                return
+            packed = time.monotonic()
+            if run(["gcloud", "storage", "cp", out, url], check=False).returncode != 0:
+                log(f"go cache: could not upload {url}; not saved")
+                return
+            done = time.monotonic()
+            log(f"go cache: saved {size_text(tree_size(*(os.path.join(base, p) for p in parts)))} as "
+                f"{size_text(os.path.getsize(out))} to {url} (pack {packed - start:.0f} s, upload {done - packed:.0f} s)")
+            # Keep this object and the newest other one (GO_CACHE_KEEP), which
+            # a dependency bump's next build starts from.
+            ls = run(["gcloud", "storage", "ls", "-l", f"gs://{bucket}/{GO_CACHE_PREFIX}*{GO_CACHE_EXT}"],
+                     check=False, capture=True)
+            stale = stale_cache_objects(ls.stdout, url) if ls.returncode == 0 else []
+            if stale and run(["gcloud", "storage", "rm", *stale], check=False).returncode == 0:
+                log(f"go cache: removed {len(stale)} older object(s)")
         except Exception as e:  # caching must never fail the deploy
             log(f"go cache: save skipped ({e!r})")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(out)
 
     # --- ops pool warm-up (best-effort, like the cache) -------------------------
 

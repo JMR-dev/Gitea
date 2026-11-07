@@ -67,6 +67,8 @@ steps:
     # about a second, where pulumi/pulumi took ~100 s from Docker Hub. Even
     # uncached, a gcloud image pulled in 35-42 s (2026-10-25). --fetch-tools
     # adds the pinned, checksummed Go and Pulumi CLI (TOOLS in infra_deploy.py).
+    # Its Cloud SDK's bundled Python (3.14, compression.zstd) packs the Go
+    # cache; a bump that drops it only makes every build cold (ZSTD_PYTHONS).
     name: gcr.io/google.com/cloudsdktool/google-cloud-cli:589.0.0@sha256:2c7b0a3d24236ab5f0c1f768c82000f523ed999f4c677dd311785b313ccb76bd
     entrypoint: python3
     args: [scripts/cicd/infra_deploy.py, "${_MODE}", --fetch-tools]

@@ -72,11 +72,34 @@ class Converged(unittest.TestCase):
         self.assertEqual(D.leftover_changes(p), ["update gitea-vm"])
 
 
+@contextlib.contextmanager
+def quiet_stderr():
+    """Silence file descriptor 2, which child processes write their expected
+    complaints to (tar's "Unexpected EOF", a Python traceback)."""
+    saved = os.dup(2)
+    try:
+        with open(os.devnull, "w") as null:
+            os.dup2(null.fileno(), 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
 class GoCache(unittest.TestCase):
+    B = "gs://ci-build-cache"
+    NAME = r"infra-go-cache-[0-9a-f]{16}\.tar\.zst"
+    # What a fake archive holds, relative to the cache dir.
+    ARCHIVE = ("build/0a/0a1b-d", "mod/cache/download/example.com/m/@v/v1.0.0.zip",
+               "pulumi/plugins/resource-gcp-v9.0.0/pulumi-resource-gcp")
+
+    def obj(self, c):
+        return f"{self.B}/infra-go-cache-{c * 16}.tar.zst"
+
     def test_name_is_stable_and_keyed_on_deps_and_toolchain(self):
         n = D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.26.9")
         self.assertEqual(n, D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.26.9"))
-        self.assertTrue(n.startswith(D.GO_CACHE_PREFIX) and n.endswith(".tar"))
+        self.assertTrue(n.startswith(D.GO_CACHE_PREFIX) and n.endswith(".tar.zst"))
         for other in (D.go_cache_name(b"module x\n", b"a v2 h1:y\n", "go1.26.9"),
                       D.go_cache_name(b"module x\ntoolchain go1.27.0\n", b"a v1 h1:x\n", "go1.26.9"),
                       D.go_cache_name(b"module x\n", b"a v1 h1:x\n", "go1.27.0")):
@@ -96,20 +119,333 @@ class GoCache(unittest.TestCase):
         self.assertIsNone(D.newest_object(""))
         self.assertIsNone(D.newest_object("TOTAL: 0 objects, 0 bytes (0B)\n"))
 
-    def saves(self, mode, hit):
-        d = D.Deploy(argparse.Namespace(mode=mode, state_bucket="ci-deploy-state"))
-        d.go_cache, d.go_cache_hit = "infra-go-cache-abcd.tar", hit
-        ok = subprocess.CompletedProcess([], 0)
-        with mock.patch.object(D, "run", return_value=ok) as run, redirect_stdout(io.StringIO()):
+    def test_a_zstd_object_never_shares_a_name_with_a_tar_one(self):
+        mod, deps, gov = b"module x\n", b"a v1 h1:x\n", "go1.26.9"
+        old = hashlib.sha256(b"plugins-2\0" + gov.encode())  # the .tar objects' key
+        for part in (json.dumps(D.TOOLS, sort_keys=True).encode(), mod, deps):
+            old.update(b"\0" + part)
+        n = D.go_cache_name(mod, deps, gov)
+        self.assertRegex(n, f"^{self.NAME}$")
+        self.assertNotIn(old.hexdigest()[:16], n)
+
+    # --- the fakes ----------------------------------------------------------
+
+    def deploy(self, mode="up"):
+        d = D.Deploy(argparse.Namespace(mode=mode, state_bucket="ci-deploy-state", app_project="gitea-496920",
+                                        stack="prod"))
+        self.addCleanup(D.remove_tree, d.tmp)
+        return d
+
+    def src_tree(self, go_mod=True):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "infra"))
+        for name, body in ((("go.mod", "module x\n"), ("go.sum", "a v1 h1:x\n")) if go_mod else ()):
+            with open(os.path.join(root, "infra", name), "w") as f:
+                f.write(body)
+        return root
+
+    @staticmethod
+    def write(path, data=b"x"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def restoring(self, d, src, *, exact=True, listing="", fail="", py="/zpy", twice=False):
+        """d.prepare(src) against a fake cache bucket, `fail` naming what goes
+        wrong: (every command, as argv or ["pipe", first, second], and the log)."""
+        calls = []
+        ok = lambda cmd, out="": subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        no = lambda cmd, err="ERROR: boom": subprocess.CompletedProcess(cmd, 1, stdout="", stderr=err)
+        none = "ERROR: (gcloud.storage.ls) One or more URLs matched no objects."
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:3] == ["go", "env", "GOVERSION"]:
+                return no(cmd) if fail == "go env" else ok(cmd, "go1.26.9\n")
+            if cmd[:4] == ["gcloud", "storage", "ls", "-l"]:
+                return no(cmd) if fail == "ls -l" else ok(cmd, listing) if listing else no(cmd, none)
+            if cmd[:3] == ["gcloud", "storage", "ls"]:
+                return ok(cmd, cmd[3] + "\n") if exact else no(cmd, none)
+            if cmd[:3] == ["gcloud", "storage", "cp"]:
+                if fail == "run raises":
+                    raise FileNotFoundError(2, "No such file or directory", "gcloud")
+                if fail == "cp":
+                    return no(cmd)
+                self.write(cmd[4], b"\x28\xb5\x2f\xfd packed")
+                return ok(cmd)
+            if cmd[0] in ("go", "pulumi"):  # go build, pulumi login
+                return ok(cmd)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_pipe(first, second, *, show):
+            calls.append(["pipe", first, second])
+            if fail == "pipe raises":
+                raise OSError("tar: not found")
+            stage = second[second.index("-C") + 1]
+            for rel in self.ARCHIVE:
+                self.write(os.path.join(stage, rel))
+            if fail == "unpack":  # part-way through a read-only module dir
+                ro = os.path.join(stage, "mod", "example.com", "m@v1.0.0")
+                self.write(os.path.join(ro, "go.mod"))
+                os.chmod(ro, 0o555)
+                return False
+            return True
+        with mock.patch.object(D, "run", side_effect=fake_run), mock.patch.object(D, "pipe", side_effect=fake_pipe), \
+                mock.patch.object(d, "zstd_python", return_value=py), mock.patch.dict(os.environ), \
+                redirect_stdout(io.StringIO()) as out:
+            d.prepare(src)
+            if twice:
+                d.prepare(src)  # a rollback's
+        return calls, out.getvalue()
+
+    def saving(self, d, *, listing="", fail="", py="/zpy"):
+        """d.save_go_cache(), twice (a second prepare in the same run),
+        against a fake cache bucket: (every command, the log)."""
+        calls = []
+        result = lambda cmd, rc, out="": subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="ERROR: boom" * rc)
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:3] == ["gcloud", "storage", "cp"]:
+                return result(cmd, int(fail == "upload"))
+            if cmd[:4] == ["gcloud", "storage", "ls", "-l"]:
+                return result(cmd, 1) if fail == "prune ls" else result(cmd, 0, listing)
+            if cmd[:3] == ["gcloud", "storage", "rm"]:
+                return result(cmd, int(fail == "rm"))
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_pipe(first, second, *, show):
+            calls.append(["pipe", first, second])
+            if fail == "pipe raises":
+                raise OSError("tar: not found")
+            self.write(second[5], b"\x28\xb5\x2f\xfd packed")
+            return fail != "pack"
+        with mock.patch.object(D, "run", side_effect=fake_run), mock.patch.object(D, "pipe", side_effect=fake_pipe), \
+                mock.patch.object(d, "zstd_python", return_value=py), redirect_stdout(io.StringIO()) as out:
             d.save_go_cache()
-            d.save_go_cache()  # a second prepare in the same run
-        return [c.args[0][:3] for c in run.call_args_list]
+            d.save_go_cache()
+        return calls, out.getvalue()
+
+    def assert_cold(self, d, log):
+        """Only the empty dirs use_cache_dirs makes, nothing else left in tmp."""
+        gocache = d.go_cache_dir()
+        self.assertEqual(sorted(os.listdir(gocache)), ["build", "mod", "pulumi"])
+        for sub in ("build", "mod", "pulumi"):
+            self.assertEqual(os.listdir(os.path.join(gocache, sub)), [], sub)
+        self.assertEqual(os.listdir(d.tmp), ["gocache"])
+        self.assertFalse(d.go_cache_hit)
+        self.assertIn("(cold build)", log)
+
+    # --- restore ------------------------------------------------------------
+
+    def test_an_exact_hit_is_unpacked_aside_then_moved_into_place(self):
+        d, src = self.deploy(), self.src_tree()
+        calls, log = self.restoring(d, src)
+        zst, stage = os.path.join(d.tmp, "go-cache-in.tar.zst"), os.path.join(d.tmp, "gocache-restore")
+        exact = f"{self.B}/{d.go_cache}"
+        self.assertRegex(d.go_cache, f"^{self.NAME}$")
+        self.assertEqual(calls, [
+            ["go", "env", "GOVERSION"],
+            ["gcloud", "storage", "ls", exact],
+            ["gcloud", "storage", "cp", exact, zst],
+            ["pipe", ["/zpy", "-I", "-c", D.ZSTD_FILTER, "unpack", zst], ["tar", "-xf", "-", "-C", stage]],
+            ["go", "build", "-trimpath", "-o", "gitea-infra", "."],
+            ["pulumi", "login", "gs://gitea-496920-pulumi-state"]])
+        self.assertEqual(d.pulumi_backend(), "gs://gitea-496920-pulumi-state")
+        self.assertTrue(d.go_cache_hit)
+        for rel in self.ARCHIVE:
+            self.assertTrue(os.path.isfile(os.path.join(d.go_cache_dir(), rel)), rel)
+        self.assertEqual(os.listdir(d.tmp), ["gocache"], "no staging dir or download left")
+        self.assertRegex(log, rf"go cache: restored \(exact\) \d+ MB from {re.escape(exact)} \(\d+ MB packed\) "
+                              r"in \d+ s \(download \d+ s, unpack \d+ s\)")
+
+    def test_without_its_own_object_the_newest_zstd_one_is_restored(self):
+        d, src = self.deploy(), self.src_tree()
+        listing = (f"  10  2026-11-01T00:00:00Z  {self.obj('a')}\n"
+                   f"  20  2026-11-05T00:00:00Z  {self.obj('b')}\n"
+                   f"  30  2026-11-03T00:00:00Z  {self.obj('c')}\n"
+                   "TOTAL: 3 objects, 60 bytes (60B)\n")
+        calls, log = self.restoring(d, src, exact=False, listing=listing)
+        zst = os.path.join(d.tmp, "go-cache-in.tar.zst")
+        self.assertEqual(calls[1:4], [["gcloud", "storage", "ls", f"{self.B}/{d.go_cache}"],
+                                      ["gcloud", "storage", "ls", "-l", f"{self.B}/infra-go-cache-*.tar.zst"],
+                                      ["gcloud", "storage", "cp", self.obj("b"), zst]])
+        self.assertFalse(d.go_cache_hit)
+        self.assertIn(f"go cache: restored (partial) ", log)
+        self.assertTrue(os.path.isfile(os.path.join(d.go_cache_dir(), self.ARCHIVE[0])))
+
+    def test_any_restore_failure_is_a_cold_build(self):
+        for fail in ("no zstd Python", "go env", "go.mod unreadable", "ls -l", "nothing listed", "cp", "unpack",
+                     "pipe raises", "run raises"):
+            with self.subTest(fail):
+                d, src = self.deploy(), self.src_tree(go_mod=fail != "go.mod unreadable")
+                calls, log = self.restoring(d, src, exact=fail not in ("ls -l", "nothing listed"), fail=fail,
+                                            py=None if fail == "no zstd Python" else "/zpy")
+                self.assert_cold(d, log)
+                self.assertEqual(calls[-2:], [["go", "build", "-trimpath", "-o", "gitea-infra", "."],
+                                              ["pulumi", "login", "gs://gitea-496920-pulumi-state"]])
+                if fail == "no zstd Python":
+                    self.assertEqual([c for c in calls if c[0] in ("gcloud", "pipe")], [])
+
+    def test_restore_runs_once_a_run(self):
+        d, src = self.deploy(), self.src_tree()
+        calls, _ = self.restoring(d, src, twice=True)
+        self.assertEqual([c[0] for c in calls if c[0] in ("gcloud", "pipe")], ["gcloud", "gcloud", "pipe"])
+        self.assertEqual(len([c for c in calls if c[:2] == ["go", "build"]]), 2)
+        self.assertTrue(os.path.isfile(os.path.join(d.go_cache_dir(), self.ARCHIVE[0])))
+
+    # --- save ---------------------------------------------------------------
+
+    def test_a_save_packs_uploads_then_prunes_older_zstd_objects(self):
+        d = self.deploy()
+        d.go_cache = f"infra-go-cache-{'a' * 16}.tar.zst"
+        for sub in ("build", "mod", os.path.join("pulumi", "plugins")):
+            self.write(os.path.join(d.go_cache_dir(), sub, "f"))
+        url = self.obj("a")
+        listing = (f"  10  2026-11-07T00:00:00Z  {url}\n"
+                   f"  20  2026-11-05T00:00:00Z  {self.obj('b')}\n"
+                   f"  30  2026-11-03T00:00:00Z  {self.obj('c')}\n"
+                   f"  40  2026-11-01T00:00:00Z  {self.obj('d')}\n"
+                   "TOTAL: 4 objects, 100 bytes (100B)\n")
+        calls, log = self.saving(d, listing=listing)
+        out = os.path.join(d.tmp, "go-cache-out.tar.zst")
+        self.assertEqual(calls, [
+            ["pipe", ["tar", "-cf", "-", "-C", d.go_cache_dir(), "build", "mod", os.path.join("pulumi", "plugins")],
+             ["/zpy", "-I", "-c", D.ZSTD_FILTER, "pack", out, "3"]],
+            ["gcloud", "storage", "cp", out, url],
+            ["gcloud", "storage", "ls", "-l", f"{self.B}/infra-go-cache-*.tar.zst"],
+            ["gcloud", "storage", "rm", self.obj("c"), self.obj("d")]])
+        self.assertFalse(os.path.exists(out))
+        self.assertRegex(log, rf"go cache: saved \d+ MB as \d+ MB to {re.escape(url)} \(pack \d+ s, upload \d+ s\)")
+        self.assertIn("go cache: removed 2 older object(s)", log)
+
+    def saves(self, mode, hit):
+        d = self.deploy(mode)
+        d.go_cache, d.go_cache_hit = f"infra-go-cache-{'a' * 16}.tar.zst", hit
+        calls, _ = self.saving(d)
+        return [c[0] if c[0] == "pipe" else c[:3] for c in calls]
 
     def test_save_only_from_a_deploy_without_an_exact_hit_and_only_once(self):
         self.assertEqual(self.saves("preview", hit=False), [])
         self.assertEqual(self.saves("up", hit=True), [])
         self.assertEqual(self.saves("up", hit=False),
-                         [["tar", "-cf", mock.ANY], ["gcloud", "storage", "cp"]])
+                         ["pipe", ["gcloud", "storage", "cp"], ["gcloud", "storage", "ls"]])
+
+    def test_a_save_never_fails_the_deploy(self):
+        listing = f"  10  2026-11-07T00:00:00Z  {self.obj('a')}\n" + "".join(
+            f"  20  2026-11-0{i}T00:00:00Z  {self.obj(c)}\n" for i, c in ((5, "b"), (3, "c")))
+        for fail, ran in (("pack", ["pipe"]), ("upload", ["pipe", "cp"]), ("pipe raises", ["pipe"]),
+                          ("no zstd Python", []), ("prune ls", ["pipe", "cp", "ls"]),
+                          ("rm", ["pipe", "cp", "ls", "rm"])):
+            with self.subTest(fail):
+                d = self.deploy()
+                d.go_cache = f"infra-go-cache-{'a' * 16}.tar.zst"
+                calls, _ = self.saving(d, listing=listing, fail=fail, py=None if fail == "no zstd Python" else "/zpy")
+                self.assertEqual([c[0] if c[0] == "pipe" else c[2] for c in calls], ran)
+                self.assertTrue(d.go_cache_saved)
+                self.assertFalse(os.path.exists(os.path.join(d.tmp, "go-cache-out.tar.zst")))
+
+    def test_stale_objects_are_only_older_zstd_ones_of_ours(self):
+        saved = self.obj("a")
+        ls = (f"  10  2026-11-01T00:00:00Z  {saved}\n"  # listed as the oldest: still never stale
+              f"  20  2026-11-05T00:00:00Z  {self.obj('b')}\n"  # the newest other: kept
+              f"  30  2026-11-03T00:00:00Z  {self.obj('c')}\n"
+              f"  40  2026-11-02T00:00:00Z  {self.obj('d')}\n"
+              f"  50  2026-10-01T00:00:00Z  {self.B}/infra-go-cache-{'e' * 16}.tar\n"  # the age rule's
+              f"  60  2026-10-01T00:00:00Z  {self.B}/infra-go-cache-{'f' * 16}.tar.gz\n"
+              f"  70  2026-10-01T00:00:00Z  {self.B}/infra-go-cache-{'0' * 15}.tar.zst\n"
+              f"  80  2026-10-01T00:00:00Z  {self.B}/infra-go-cache-{'A' * 16}.tar.zst\n"
+              f"  90  2026-10-01T00:00:00Z  {self.B}/gcloud/tmp/parallel_composite_uploads/"
+              f"infra-go-cache-{'1' * 16}.tar.zst\n"
+              f"  95  2026-10-01T00:00:00Z  gs://other-build-cache/infra-go-cache-{'2' * 16}.tar.zst\n"
+              f"  99  2026-10-01T00:00:00Z  {self.B}/notes.txt\n"
+              "TOTAL: 11 objects, 645 bytes (645B)\n")
+        self.assertEqual((D.GO_CACHE_KEEP, D.GO_CACHE_ZSTD_LEVEL), (2, 3))
+        self.assertEqual(D.stale_cache_objects(ls, saved), [self.obj("c"), self.obj("d")])
+        self.assertEqual(D.stale_cache_objects(ls, saved, keep=1), [self.obj(c) for c in "bcd"])
+        self.assertEqual(D.stale_cache_objects("", saved), [])
+        self.assertEqual(D.cache_objects(ls)[0], ("2026-11-01T00:00:00Z", saved))
+
+    # --- the zstd Python and the pipe -----------------------------------------
+
+    def test_the_zstd_python_is_this_one_else_the_bundled_one_probed_once(self):
+        bundled = tuple(f"/usr/{lib}/google-cloud-sdk/platform/bundledpythonunix/bin/python3" for lib in ("lib", "lib64"))
+        self.assertEqual(D.ZSTD_PYTHONS, bundled)
+        every = [sys.executable, *bundled]
+        for want in (sys.executable, bundled[0], bundled[1], None):
+            with self.subTest(want):
+                d, probed = self.deploy(), []
+
+                def probe(cmd, **kw):
+                    probed.append(cmd[0])
+                    self.assertEqual(cmd[1:], ["-I", "-c", "import compression.zstd"])
+                    if cmd[0] in bundled and cmd[0] != want:
+                        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+                    return subprocess.CompletedProcess(cmd, 0 if cmd[0] == want else 1)
+                with mock.patch.object(D, "run", side_effect=probe), redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(d.zstd_python(), want)
+                    self.assertEqual(d.zstd_python(), want)
+                self.assertEqual(probed, every[:every.index(want) + 1] if want else every)
+                self.assertEqual("WARNING" in out.getvalue(), want is None)
+
+    def test_pipe_is_true_only_when_both_ends_exit_0(self):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work)
+        out = os.path.join(work, "out")
+        copy = ["dd", f"of={out}", "status=none"]
+        with redirect_stdout(io.StringIO()) as log:
+            self.assertTrue(D.pipe(["printf", "abc"], copy, show="copy"))
+        self.assertEqual(log.getvalue(), "==> $ copy\n", "the label, never the commands")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"abc")
+        for name, first, second in (
+                ("the producer fails", ["sh", "-c", "printf abc; exit 3"], copy),
+                ("the consumer fails", ["printf", "abc"], ["sh", "-c", "cat >/dev/null; exit 4"]),
+                ("the consumer stops reading", ["yes"], ["dd", "of=/dev/null", "bs=1", "count=1", "status=none"])):
+            with self.subTest(name), redirect_stdout(io.StringIO()):
+                self.assertFalse(D.pipe(first, second, show=name))
+        with redirect_stdout(io.StringIO()), self.assertRaises(OSError):
+            D.pipe(["yes"], [os.path.join(work, "no-such-program")], show="nothing to read it")
+
+    def test_the_filter_round_trips_a_go_cache_through_tar(self):
+        d = self.deploy()
+        with redirect_stdout(io.StringIO()):
+            py = d.zstd_python()
+        if not py:
+            self.skipTest("no Python here has compression.zstd")
+        work = tempfile.mkdtemp()
+        self.addCleanup(D.remove_tree, work)
+        src, dst, packed = (os.path.join(work, n) for n in ("src", "dst", "c.tar.zst"))
+        module = os.path.join("mod", "example.com", "m@v1.0.0")
+        files = {"build/0a/0a1b-d": os.urandom(1 << 20), os.path.join(module, "go.mod"): b"module m\n",
+                 "pulumi/plugins/resource-gcp-v9.0.0/pulumi-resource-gcp": b"#!/bin/sh\n" * 4096}
+        for rel, data in files.items():
+            self.write(os.path.join(src, rel), data)
+        os.chmod(os.path.join(src, "pulumi/plugins/resource-gcp-v9.0.0/pulumi-resource-gcp"), 0o755)
+        os.chmod(os.path.join(src, module, "go.mod"), 0o444)
+        os.chmod(os.path.join(src, module), 0o555)  # as Go leaves its module cache
+        os.mkdir(dst)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(D.pipe(["tar", "-cf", "-", "-C", src, "build", "mod", "pulumi/plugins"],
+                                   [py, "-I", "-c", D.ZSTD_FILTER, "pack", packed, str(D.GO_CACHE_ZSTD_LEVEL)],
+                                   show="pack"))
+            self.assertTrue(D.pipe([py, "-I", "-c", D.ZSTD_FILTER, "unpack", packed], ["tar", "-xf", "-", "-C", dst],
+                                   show="unpack"))
+        with open(packed, "rb") as f:
+            whole = f.read()
+        self.assertEqual(whole[:4].hex(" "), "28 b5 2f fd", "a zstd frame")
+        for rel, data in files.items():
+            with open(os.path.join(dst, rel), "rb") as f:
+                self.assertEqual(f.read(), data, rel)
+        self.assertFalse(os.stat(os.path.join(dst, module)).st_mode & 0o222, "still read-only")
+        self.assertTrue(os.access(os.path.join(dst, "pulumi/plugins/resource-gcp-v9.0.0/pulumi-resource-gcp"), os.X_OK))
+        # A truncated object fails the unpack (a cold build), never half-restores quietly.
+        self.write(os.path.join(work, "cut.tar.zst"), whole[:len(whole) // 2])
+        os.mkdir(os.path.join(work, "dst2"))
+        with redirect_stdout(io.StringIO()), quiet_stderr():
+            self.assertFalse(D.pipe([py, "-I", "-c", D.ZSTD_FILTER, "unpack", os.path.join(work, "cut.tar.zst")],
+                                    ["tar", "-xf", "-", "-C", os.path.join(work, "dst2")], show="unpack"))
 
 
 class Tools(unittest.TestCase):
