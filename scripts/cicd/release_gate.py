@@ -21,11 +21,13 @@ with a warning: the approval is the person taking that on. The engine itself
   image  D3 fail-verify (image rollback) and D4 fail-after-migrate (data restore)
   infra  D5 fail-verify (re-apply the last good commit)
 
-`superseded image --sha S` answers whether a newer commit on main also
-changes the image, in which case that commit's build releases it and this
-one must not: builds that finish out of order would otherwise put an older
-image back. It asks Gitea's API anonymously (the repo is public) and answers
-"no" when it cannot tell, so a Gitea outage never blocks a release.
+`superseded image --sha S` answers whether a newer commit on main's own
+first-parent line (a merge's diff against main as it was, not the commits
+that merge brought in) also changes the image, in which case that commit's
+build releases it and this one must not: builds that finish out of order
+would otherwise put an older image back. It asks Gitea's API anonymously
+(the repo is public) and answers "no" when it cannot tell, so a Gitea outage
+never blocks a release.
 
 Usage:
   release_gate.py hash       <pipeline>
@@ -161,9 +163,38 @@ def cmd_attest(a):
 IMAGE_PATHS = ("image/", "cloudbuild/image.yaml")
 
 
+def main_line(commits):
+    """The commits of a Gitea compare response on main's own first-parent
+    line, newest first: the head (the one listed commit that no other lists
+    as a parent), its first parent, and so on while they are listed. None
+    when that can't be told: a commit without parents, a parent without a
+    sha, or not exactly one head."""
+    by_sha, parents = {}, set()
+    for c in commits:
+        ps = c.get("parents")
+        if not c.get("sha") or not ps or not all(isinstance(p, dict) and p.get("sha") for p in ps):
+            return None
+        by_sha[c["sha"]] = c
+        parents.update(p["sha"] for p in ps)
+    heads = [s for s in by_sha if s not in parents]
+    if len(heads) != 1:
+        return None
+    line, seen, sha = [], set(), heads[0]
+    while sha in by_sha and sha not in seen:  # a malformed answer could loop
+        seen.add(sha)
+        line.append(by_sha[sha])
+        sha = by_sha[sha]["parents"][0]["sha"]
+    return line
+
+
 def newer_touches(compare, paths):
-    """Whether any commit in a Gitea compare response changes one of paths."""
-    for c in compare.get("commits") or []:
+    """The newest commit on main's own first-parent line in a Gitea compare
+    response that changes one of paths, or None. A merge counts with its diff
+    against main as it was; the commits it brought in don't, since a branch
+    that merged main in lists main's own changes again. Every listed commit
+    counts when main's line can't be told (main_line)."""
+    commits = compare.get("commits") or []
+    for c in main_line(commits) or commits:
         for f in c.get("files") or []:
             name = f.get("filename", "")
             if any(name == p or (p.endswith("/") and name.startswith(p)) for p in paths):

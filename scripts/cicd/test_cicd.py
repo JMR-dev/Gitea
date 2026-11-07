@@ -1186,6 +1186,70 @@ class Superseded(unittest.TestCase):
         c = {"commits": [{"sha": "ccc", "files": [{"filename": "cloudbuild/image.yaml"}]}]}
         self.assertEqual(G.newer_touches(c, G.IMAGE_PATHS), "ccc")
 
+    # Gitea's compare lists each commit's parents as {created, sha, url}, and a
+    # merge's files as its diff against its own first parent.
+    API = "https://gitea.jasonmross.dev/api/v1/repos/JMR-dev/Gitea/git/commits/"
+    INFRA = ("infra/main.go", "infra/pkg/iam/iam.go")
+    CADDY = "image/caddy/Dockerfile"
+
+    def commit(self, sha, parents, *files):
+        return {"sha": sha, "files": [{"filename": f, "status": "modified"} for f in files],
+                "parents": [{"created": "2026-11-07T00:00:00Z", "sha": p, "url": self.API + p} for p in parents]}
+
+    def test_merge_from_main_does_not_supersede(self):
+        # Branch B merged main (A, the commit asked about) before main merged
+        # B: B2's diff against B1 is A's own image change, nothing newer.
+        c = {"commits": [self.commit("MB", ["A", "B2"], *self.INFRA),
+                         self.commit("B2", ["B1", "A"], self.CADDY),
+                         self.commit("B1", ["B0"], *self.INFRA)]}
+        self.assertIsNone(G.newer_touches(c, G.IMAGE_PATHS))
+
+    def test_newer_image_merge_on_main_supersedes(self):
+        # Listed before MC, C1 and B2 would answer first if every commit counted.
+        c = {"commits": [self.commit("C1", ["MB"], self.CADDY),
+                         self.commit("MB", ["A", "B2"], *self.INFRA),
+                         self.commit("B2", ["B1", "A"], self.CADDY),
+                         self.commit("MC", ["MB", "C1"], self.CADDY),
+                         self.commit("B1", ["B0"], *self.INFRA)]}
+        self.assertEqual(G.newer_touches(c, G.IMAGE_PATHS), "MC")
+        self.assertEqual([x["sha"] for x in G.main_line(c["commits"])], ["MC", "MB"])
+
+    def test_the_caddy_pin_was_not_superseded(self):
+        # compare 2ce57a7...f93e5b7 as Gitea answered it: #48's merge, and its
+        # branch's merge of main, which brought in #47's own Caddy change.
+        pin = "2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b"
+        merge = "f93e5b769c1f385a4072c51b9476ee18ab649154"
+        catch_up = "72f431042694fb10ca862c64a6f0a0c0c8f05b85"
+        branch = "84ee2e523ef03e83db0ba5687721f9bcf02b28fa"
+        dns = ("infra/pkg/dns/dns_test.go", "infra/pkg/iam/iam_test.go", "Makefile", "docs/runbook.md",
+               "infra/main.go", "infra/pkg/dns/dns.go", "infra/pkg/iam/iam.go")
+        c = {"total_commits": 3, "commits": [
+            self.commit(merge, [pin, catch_up], *dns),
+            self.commit(catch_up, [branch, pin], "docs/runbook.md", self.CADDY, "vm/ansible/README.md",
+                        "vm/ansible/tests/check", "vm/config/Caddyfile.tmpl", "vm/quadlets/caddy.container"),
+            self.commit(branch, ["b5c3a9da87bf6b5d28c44384efe2ed942b02bccd"], *dns)]}
+        self.assertIsNone(G.newer_touches(c, G.IMAGE_PATHS))
+        self.assertEqual([x["sha"] for x in G.main_line(c["commits"])], [merge])
+
+    def test_without_one_head_or_parents_all_commits_count(self):
+        # When main's line can't be told, every listed commit counts, as before.
+        image = self.commit("I", ["A"], self.CADDY)
+        for name, commits in (
+                ("two heads", [self.commit("H", ["A"], *self.INFRA), image]),
+                ("no parents", [self.commit("H", ["I"], *self.INFRA), {"sha": "I", "files": image["files"]}]),
+                ("empty parents", [self.commit("H", ["I"], *self.INFRA), dict(image, parents=[])]),
+                ("a parent without a sha", [self.commit("H", ["I"], *self.INFRA),
+                                            dict(image, parents=[{"url": self.API}])])):
+            with self.subTest(name):
+                self.assertIsNone(G.main_line(commits))
+                self.assertEqual(G.newer_touches({"commits": commits}, G.IMAGE_PATHS), "I")
+
+    def test_a_parent_cycle_ends_the_walk(self):
+        commits = [self.commit("H", ["X"], *self.INFRA), self.commit("X", ["Y"], self.CADDY),
+                   self.commit("Y", ["X"], *self.INFRA)]
+        self.assertEqual([x["sha"] for x in G.main_line(commits)], ["H", "X", "Y"])
+        self.assertEqual(G.newer_touches({"commits": commits}, G.IMAGE_PATHS), "X")
+
 
 class RelayAgrees(unittest.TestCase):
     """cicd/relay flags the same files this gate hashes, for the same pipelines."""
