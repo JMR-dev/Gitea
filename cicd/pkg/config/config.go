@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/mail"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -63,6 +64,58 @@ type Config struct {
 	// this project's logs and metrics as. Unset, package telemetry creates
 	// nothing and cb-infra gets no telemetry roles (docs/cicd.md).
 	WatchtowerReader string
+
+	// CertAlertDays is the certificate alert's threshold (package alerting):
+	// it fires when Gitea's certificate has fewer days left than this.
+	// gitea-cicd:certAlertDays, optional, a whole number from 1 to 365;
+	// DefaultCertAlertDays when unset. Above the days any certificate has
+	// left when Caddy renews it, it fires on a healthy one: a drill
+	// (CertAlertIsDrill, docs/runbook.md).
+	CertAlertDays int
+}
+
+// CertLifetimeDays is the lifetime of the certificates Let's Encrypt issues
+// Gitea: 64 days from 2027-02-10. Caddy (certmagic) renews one when a third
+// of it is left, about 21.3 days, and retries until it expires.
+//
+// Before 2028-02-16, when Let's Encrypt moves to 45-day certificates (renewal
+// from 15 days left), set this to 45: alerting's
+// TestDefaultThresholdLeavesCaddyItsRetries then fails until
+// DefaultCertAlertDays drops to about 10.
+const CertLifetimeDays = 64
+
+// LongestCertLifetimeDays is the longest certificate Let's Encrypt issues
+// Gitea: 90 days until 2027-02-10. Caddy renews one at 30 days left, the most
+// any certificate has when it is renewed, so a threshold above 30 fires on a
+// healthy certificate whatever Caddy does (CertAlertIsDrill). Once the last
+// 90-day certificate has expired (by 2027-05-11), this can be
+// CertLifetimeDays.
+const LongestCertLifetimeDays = 90
+
+// DefaultCertAlertDays alerts once Caddy's renewal has been failing for at
+// least 3 days (21.3 - 18), and leaves 18 days to fix it.
+const DefaultCertAlertDays = 18
+
+// certAlertDays reads gitea-cicd:certAlertDays as Load gets it: unset is the
+// default, anything but a whole number from 1 to 365 an error.
+// config.GetInt would read "1.5" or "abc" as 0 without a word.
+func certAlertDays(raw string) (int, error) {
+	if raw == "" {
+		return DefaultCertAlertDays, nil
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil || days < 1 || days > 365 {
+		return 0, fmt.Errorf("gitea-cicd:certAlertDays %q must be a whole number of days from 1 to 365", raw)
+	}
+	return days, nil
+}
+
+// CertAlertIsDrill says whether a threshold fires on a healthy certificate:
+// one above the days left when Caddy renews the longest-lived, which no
+// certificate stays above. It fires at once if the certificate has fewer days
+// left than that now, and before Caddy's next renewal otherwise.
+func CertAlertIsDrill(days int) bool {
+	return days > LongestCertLifetimeDays/3
 }
 
 func Load(ctx *pulumi.Context) (*Config, error) {
@@ -86,7 +139,23 @@ func Load(ctx *pulumi.Context) (*Config, error) {
 		WatchtowerReader: c.Get("watchtowerReader"),
 	}
 	applyDefaults(cfg)
-	return cfg, validate(cfg, ctx.IsConfigSecret("gitea-cicd:operatorEmail"))
+	if err := validate(cfg, ctx.IsConfigSecret("gitea-cicd:operatorEmail")); err != nil {
+		return nil, err
+	}
+	days, err := certAlertDays(c.Get("certAlertDays"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.CertAlertDays = days
+	if CertAlertIsDrill(days) {
+		if err := ctx.Log.Warn(fmt.Sprintf("gitea-cicd:certAlertDays %d is a drill value: this alert will fire, "+
+			"at once if the certificate has fewer days left than that, otherwise before Caddy next renews it "+
+			"(at %d days left at most). Once the drill is done, `pulumi config rm gitea-cicd:certAlertDays` "+
+			"and `make ci-up` (docs/runbook.md)", days, LongestCertLifetimeDays/3), nil); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
 }
 
 func applyDefaults(c *Config) {

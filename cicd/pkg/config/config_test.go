@@ -53,3 +53,38 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestCertAlertDaysDefault(t *testing.T) {
+	if got, err := certAlertDays(""); err != nil || got != 18 {
+		t.Fatalf("unset: got %d, %v; want 18", got, err)
+	}
+}
+
+func TestCertAlertDaysRejects(t *testing.T) {
+	for _, raw := range []string{"0", "-1", "366", "1.5", "18.0", "abc", "18d", " 18", "1e2"} {
+		if got, err := certAlertDays(raw); err == nil || !strings.Contains(err.Error(), "gitea-cicd:certAlertDays") {
+			t.Errorf("%q: got %d, %v; want an error naming gitea-cicd:certAlertDays", raw, got, err)
+		}
+	}
+}
+
+func TestCertAlertDaysAccepts(t *testing.T) {
+	for raw, want := range map[string]int{"1": 1, "18": 18, "120": 120, "365": 365} {
+		if got, err := certAlertDays(raw); err != nil || got != want {
+			t.Errorf("%q: got %d, %v; want %d", raw, got, err, want)
+		}
+	}
+}
+
+// A threshold above the days any healthy certificate has left when Caddy
+// renews it fires whatever Caddy does: that is a drill, and `pulumi up` says
+// so. The longest certificate Let's Encrypt issues is 90 days (until
+// 2027-02-10), renewed at 30 days left, so 30 itself never fires on a healthy
+// one and 31 always does.
+func TestCertAlertIsDrill(t *testing.T) {
+	for days, want := range map[int]bool{18: false, 21: false, 25: false, 30: false, 31: true, 120: true} {
+		if got := CertAlertIsDrill(days); got != want {
+			t.Errorf("CertAlertIsDrill(%d) = %v, want %v", days, got, want)
+		}
+	}
+}
