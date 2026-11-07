@@ -77,5 +77,7 @@ scrub rule gets fixture lines in `scripts/testdata`: `keep:`/`same:`/`drop:`
 tagged, made up, and anything that must never ship in `scrub.forbidden`.
 
 `tests/make-goldens` wrote the first goldens the way `vm/bootstrap.sh` did, the
-byte-for-byte proof for the cutover from the bash. It only knows the templates
-the bash had; don't use it for changes.
+byte-for-byte proof for the cutover from the bash. It knew only the templates
+the bash had, so once they moved on it could only write wrong goldens, and it
+is gone; git has its last working version at 5f943f6, from before the
+templates moved.

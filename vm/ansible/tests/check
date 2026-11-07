@@ -14,8 +14,9 @@ defines it, so a new variable fails here with what to add, not as an Ansible
 "undefined variable" deep in a deploy. So is that Caddy has no mode but the
 gitea network (caddy_bridge_only): its quadlet's one Network= line is literal,
 so no variable can choose another. The first goldens were written by
-tests/make-goldens the way vm/bootstrap.sh rendered, which proved the cutover
-byte for byte; from then on --update is how they change.
+tests/make-goldens (gone since; in git at 5f943f6) the way vm/bootstrap.sh
+rendered, which proved the cutover byte for byte; from then on --update is how
+they change.
 
 Once the goldens match, Caddy's stop budget and the telemetry to watchtower are
 checked too (not under --update). Everywhere, as they need nothing downloaded:
