@@ -201,8 +201,9 @@ this page.
 | D6 | D3–D5 above | each sends the rollback e-mail, and each failed check shows on Gitea | none |
 
 D2 last ran by hand before the 28 upgrade (2026-10-20, PASS). D3, D4 and D5
-have never run. The 28 release itself succeeded, so its automatic rollback
-never ran either.
+last passed on 2026-11-06, for infra code `be18bfc` and image code `5716844`
+(the drill log at the bottom of this page). The 28 release itself succeeded, so
+its automatic rollback never ran either.
 
 **Re-run D3–D5 whenever the release code changes.** The gate enforces this for
 automatic runs, and the pending `cloudbuild/drill-*` statuses show what's due.
@@ -444,3 +445,6 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 | 2026-10-25 | D3 image fail-verify (Path A) | 639575d | `667106d1` | PASS: image code `e8a8e86` attested; promoted, rolled back to `:previous`. A first submission from a git worktree (`450d7883`) failed at `resolve-gitea` before any release: `.gcloudignore`'s `.git/` skips only a directory, so the worktree's `.git` file was uploaded |
 | 2026-10-25 | D4 image fail-after-migrate (Path B) | 639575d | `960c42dc` | PASS: image code `e8a8e86`; restored from `gitea-data-pre-release-20261025t153628z`, drill marker absent; down 15:39–15:41 and 15:47–15:49 UTC (10 s probes), about 3.5 min in all |
 | 2026-10-25 | D5 infra fail-verify (vm_sync by tree kind, replaced-VM waits) | 1435746 | `6920bafd` | PASS: infra code `6b092ee` attested; legacy path (startup-script wait, `running`, config sync) in deploy and rollback; 9.1 min |
+| 2026-11-06 | D5 infra fail-verify (the Ansible VM and engine, #35–#38) | 4c15ceb | `b9ea62dc` | PASS: infra code `be18bfc` attested; re-applied last-good 4c15ceb through the playbook; 14.2 min. Run after 15 minutes with no Gitea Actions run or CI build |
+| 2026-11-06 | D3 image fail-verify (Path A, the engine's Ansible steps) | 4c15ceb | `e5cfa416` | PASS: image code `5716844` attested; promoted, rolled back to `:previous`; 17.3 min |
+| 2026-11-06 | D4 image fail-after-migrate (Path B) | 4c15ceb | `e2d9cc09` | PASS: image code `5716844`; restored from `gitea-data-pre-release-20261106t234625z` (12,888 files, inventory matching the snapshot), drill marker absent; down 23:49:11–23:51:13 and 23:56:35–23:59:23 UTC (the VM's systemd stop and start lines for Gitea and Caddy, read from Watchtower), about 5 min in all; 16.8 min |
