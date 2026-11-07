@@ -1206,5 +1206,70 @@ class RelayAgrees(unittest.TestCase):
         self.assertEqual(relay, gate)
 
 
+class ChecksWorkflowAgrees(unittest.TestCase):
+    """The PR checks (.gitea/workflows/checks.yml) run the stages of `make check`
+    that a PR should, and `make check` still runs them, so a stage can't drop
+    out of one without the other noticing (docs/cicd.md, "PR checks")."""
+
+    # What the workflow runs, and what only `make check` runs: ansible-check
+    # is cloudbuild/preview's, check-metadata-guard needs namespaces and nft,
+    # workflow-lint needs podman.
+    IN_PR = {"infra-check", "ci-check", "scripts-check"}
+    LOCAL_ONLY = {"ansible-check", "check-metadata-guard", "workflow-lint"}
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(G.ROOT, ".gitea/workflows/checks.yml")) as f:
+            cls.workflow = f.read()
+        with open(os.path.join(G.ROOT, "Makefile")) as f:
+            makefile = f.read()
+        # Each rule, "target: prerequisites ## help", as target -> prerequisites.
+        # Not .PHONY (a leading dot) and not a ":=" variable.
+        cls.rules = {name: rest.split("##")[0].split()
+                     for name, rest in re.findall(r"^([A-Za-z_-]+):(?!=)(.*)$", makefile, re.M)}
+        # The workflow's lines, without comments or the "- " of a list item.
+        cls.lines = [re.sub(r"^-\s+", "", s) for s in (line.strip() for line in cls.workflow.splitlines())
+                     if s and not s.startswith("#")]
+
+    def make_targets(self):
+        """The targets of every `make` the workflow runs, flags and VAR=x left out."""
+        targets = []
+        for line in self.lines:
+            m = re.match(r"(?:run:\s*)?make\s+(.*)$", line)
+            if m:
+                targets += [w for w in m.group(1).split() if not w.startswith("-") and "=" not in w]
+        return targets
+
+    def test_the_workflow_runs_exactly_the_pr_stages(self):
+        self.assertEqual(sorted(self.make_targets()), sorted(self.IN_PR))
+
+    def test_make_check_runs_them_and_the_local_stages(self):
+        check = self.rules["check"]
+        for target in self.IN_PR:
+            self.assertIn(target, check)
+        self.assertEqual(set(check) - self.IN_PR, self.LOCAL_ONLY)
+
+    def test_every_stage_is_a_make_target(self):
+        for target in self.IN_PR | self.LOCAL_ONLY | set(self.make_targets()):
+            self.assertIn(target, self.rules)
+
+    def test_every_action_is_pinned_to_a_commit(self):
+        uses = [line[len("uses:"):].strip() for line in self.lines if line.startswith("uses:")]
+        self.assertTrue(uses)
+        for u in uses:
+            self.assertRegex(u, r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}\s+#\s*v\d[\w.]*$")
+
+    def test_the_scripts_job_installs_its_tools(self):
+        # ripgrep for the bats fakes; without shellcheck, scripts-check fails.
+        installs = [line for line in self.lines if "apt" in line and re.search(r"\binstall\s", line)]
+        self.assertEqual(len(installs), 1, installs)
+        self.assertLessEqual({"shellcheck", "bats", "ripgrep"}, set(installs[0].split()))
+
+    def test_no_path_filters(self):
+        # A PR a filter skips never gets the status, and a required status that
+        # never comes blocks the merge.
+        self.assertNotRegex(self.workflow, r"(?m)^\s*paths(-ignore)?\s*:")
+
+
 if __name__ == "__main__":
     unittest.main()
