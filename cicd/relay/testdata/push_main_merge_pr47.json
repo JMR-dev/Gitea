@@ -1,0 +1,130 @@
+{
+  "ref": "refs/heads/main",
+  "before": "202cf565c5d4f98059d3050aa55312da5ad29b83",
+  "after": "2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b",
+  "compare_url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/compare/202cf565c5d4f98059d3050aa55312da5ad29b83...2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b",
+  "commits": [
+    {
+      "id": "2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b",
+      "message": "Merge pull request 'Pin the Caddy image's googleclouddns plugin at v1.1.0' (#47) from chore/pin-caddy-dns-plugin into main\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T16:57:45Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "image/caddy/Dockerfile"
+      ]
+    },
+    {
+      "id": "9bd5d317cda6aa0b348f8d2ea695d20747a9d0b4",
+      "message": "Merge branch 'main' into chore/pin-caddy-dns-plugin\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/9bd5d317cda6aa0b348f8d2ea695d20747a9d0b4",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T16:48:15Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "docs/runbook.md",
+        "vm/ansible/README.md",
+        "vm/ansible/tests/check",
+        "vm/ansible/tests/golden/bridge-off/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-off/caddy.container.golden",
+        "vm/ansible/tests/golden/bridge-on/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-on/caddy.container.golden",
+        "vm/ansible/tests/golden/host-detection/Caddyfile.golden",
+        "vm/ansible/tests/golden/host-detection/caddy.container.golden",
+        "vm/config/Caddyfile.tmpl",
+        "vm/quadlets/caddy.container"
+      ]
+    },
+    {
+      "id": "6bf19ddae641aaa66517c0955a43ad09a7ed4b34",
+      "message": "caddy image: pin the googleclouddns plugin at v1.1.0\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/6bf19ddae641aaa66517c0955a43ad09a7ed4b34",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T09:56:21-06:00",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "image/caddy/Dockerfile"
+      ]
+    },
+    {
+      "id": "58b424bfec51b62c0ccbfc327cb351ed649c083d",
+      "message": "caddy image: assert the googleclouddns plugin's version\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/58b424bfec51b62c0ccbfc327cb351ed649c083d",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T09:52:58-06:00",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "image/caddy/Dockerfile"
+      ]
+    }
+  ],
+  "total_commits": 4,
+  "head_commit": {
+    "id": "2ce57a7281102c50d1c6a1ca6c46cbbdb8c5d59b",
+    "added": [],
+    "removed": [],
+    "modified": [
+      "image/caddy/Dockerfile"
+    ]
+  },
+  "repository": {
+    "id": 1,
+    "name": "Gitea",
+    "full_name": "JMR-dev/Gitea",
+    "private": false,
+    "default_branch": "main"
+  },
+  "pusher": {
+    "id": 1,
+    "login": "JMR-dev"
+  },
+  "sender": {
+    "id": 1,
+    "login": "JMR-dev"
+  }
+}

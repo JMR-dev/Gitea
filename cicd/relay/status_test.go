@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -212,5 +213,73 @@ func TestGiteaClient(t *testing.T) {
 	s, found, err := g.Latest(context.Background(), "abc", "cloudbuild/infra")
 	if err != nil || !found || s.State != "success" {
 		t.Fatalf("latest %+v %v %v", s, found, err)
+	}
+}
+
+func TestGiteaFirstParentFiles(t *testing.T) {
+	const sha = "96776d039aca88cf58482966a72ca2ab7673c884"
+	answer := fixture(t, "gitea_commit_96776d0.json")
+	var gotPath, gotAuth string
+	var hasAuth bool
+	var reply func(w http.ResponseWriter)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hasAuth = r.Header["Authorization"]
+		gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.RequestURI()
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		reply(w)
+	}))
+	defer srv.Close()
+	serve := func(code int, body []byte) func(http.ResponseWriter) {
+		return func(w http.ResponseWriter) { w.WriteHeader(code); _, _ = w.Write(body) }
+	}
+
+	t.Run("answer", func(t *testing.T) {
+		reply = serve(http.StatusOK, answer)
+		g := &Gitea{BaseURL: srv.URL + "/", Repo: "JMR-dev/Gitea", Token: "t0k"}
+		parents, files, err := g.FirstParentFiles(context.Background(), sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotPath != "/api/v1/repos/JMR-dev/Gitea/git/commits/"+sha+"?stat=false&verification=false&files=true" ||
+			gotAuth != "token t0k" {
+			t.Fatalf("path %q auth %q", gotPath, gotAuth)
+		}
+		if len(parents) != 2 || parents[0] != "6fad9f8cb3e832eb460cd6ddc4add853247e27aa" ||
+			parents[1] != "7ff334149cdf54c8ca9dbaba8364d8bfc08417c4" {
+			t.Fatalf("parents %v", parents)
+		}
+		if len(files) != 20 || !slices.Contains(files, "vm/nftables/gitea.nft") || !slices.Contains(files, "scripts/bats/bootstrap.bats") {
+			t.Fatalf("%d files %v", len(files), files)
+		}
+	})
+	t.Run("anonymous", func(t *testing.T) {
+		reply = serve(http.StatusOK, answer)
+		g := &Gitea{BaseURL: srv.URL, Repo: "JMR-dev/Gitea"}
+		if _, _, err := g.FirstParentFiles(context.Background(), sha); err != nil {
+			t.Fatal(err)
+		}
+		if hasAuth {
+			t.Fatalf("sent Authorization %q without a token", gotAuth)
+		}
+	})
+	for name, r := range map[string]func(http.ResponseWriter){
+		"not found": serve(http.StatusNotFound, []byte(`{"message":"sha not found"}`)),
+		"bad json":  serve(http.StatusOK, []byte(`{"sha":`)),
+		// Without a file list, "no files" would read as "nothing to deploy".
+		"no files":      serve(http.StatusOK, []byte(`{"sha":"`+sha+`","parents":[{"sha":"6fad9f8cb3e832eb460cd6ddc4add853247e27aa"}]}`)),
+		"null files":    serve(http.StatusOK, []byte(`{"sha":"`+sha+`","parents":[],"files":null}`)),
+		"other commit":  serve(http.StatusOK, []byte(strings.Replace(string(answer), sha, "0123456789012345678901234567890123456789", 1))),
+		"server failed": serve(http.StatusBadGateway, []byte("bad gateway")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			reply = r
+			g := &Gitea{BaseURL: srv.URL, Repo: "JMR-dev/Gitea", Token: "t0k"}
+			if parents, files, err := g.FirstParentFiles(context.Background(), sha); err == nil {
+				t.Fatalf("no error; parents %v files %v", parents, files)
+			}
+		})
 	}
 }

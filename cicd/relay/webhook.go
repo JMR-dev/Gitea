@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,10 +14,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // maxBody bounds what a delivery may cost before its signature is checked.
-// A push of PAYLOAD_COMMIT_LIMIT (15) commits is a few tens of KiB.
+// A push lists at most [ui] FEED_MAX_COMMIT_NUM (5 by default) commits with
+// their file lists: a few KiB, unless one touches thousands of files.
 const maxBody = 2 << 20
 
 // The modes a delivery can map to. Each is its own Pub/Sub topic and Cloud
@@ -56,6 +59,19 @@ type Webhook struct {
 	Topics  map[string]string
 	Pub     Publisher
 	Status  StatusPoster // nil: post no statuses from here
+	Commits CommitReader // nil: classify a push to main from its payload alone
+	// LookupTimeout bounds the Commits read; 0 means DefaultLookupTimeout.
+	LookupTimeout time.Duration
+}
+
+// DefaultLookupTimeout leaves the publish most of what is left of Gitea's
+// webhook delivery timeout ([webhook] DELIVER_TIMEOUT, 5 s by default).
+const DefaultLookupTimeout = 2 * time.Second
+
+// CommitReader reads a commit's parents and the files it changed against its
+// first parent; *Gitea in production, a fake in tests.
+type CommitReader interface {
+	FirstParentFiles(ctx context.Context, sha string) (parents, files []string, err error)
 }
 
 func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -76,14 +92,14 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	event := r.Header.Get("X-Gitea-Event")
 	delivery := r.Header.Get("X-Gitea-Delivery")
-	d, err := h.decide(event, body)
+	d, err := h.decide(r.Context(), event, body)
 	if err != nil {
 		slog.Warn("delivery refused", "event", event, "delivery", delivery, "error", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if d.msg == nil {
-		slog.Info("delivery ignored", "event", event, "delivery", delivery, "reason", d.reason)
+		slog.Info("delivery ignored", append([]any{"event", event, "delivery", delivery, "reason", d.reason}, d.logs...)...)
 		h.post(r, d.statuses)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -96,7 +112,7 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publish failed", http.StatusBadGateway)
 		return
 	}
-	slog.Info("published", "topic", d.msg.Topic, "attributes", d.msg.Attributes)
+	slog.Info("published", append([]any{"topic", d.msg.Topic, "attributes", d.msg.Attributes}, d.logs...)...)
 	h.post(r, d.statuses)
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, "%s %s\n", d.msg.Attributes["mode"], d.msg.Attributes["pipelines"])
@@ -137,9 +153,10 @@ type decision struct {
 	msg      *Message
 	reason   string
 	statuses []Status // posted whether or not anything is published
+	logs     []any    // more attributes for the delivery's log line
 }
 
-func (h *Webhook) decide(event string, body []byte) (decision, error) {
+func (h *Webhook) decide(ctx context.Context, event string, body []byte) (decision, error) {
 	switch event {
 	case "push":
 		var p pushPayload
@@ -149,7 +166,7 @@ func (h *Webhook) decide(event string, body []byte) (decision, error) {
 		if p.Repository.FullName != h.Repo {
 			return decision{}, fmt.Errorf("delivery for %q, not %q", p.Repository.FullName, h.Repo)
 		}
-		return h.decidePush(p), nil
+		return h.decidePush(ctx, p), nil
 	case "pull_request":
 		var p prPayload
 		if err := json.Unmarshal(body, &p); err != nil {
@@ -168,30 +185,79 @@ func (h *Webhook) decide(event string, body []byte) (decision, error) {
 
 const zeroSHA = "0000000000000000000000000000000000000000"
 
-func (h *Webhook) decidePush(p pushPayload) decision {
+func (h *Webhook) decidePush(ctx context.Context, p pushPayload) decision {
 	if p.Ref != "refs/heads/main" {
 		return decision{reason: "push to " + p.Ref}
 	}
 	if p.After == "" || p.After == zeroSHA {
 		return decision{reason: "main deleted"}
 	}
-	paths, complete := p.paths()
+	paths, complete, source := h.pushPaths(ctx, p)
 	mode, pipelines, why := Classify(paths, complete)
 	drills := DrillStatuses(p.After, paths, complete)
+	logs := []any{"source", source, "before", p.Before,
+		"files", paths[:min(len(paths), maxLoggedFiles)], "files_total", len(paths)}
 	if len(pipelines) == 0 {
 		return decision{
 			reason: why,
 			statuses: append([]Status{{SHA: p.After, Context: "cloudbuild/" + ModeDeploy, State: "success",
 				Description: "nothing to deploy: " + why}}, drills...),
+			logs: logs,
 		}
 	}
-	return decision{statuses: drills, msg: &Message{
+	return decision{statuses: drills, logs: logs, msg: &Message{
 		Topic: h.Topics[mode],
 		Attributes: map[string]string{
 			"sha": p.After, "ref": "main", "pr": "",
 			"mode": mode, "pipelines": strings.Join(pipelines, ","),
 		},
 	}}
+}
+
+// Where a push to main's paths came from, as logged.
+const (
+	SourceFirstParent  = "first-parent"  // the head's files against its first parent, which is before
+	SourcePayload      = "payload"       // the payload's commit lists
+	SourceLookupFailed = "lookup-failed" // reading Gitea's API failed or timed out: gated
+)
+
+// maxLoggedFiles bounds a log line; files_total says how many there were.
+const maxLoggedFiles = 100
+
+// pushPaths is what a push to main changed, whether that is all of it, and
+// where it came from.
+//
+// Gitea lists each commit in before..after (at most [ui]
+// FEED_MAX_COMMIT_NUM, 5 by default) with its files against its own first
+// parent. So when a branch that had main merged into it is merged, its
+// "Merge branch 'main'" commit lists everything main gained since, which
+// main already deployed. When the head's first parent is before, the head's
+// own first-parent files are exactly `git diff before after`, uncapped, and
+// are used instead. Otherwise (a fast-forward, or a rebase merge of several
+// commits) the head is only the newest of the commits pushed, so the
+// payload's lists stand.
+func (h *Webhook) pushPaths(ctx context.Context, p pushPayload) (paths []string, complete bool, source string) {
+	paths, complete = p.paths()
+	if h.Commits == nil || p.Before == "" || p.Before == zeroSHA {
+		return paths, complete, SourcePayload
+	}
+	timeout := h.LookupTimeout
+	if timeout <= 0 {
+		timeout = DefaultLookupTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	parents, files, err := h.Commits.FirstParentFiles(ctx, p.After)
+	if err != nil {
+		// Unsettled, so gated: a person sees it before it deploys.
+		slog.Warn("reading the pushed commit failed; gating the push",
+			"sha", p.After, "before", p.Before, "error", err)
+		return paths, false, SourceLookupFailed
+	}
+	if len(parents) > 0 && parents[0] == p.Before {
+		return files, true, SourceFirstParent
+	}
+	return paths, complete, SourcePayload
 }
 
 func (h *Webhook) decidePR(p prPayload) decision {
@@ -233,9 +299,12 @@ func (h *Webhook) decidePR(p prPayload) decision {
 var Gated = []string{"image/gitea.version", "image/alpine.version", "vm/bootstrap.sh"}
 
 // Classify maps the paths a push to main changed onto a mode and the
-// pipelines to run. complete is false when Gitea truncated the commit list
-// (PAYLOAD_COMMIT_LIMIT): the paths are then a sample, a gated file may be
-// among the missing ones, so everything runs and a person approves it.
+// pipelines to run. complete is false when the paths may be only part of the
+// push: Gitea listed fewer commits than were pushed ([ui]
+// FEED_MAX_COMMIT_NUM, 5 by default) and the head's first parent isn't the
+// push's before, or Gitea's API couldn't be read (see pushPaths). The paths
+// are then a sample, a gated file may be among the missing ones, so
+// everything runs and a person approves it.
 func Classify(paths []string, complete bool) (mode string, pipelines []string, reason string) {
 	if !complete {
 		return ModeGated, []string{PipelineInfra, PipelineImage}, "commit list truncated"
@@ -368,6 +437,7 @@ type repoRef struct {
 
 type pushPayload struct {
 	Ref          string   `json:"ref"`
+	Before       string   `json:"before"`
 	After        string   `json:"after"`
 	TotalCommits int      `json:"total_commits"`
 	Commits      []commit `json:"commits"`

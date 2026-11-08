@@ -62,10 +62,11 @@
       when: fail2ban_present | default(false) | bool
       listen: journald config changed
 
-    # Role app's: Gitea or Caddy is moving to its fixed address, and either may
-    # hold the other's. Caddy stops first, so the restarts below start Gitea,
-    # then Caddy, with no address still held. "Restart caddy" starts it again,
-    # and role app's last task would too.
+    # Role app's: Gitea or Caddy is moving to its fixed address or MAC, and
+    # either may hold the other's address. Caddy stops first, so the restarts
+    # below (notified with this) start Gitea, then Caddy, with no address still
+    # held. "Restart caddy" starts it again, and so would role app's "Gitea and
+    # Caddy running", the task right after its flush of these handlers.
     - name: Stop caddy before the containers change address
       ansible.builtin.systemd_service:
         name: caddy.service

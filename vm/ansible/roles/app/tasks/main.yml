@@ -166,35 +166,25 @@
 # Gitea and Caddy (on the bridge) have fixed addresses on the gitea network
 # (vars/main.yml). One that a running container holds can't be taken, and
 # until they had them, podman handed both out in turn, so either may hold the
-# other's now. When either is about to change address, Caddy stops before the
-# restarts below (site.yml's handlers), which then start Gitea, then Caddy,
-# each on its own address. Read before the quadlets change; a container that
+# other's now. When either is about to change address, or MAC (fixed too,
+# since 2026-11-07), Caddy stops before the restarts below (site.yml's
+# handlers), which then start Gitea, then Caddy, each on its own
+# (fixed-addresses.yml); once both run, the host's neighbor entries for their
+# old MACs are flushed. Read before the quadlets change; a container that
 # isn't running holds nothing.
 - name: The containers' addresses now
   ansible.builtin.command:
     argv: [podman, container, inspect, "{{ item }}"]
   loop: [gitea, caddy]
-  register: app_addresses
+  register: app_inspect
   changed_when: false
   failed_when: false
   check_mode: false
 
-- name: Stop Caddy first if either is changing address
-  ansible.builtin.debug:
-    msg: "{{ item.item }} holds {{ app_held }} on the gitea network, not {{ app_wanted }}: Caddy stops before the restarts"
-  loop: "{{ app_addresses.results }}"
-  loop_control:
-    label: "{{ item.item }}"
+- name: Either changing address or MAC
+  ansible.builtin.include_tasks: fixed-addresses.yml
   vars:
-    app_held: >-
-      {{ (item.stdout | from_json | first).NetworkSettings.Networks.gitea.IPAddress | default('')
-         if item.rc == 0 and item.stdout | length > 0 else '' }}
-    app_wanted: "{{ GITEA_ADDRESS if item.item == 'gitea' else CADDY_ADDRESS }}"
-  when:
-    - app_held | length > 0
-    - app_held != app_wanted
-  changed_when: true
-  notify: container addresses changed
+    app_fixed_step: before
 
 - name: Quadlets
   ansible.builtin.template:
@@ -245,3 +235,43 @@
     name: "{{ item }}"
     state: started
   loop: [gitea.service, caddy.service]
+
+# The host's neighbor (ARP) entries on the gitea bridge, flushed on every run.
+# A container that came back on a new MAC (its move to a fixed one, or one
+# just started above after a run that was cut off mid-restart) leaves them
+# naming the old one, and the published ports (DNAT), and Caddy on the host
+# network, reach the containers through them: traffic was lost until they
+# expired, 23-47 s. Flushed, the host asks again, which costs only a re-ARP,
+# so no run reports it as a change. The bridge's name from podman. Not under
+# --check. tests/check (neighbor_flush) holds these to this place.
+- name: The gitea network's bridge
+  ansible.builtin.command:
+    argv: [podman, network, inspect, gitea]
+  register: app_bridge
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Flush the host's neighbor entries on it
+  ansible.builtin.command:
+    argv: [ip, neigh, flush, dev, "{{ (app_bridge.stdout | from_json | first).network_interface }}"]
+  changed_when: false
+  when: not ansible_check_mode
+
+# Each now runs on its fixed address and MAC (vars/main.yml), the proof the
+# restarts above took them: one still on a random MAC loses traffic again at
+# its next restart. Caddy on the host network has neither. A container that
+# doesn't exist fails the check below, not this inspect. Not under --check,
+# where nothing restarted.
+- name: Their addresses now
+  ansible.builtin.command:
+    argv: [podman, container, inspect, "{{ item }}"]
+  loop: "{{ ['gitea'] if caddy_mode == 'host' else ['gitea', 'caddy'] }}"
+  register: app_inspect
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Each on its own
+  ansible.builtin.include_tasks: fixed-addresses.yml
+  vars:
+    app_fixed_step: after

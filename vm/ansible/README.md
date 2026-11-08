@@ -48,7 +48,13 @@ runs the telemetry checks:
   `shutdown_delay` + `grace_period` + 3 s to fit in `caddy.container`'s
   explicit `StopTimeout=`, itself under `TimeoutStopSec` (systemd's 90 s if
   unset), so a stop ends before podman's SIGKILL (`docs/runbook.md`, "Caddy's
-  stop budget"); `scripts/check-peer-config.sh` over the peer script,
+  stop budget"); Gitea's and Caddy's fixed MACs (`fixed_macs()`), the order
+  and topics of `site.yml`'s handlers that stop and restart them
+  (`app_handlers()`), role app's flush of the gitea bridge's neighbor entries
+  once both run (`neighbor_flush()`), those three checks themselves on broken
+  inputs (`tests/test_check.py`), and `tests/fixed-addresses.yml` over role app's
+  fixed-address check, as is and under `--check` (`docs/runbook.md`, "Fixed
+  addresses and MACs"); `scripts/check-peer-config.sh` over the peer script,
   `tests/tunnel-state.yml` over role tunnel's states, and
   `scripts/check-metadata-guard.sh --static`, which checks that the ruleset's
   metadata guard names the uid `alloy.container` runs as and the address

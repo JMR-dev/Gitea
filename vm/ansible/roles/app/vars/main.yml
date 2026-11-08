@@ -28,7 +28,8 @@ GITEA_LFS_JWT_SECRET: "${GITEA_LFS_JWT_SECRET}"
 CADDY_EMAIL: "${CADDY_EMAIL}"
 
 GITEA_UPSTREAM: "{{ '127.0.0.1:3000' if caddy_mode == 'host' else 'gitea:3000' }}"
-CADDY_NETWORK: "{{ 'host' if caddy_mode == 'host' else 'gitea.network' }}"
+# On the bridge, with its fixed MAC (below) as a network option.
+CADDY_NETWORK: "{{ 'host' if caddy_mode == 'host' else 'gitea.network:mac=' ~ CADDY_MAC }}"
 CADDY_PUBLISH_PORTS: "{{ caddy_publish_host if caddy_mode == 'host' else caddy_publish_bridge }}"
 CADDY_SYSCTL: "{{ caddy_sysctl_host if caddy_mode == 'host' else caddy_sysctl_bridge }}"
 # Where the Caddyfile's :2020 metrics site listens: loopback on the host
@@ -57,6 +58,23 @@ GITEA_ADDRESS: "{{ podman_gateway | regex_replace('[0-9]+$', '250') }}"
 CADDY_ADDRESS: "{{ podman_gateway | regex_replace('[0-9]+$', '251') }}"
 CADDY_IP: "{{ caddy_ip_host if caddy_mode == 'host' else 'IP=' ~ CADDY_ADDRESS }}"
 caddy_ip_host: "# Network=host: no address on the gitea network."
+
+# And fixed MACs there, named after those addresses (.250 fa, .251 fb). podman
+# gives every new container a random MAC, and after a restart on a fixed
+# address Caddy's and the host's neighbor (ARP) entries still name the old one:
+# traffic to Gitea was lost for 23-47 s after a restart (2026-11-07).
+# Lowercase, as podman prints them and role app compares them, and locally
+# administered unicast (02:...). Today Gitea and Caddy are the only containers
+# on this bridge; tests/check's fixed_macs() checks only their two quadlets
+# (one MAC each, locally administered unicast, not equal), so a container
+# added to the gitea network must get a MAC of its own by hand. Quadlet has no
+# key of its own for a MAC, but passes Network= options to podman's
+# --network, so each quadlet's Network= is gitea.network:mac=<it>, alongside
+# its IP= (quadlet -dryrun and podman 5.8.9: --ip <address> --network
+# gitea:mac=<mac>, both applied). Not on the host network, which has no MAC to
+# set: CADDY_NETWORK leaves the option out there.
+GITEA_MAC: "02:00:00:00:00:fa"
+CADDY_MAC: "02:00:00:00:00:fb"
 
 # Gitea calls log.Fatal when GITEA_RUNNER_REGISTRATION_TOKEN_FILE names a file
 # it cannot read, so the lines and the file come from one decision: whether

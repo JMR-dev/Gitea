@@ -1,0 +1,156 @@
+# Runs roles/app/tasks/fixed-addresses.yml over every case role app can meet,
+# with made-up `podman container inspect` output, and checks what it comes
+# to. Before the quadlets change: whether Caddy is stopped first and both
+# restarted (the handlers notified). Once both run: whether the check passes,
+# and what it says when it doesn't. Runs on localhost and touches nothing;
+# tests/check runs it.
+#
+# A case's inspect entries are as register keeps a looped command's results:
+# {name, networks} for a running container (networks as podman prints
+# NetworkSettings.Networks), {name, rc} for one that doesn't exist, {name,
+# skipped} for a command skipped under --check. The cases marked check_mode
+# run only under --check (tests/check runs this both ways): a task's
+# check_mode doesn't change ansible_check_mode, which the role reads.
+- name: Gitea's and Caddy's fixed addresses and MACs, case by case
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    GITEA_ADDRESS: 10.89.10.250
+    CADDY_ADDRESS: 10.89.10.251
+    CADDY_MAC: "02:00:00:00:00:fb"
+    gitea_mac: "02:00:00:00:00:fa"
+    gitea_fixed: {gitea: {IPAddress: 10.89.10.250, MacAddress: "02:00:00:00:00:fa"}}
+    caddy_fixed: {gitea: {IPAddress: 10.89.10.251, MacAddress: "02:00:00:00:00:fb"}}
+    # What podman gave a test container on a fixed address, 2026-11-07.
+    gitea_random: {gitea: {IPAddress: 10.89.10.250, MacAddress: "6e:ca:bd:13:7c:e7"}}
+    caddy_random: {gitea: {IPAddress: 10.89.10.251, MacAddress: "e6:ed:0c:1f:4f:e4"}}
+    # A container that exists but isn't running keeps its gitea entry, empty
+    # (podman 5.8.9, 2026-11-07).
+    stopped: {gitea: {IPAddress: "", MacAddress: ""}}
+    cases:
+      - what: random MACs on the fixed addresses (the deploy that brings fixed ones)
+        step: before
+        inspect: [{name: gitea, networks: "{{ gitea_random }}"}, {name: caddy, networks: "{{ caddy_random }}"}]
+        stop: true
+        restart: true
+      - what: fixed addresses and MACs (every deploy after)
+        step: before
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+      - what: podman printing a MAC in capitals
+        step: before
+        inspect:
+          - {name: gitea, networks: {gitea: {IPAddress: 10.89.10.250, MacAddress: "02:00:00:00:00:FA"}}}
+          - {name: caddy, networks: "{{ caddy_fixed }}"}
+      - what: the fixed MAC written in capitals
+        step: before
+        gitea_mac: "02:00:00:00:00:FA"
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+      - what: Gitea on Caddy's address, with its own MAC
+        step: before
+        inspect:
+          - {name: gitea, networks: {gitea: {IPAddress: 10.89.10.251, MacAddress: "02:00:00:00:00:fa"}}}
+          - {name: caddy, rc: 125}
+        stop: true
+        restart: true
+      - what: neither container exists (a first deploy)
+        step: before
+        inspect: [{name: gitea, rc: 125}, {name: caddy, rc: 125}]
+      - what: Caddy on the host network, Gitea on a random MAC
+        step: before
+        inspect: [{name: gitea, networks: "{{ gitea_random }}"}, {name: caddy, networks: {host: {}}}]
+        stop: true
+        restart: true
+      - what: Caddy on the host network, Gitea fixed
+        step: before
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: {host: {}}}]
+      - what: Caddy stopped, its gitea entry empty (it holds nothing)
+        step: before
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: "{{ stopped }}"}]
+      - what: Gitea stopped, Caddy on a random MAC
+        step: before
+        inspect: [{name: gitea, networks: "{{ stopped }}"}, {name: caddy, networks: "{{ caddy_random }}"}]
+        stop: true
+        restart: true
+      - what: after the restarts, both fixed
+        step: after
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+      - what: after the restarts, podman printing a MAC in capitals
+        step: after
+        inspect:
+          - {name: gitea, networks: "{{ gitea_fixed }}"}
+          - {name: caddy, networks: {gitea: {IPAddress: 10.89.10.251, MacAddress: "02:00:00:00:00:FB"}}}
+      - what: after the restarts, the fixed MAC written in capitals
+        step: after
+        gitea_mac: "02:00:00:00:00:FA"
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+      - what: after the restarts, Gitea still on a random MAC
+        step: after
+        inspect: [{name: gitea, networks: "{{ gitea_random }}"}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+        fails: gitea holds 10.89.10.250 (6e:ca:bd:13:7c:e7) on the gitea network, not 10.89.10.250 (02:00:00:00:00:fa)
+      - what: after the restarts, Caddy on Gitea's MAC
+        step: after
+        inspect:
+          - {name: gitea, networks: "{{ gitea_fixed }}"}
+          - {name: caddy, networks: {gitea: {IPAddress: 10.89.10.251, MacAddress: "02:00:00:00:00:fa"}}}
+        fails: caddy holds 10.89.10.251 (02:00:00:00:00:fa) on the gitea network, not 10.89.10.251 (02:00:00:00:00:fb)
+      - what: after the restarts, Gitea off the gitea network
+        step: after
+        inspect: [{name: gitea, networks: {}}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+        fails: gitea has no address on the gitea network
+      # After "Gitea and Caddy running", an empty entry is a container that
+      # didn't come up: a real failure.
+      - what: after the restarts, Caddy not running, its gitea entry empty
+        step: after
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, networks: "{{ stopped }}"}]
+        fails: caddy has no address on the gitea network
+      # Its --rm container gone while systemd waits to restart it: the inspect
+      # fails (failed_when: false), and the check says so.
+      - what: after the restarts, Caddy's container gone
+        step: after
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}, {name: caddy, rc: 125}]
+        fails: caddy has no address on the gitea network
+      - what: after the restarts, Caddy on the host network (Gitea alone checked)
+        step: after
+        inspect: [{name: gitea, networks: "{{ gitea_fixed }}"}]
+      - what: under --check, where the inspect is skipped and nothing restarted
+        step: after
+        check_mode: true
+        inspect: [{name: gitea, skipped: true}, {name: caddy, skipped: true}]
+      - what: under --check, a random MAC before the change
+        step: before
+        check_mode: true
+        inspect: [{name: gitea, networks: "{{ gitea_random }}"}, {name: caddy, networks: "{{ caddy_fixed }}"}]
+        stop: true
+        restart: true
+    # The cases that come out wrong (fixed-addresses-case.yml adds them).
+    wrong_cases: []
+    these_cases: >-
+      {{ cases | selectattr('check_mode', 'defined') | list if ansible_check_mode
+         else cases | rejectattr('check_mode', 'defined') | list }}
+  # As site.yml's, but noting what was notified.
+  handlers:
+    - name: Caddy stops first
+      ansible.builtin.set_fact:
+        notified_stop: true
+      listen: container addresses changed
+
+    - name: Both restart
+      ansible.builtin.set_fact:
+        notified_restart: true
+      listen: gitea config changed
+  tasks:
+    - name: One case
+      ansible.builtin.include_tasks: fixed-addresses-case.yml
+      loop: "{{ these_cases }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.what }}"
+
+    - name: Every case
+      ansible.builtin.assert:
+        that: wrong_cases | length == 0
+        fail_msg: >-
+          {{ wrong_cases | length }} of {{ these_cases | length }} cases came out wrong: {{ wrong_cases | join('; ') }}
+        success_msg: "{{ these_cases | length }} cases{{ ' under --check' if ansible_check_mode else '' }}, all as they should be"
