@@ -704,6 +704,41 @@ sudo podman inspect <name> --format '{{.NetworkSettings.Networks.gitea.IPAddress
 sudo podman rm -f <name> && sudo systemctl start gitea caddy
 ```
 
+### Fixed addresses and MACs
+
+Each also has a fixed MAC there (`GITEA_MAC` `02:00:00:00:00:fa`, `CADDY_MAC`
+`02:00:00:00:00:fb` in `vm/ansible/roles/app/vars/main.yml`, as the network's
+option: `Network=gitea.network:mac=…`, next to `IP=`; none for Caddy on the
+host network). Without one, podman gives every new container a random MAC, and
+after a restart on the same address Caddy's and the host's neighbor (ARP)
+entries still name the old MAC: traffic to Gitea was lost for 23-47 s after a
+restart (2026-11-07). When either holds the wrong address or MAC, the playbook
+stops Caddy, restarts Gitea, then Caddy (`roles/app/tasks/fixed-addresses.yml`).
+On every run, once both are running, it flushes the host's neighbor entries on
+the gitea bridge (a re-ARP is all that costs), and then fails if either isn't
+running on its own address and MAC.
+
+To look, read-only. `/etc/gitea/caddy-network` says which network Caddy is
+on, `bridge` or `host`:
+
+```bash
+# Gitea, in either mode: its address and MAC on the gitea network
+sudo podman container inspect gitea \
+  --format '{{.NetworkSettings.Networks.gitea.IPAddress}} {{.NetworkSettings.Networks.gitea.MacAddress}}'
+# Caddy, on the bridge only (on the host network it has no gitea entry)
+sudo podman container inspect caddy \
+  --format '{{.NetworkSettings.Networks.gitea.IPAddress}} {{.NetworkSettings.Networks.gitea.MacAddress}}'
+# Caddy's neighbor entry for Gitea, on the bridge only: from Caddy's own
+# network namespace, Gitea's fixed MAC or nothing yet. Gitea's address is .250
+# of the VM's gitea:podmanSubnet, so read it rather than typing it.
+gitea_ip="$(sudo podman container inspect gitea --format '{{.NetworkSettings.Networks.gitea.IPAddress}}')"
+sudo nsenter --net --target "$(sudo podman container inspect caddy --format '{{.State.Pid}}')" \
+  ip neigh show "$gitea_ip"
+# The host's entries on the gitea network's bridge, in either mode: the
+# published ports go through them, and so does Caddy on the host network
+ip neigh show dev "$(sudo podman network inspect gitea --format '{{.NetworkInterface}}')"
+```
+
 ### Caddy's stop budget
 
 On a stop (a deploy's restart, `systemctl stop caddy`, a reboot) podman sends

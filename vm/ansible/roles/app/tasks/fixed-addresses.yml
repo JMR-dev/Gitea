@@ -1,0 +1,72 @@
+# Gitea's and Caddy's addresses and MACs on the gitea network, against their
+# fixed ones (vars/main.yml), from app_inspect: the registered results of
+# `podman container inspect <name>` looped over the containers to check.
+# main.yml includes this twice, with app_fixed_step:
+#   before -- before the quadlets change. Either holding the wrong address or
+#     MAC notifies site.yml's handlers: Caddy stops, Gitea restarts, then
+#     Caddy (main.yml flushes the gitea bridge's neighbor entries once both
+#     run, on every run).
+#   after -- once both run. Each one checked must hold its own; not under
+#     --check, where nothing restarted.
+# A container holds nothing on the gitea network when it doesn't exist (its
+# inspect failed), isn't on that network (Caddy on the host network), or isn't
+# running (its entry is there, but empty). Before, that is nothing to change;
+# after "Gitea and Caddy running", it is a container that didn't come up. MACs
+# compare in lowercase, both the one podman prints and the fixed one.
+# tests/fixed-addresses.yml runs this over made-up inspect output.
+- name: Nothing read yet
+  ansible.builtin.set_fact:
+    app_wrong: []
+    app_off: []
+    app_fixed:
+      gitea: {address: "{{ GITEA_ADDRESS }}", mac: "{{ GITEA_MAC | lower }}"}
+      caddy: {address: "{{ CADDY_ADDRESS }}", mac: "{{ CADDY_MAC | lower }}"}
+
+# app_wrong: each one holding an address there that isn't its own, or its
+# address with another MAC. app_off: each one that holds none.
+- name: What each holds on the gitea network
+  ansible.builtin.set_fact:
+    app_wrong: >-
+      {{ app_wrong + ([{'name': item.item, 'says': app_says}] if app_address
+                      and (app_address != app_fixed[item.item].address or app_mac != app_fixed[item.item].mac)
+                      else []) }}
+    app_off: "{{ app_off + ([] if app_address else [item.item]) }}"
+  loop: "{{ app_inspect.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    app_net: >-
+      {{ (item.stdout | from_json | first).NetworkSettings.Networks.gitea | default({})
+         if item.rc == 0 and item.stdout | length > 0 else {} }}
+    app_address: "{{ app_net.IPAddress | default('') }}"
+    app_mac: "{{ app_net.MacAddress | default('') | lower }}"
+    app_says: >-
+      {{ item.item }} holds {{ app_address }} ({{ app_mac }}) on the gitea network, not
+      {{ app_fixed[item.item].address }} ({{ app_fixed[item.item].mac }})
+  # Each inspect that ran (under --check the after step's didn't).
+  when: item is not skipped
+
+# Both topics: Caddy stops first, then both restart, in site.yml's order. A
+# restart even when no quadlet changes this run: one that wrote them and was
+# cut off before its handlers leaves a container on its old address or MAC
+# under quadlets that are already right.
+- name: Stop Caddy first, then restart both, if either is changing address or MAC
+  ansible.builtin.debug:
+    msg: "{{ item.says }}: Caddy stops first, then both restart"
+  loop: "{{ app_wrong }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: app_fixed_step == 'before'
+  changed_when: true
+  notify: [container addresses changed, gitea config changed]
+
+- name: Gitea and Caddy run on their fixed addresses and MACs
+  ansible.builtin.assert:
+    that:
+      - app_wrong | length == 0
+      - app_off | length == 0
+    fail_msg: >-
+      {{ ((app_wrong | map(attribute='says') | list)
+          + (app_off | map('regex_replace', '$', ' has no address on the gitea network') | list)) | join('; ') }}
+    quiet: true
+  when: app_fixed_step == 'after' and not ansible_check_mode

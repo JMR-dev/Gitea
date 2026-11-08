@@ -1,6 +1,6 @@
 # Rendered by vm/bootstrap.sh into /etc/containers/systemd/
 #
-# host is chosen by bootstrap.sh at run time, not by hand:
+# Caddy's Network= is chosen by bootstrap.sh at run time, not by hand:
 # the googleclouddns ACME plugin authenticates via Application Default
 # Credentials, which on GCE means reaching the metadata server at
 # 169.254.169.254. bootstrap.sh probes whether a container on the gitea bridge
@@ -24,9 +24,10 @@ AutoUpdate=registry
 PodmanArgs=--authfile=/etc/containers/ar-auth.json
 Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
 Network=host
-# On the bridge, a fixed address, so that it never takes Gitea's from podman's
-# allocator while Gitea is down (gitea.container). Caddy keeps the metadata
-# server: the DNS-01 plugin's credentials come from it.
+# On the bridge, a fixed MAC (the mac= option on Network=, as Gitea's:
+# gitea.container says why) and a fixed address, so that it never takes
+# Gitea's from podman's allocator while Gitea is down (gitea.container). Caddy
+# keeps the metadata server: the DNS-01 plugin's credentials come from it.
 # Network=host: no address on the gitea network.
 LogDriver=journald
 
