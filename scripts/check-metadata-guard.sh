@@ -289,7 +289,10 @@ grep -q '^Network=host$' "$alloy_quadlet" || fail "alloy.container isn't on the 
 # Gitea: a fixed address on the gitea network, the one the forward rule names.
 gitea_ip="$(sed -n 's/^IP=//p' "$gitea_quadlet")"
 [[ "$gitea_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "gitea.container has no fixed IP= (got '${gitea_ip}')"
-grep -q '^Network=gitea.network$' "$gitea_quadlet" || fail "gitea.container isn't on the gitea network"
+# One option may follow the name, Gitea's fixed MAC (gitea.network:mac=...), and
+# nothing else: an ip=/ip6= could give it an address the forward rule doesn't name.
+grep -qE '^Network=gitea\.network(:mac=[0-9a-f]{2}(:[0-9a-f]{2}){5})?$' "$gitea_quadlet" \
+  || fail "gitea.container isn't on the gitea network"
 gi="${gitea_ip//./\\.}"
 [[ "$(grep -cE "^\s*ip saddr ${gi} ip daddr ${md} .*\breject\b" <<<"$rules")" -eq 1 ]] \
   || fail "the ruleset should have one rule rejecting ${gitea_ip}, gitea.container's IP=, to the metadata server"
