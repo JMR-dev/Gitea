@@ -1,0 +1,177 @@
+{
+  "ref": "refs/heads/main",
+  "before": "f93e5b769c1f385a4072c51b9476ee18ab649154",
+  "after": "6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+  "compare_url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/compare/f93e5b769c1f385a4072c51b9476ee18ab649154...6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+  "commits": [
+    {
+      "id": "6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+      "message": "Merge pull request 'Take over the infra lock when its holder build has finished' (#43) from feat/infra-lock-takeover into main\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T19:01:24Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "cicd/pkg/identity/identity.go",
+        "cicd/pkg/identity/identity_test.go",
+        "cloudbuild/infra.yaml",
+        "docs/cicd.md",
+        "scripts/cicd/infra_deploy.py",
+        "scripts/cicd/test_cicd.py"
+      ]
+    },
+    {
+      "id": "68ba0d9b82390c41c59719d6777cfb774298b56a",
+      "message": "Merge branch 'main' into feat/infra-lock-takeover\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/68ba0d9b82390c41c59719d6777cfb774298b56a",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T18:46:57Z",
+      "added": [
+        "infra/pkg/dns/dns_test.go",
+        "infra/pkg/iam/iam_test.go"
+      ],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "docs/runbook.md",
+        "infra/main.go",
+        "infra/pkg/dns/dns.go",
+        "infra/pkg/iam/iam.go"
+      ]
+    },
+    {
+      "id": "13c2fb802db326423ecd6cafd267429583df5450",
+      "message": "Merge branch 'main' into feat/infra-lock-takeover\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/13c2fb802db326423ecd6cafd267429583df5450",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T18:41:01Z",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "docs/runbook.md",
+        "image/caddy/Dockerfile",
+        "vm/ansible/README.md",
+        "vm/ansible/tests/check",
+        "vm/ansible/tests/golden/bridge-off/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-off/caddy.container.golden",
+        "vm/ansible/tests/golden/bridge-on/Caddyfile.golden",
+        "vm/ansible/tests/golden/bridge-on/caddy.container.golden",
+        "vm/ansible/tests/golden/host-detection/Caddyfile.golden",
+        "vm/ansible/tests/golden/host-detection/caddy.container.golden",
+        "vm/config/Caddyfile.tmpl",
+        "vm/quadlets/caddy.container"
+      ]
+    },
+    {
+      "id": "01426fb6eaa3b278082c03523899a577fdb112f5",
+      "message": "docs/cicd: D5 passed for the self-clearing deploy lock\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/01426fb6eaa3b278082c03523899a577fdb112f5",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T10:33:32-06:00",
+      "added": [],
+      "removed": [],
+      "modified": [
+        "docs/cicd.md"
+      ]
+    },
+    {
+      "id": "b02d6194c51df196f6b8ab711d97adc30cb7499d",
+      "message": "Merge remote-tracking branch 'origin/main' into feat/infra-lock-takeover\n",
+      "url": "https://gitea.jasonmross.dev/JMR-dev/Gitea/commit/b02d6194c51df196f6b8ab711d97adc30cb7499d",
+      "author": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "committer": {
+        "name": "JMR-dev",
+        "email": "jmr-dev@noreply.gitea.jasonmross.dev",
+        "username": "JMR-dev"
+      },
+      "verification": null,
+      "timestamp": "2026-11-07T09:55:46-06:00",
+      "added": [
+        ".gitea/actionlint.yaml",
+        ".gitea/workflows/checks.yml"
+      ],
+      "removed": [],
+      "modified": [
+        "Makefile",
+        "docs/cicd.md",
+        "scripts/cicd/test_cicd.py"
+      ]
+    }
+  ],
+  "total_commits": 6,
+  "head_commit": {
+    "id": "6fad9f8cb3e832eb460cd6ddc4add853247e27aa",
+    "added": [],
+    "removed": [],
+    "modified": [
+      "Makefile",
+      "cicd/pkg/identity/identity.go",
+      "cicd/pkg/identity/identity_test.go",
+      "cloudbuild/infra.yaml",
+      "docs/cicd.md",
+      "scripts/cicd/infra_deploy.py",
+      "scripts/cicd/test_cicd.py"
+    ]
+  },
+  "repository": {
+    "id": 1,
+    "name": "Gitea",
+    "full_name": "JMR-dev/Gitea",
+    "private": false,
+    "default_branch": "main"
+  },
+  "pusher": {
+    "id": 1,
+    "login": "JMR-dev"
+  },
+  "sender": {
+    "id": 1,
+    "login": "JMR-dev"
+  }
+}

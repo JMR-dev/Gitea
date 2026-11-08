@@ -234,11 +234,12 @@ func sameBuild(a, b string) bool {
 	return i >= 0 && j >= 0 && a[i:] == b[j:]
 }
 
-// Gitea is the slice of Gitea's API used here: commit statuses on one repo.
+// Gitea is the slice of Gitea's API used here, on one repo: commit statuses,
+// and a commit's first-parent files.
 type Gitea struct {
 	BaseURL string // https://gitea.example
 	Repo    string // owner/name
-	Token   string // write:repository
+	Token   string // write:repository; empty sends none, which reads a public repo
 	Client  *http.Client
 }
 
@@ -277,7 +278,9 @@ func (g *Gitea) do(ctx context.Context, method, path string, body any, out any) 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "token "+g.Token)
+	if g.Token != "" {
+		req.Header.Set("Authorization", "token "+g.Token)
+	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -301,6 +304,40 @@ func (g *Gitea) Post(ctx context.Context, s Status) error {
 	return g.do(ctx, http.MethodPost, "/repos/"+g.Repo+"/statuses/"+url.PathEscape(s.SHA), map[string]string{
 		"state": s.State, "context": s.Context, "description": s.Description, "target_url": s.TargetURL,
 	}, nil)
+}
+
+// FirstParentFiles is a commit's parents and the files it changed against its
+// first parent (Gitea runs `git log --name-status -m --first-parent`), all of
+// them: the commit API doesn't cap the list as the push webhook caps commits.
+func (g *Gitea) FirstParentFiles(ctx context.Context, sha string) (parents, files []string, err error) {
+	var c struct {
+		SHA     string `json:"sha"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	q := "/repos/" + g.Repo + "/git/commits/" + url.PathEscape(sha) + "?stat=false&verification=false&files=true"
+	if err := g.do(ctx, http.MethodGet, q, nil, &c); err != nil {
+		return nil, nil, err
+	}
+	if c.SHA != sha {
+		return nil, nil, fmt.Errorf("asked for commit %s, Gitea answered for %q", sha, c.SHA)
+	}
+	// A missing or null list isn't "no files", which would deploy nothing; a
+	// commit that changed nothing has an empty one.
+	if c.Files == nil {
+		return nil, nil, fmt.Errorf("commit %s: Gitea sent no file list", sha)
+	}
+	for _, p := range c.Parents {
+		parents = append(parents, p.SHA)
+	}
+	for _, f := range c.Files {
+		files = append(files, f.Filename)
+	}
+	return parents, files, nil
 }
 
 // Latest is the newest status for one context on a commit.

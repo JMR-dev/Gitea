@@ -46,7 +46,7 @@ whose permissions have been proven for real.
 | `cb-launcher-preview` | the preview trigger's own build | submit builds as the two below **only**, the source bucket |
 | `cb-infra-preview` | a PR's `cloudbuild/infra.yaml` | `roles/dns.reader` + `roles/browser` on the app project, read the app stack's state, its passphrase, read drill passes |
 | `cb-image-preview` | a PR's `cloudbuild/image.yaml` | logs and the source bucket; nothing in the app project |
-| `ci-relay`, `ci-status` | the two functions | their topics, the webhook secret and the status token |
+| `ci-relay`, `ci-status` | the two functions | their topics, the webhook secret and the status token, which `gitea-webhook` also uses to read the pushed commit (below) |
 | `ci-status-push` | the push subscription | invoke `build-status`, nothing else |
 
 **A PR preview runs code nobody has reviewed yet**, so it runs as accounts
@@ -125,6 +125,25 @@ on every PR to main:
 
 The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
 
+**What a push to main changed** comes from `pushPaths`, in the same file:
+- **The head's first-parent diff, when its first parent is the push's
+  `before`:** a merge commit, a squash or a single commit. `gitea-webhook`
+  reads it from Gitea's API (`GET /repos/JMR-dev/Gitea/git/commits/<sha>?files=true`,
+  with the status token), so it is exactly `git diff before after`, however
+  many commits the push carried.
+- **Otherwise, the payload's commit lists:** a fast-forward, or a rebase merge
+  of several commits, where the head is only the newest commit pushed.
+- Why not the payload always: Gitea lists each commit with its files against
+  its own first parent. On a branch that had main merged into it, the "Merge
+  branch 'main'" commit names everything main gained since, so summing the
+  lists redeployed what main had already shipped (#47, #48, #43 and #49 on
+  2026-11-07).
+- A read that fails or takes over 2 s gates the push, with every drill
+  pending.
+- Each push to main's log line (`published` or `delivery ignored`) carries
+  `source` (`first-parent`, `payload` or `lookup-failed`), `before`, and the
+  files (the first 100, with `files_total`).
+
 | Event | Runs | Approval |
 |---|---|---|
 | PR opened, synchronized or reopened (same repo, allowed author **and** pusher) | `pulumi preview`; image build without push | no |
@@ -132,7 +151,7 @@ The policy lives in `Classify` in `cicd/relay/webhook.go`, with table tests.
 | push to main touching `image/` or `cloudbuild/image.yaml` | image build and release | no |
 | push to main touching `scripts/cicd/release_gate.py` (the gate both pipelines run) | infra deploy **and** image build and release | no |
 | push to main touching `image/gitea.version`, `image/alpine.version` or `vm/bootstrap.sh` | as above | **yes** (`make approve`) |
-| push whose commit list Gitea truncated (more than 15 commits) | everything | **yes** |
+| push of more than 5 commits (Gitea lists 5, `[ui] FEED_MAX_COMMIT_NUM`) by a rebase or fast-forward merge, or any push to main whose head Gitea's API couldn't be read for | everything, with every drill pending | **yes** |
 | anything else (docs, `cicd/`, `scripts/ops/`, `scripts/cicd/bootstrap.py` and tests, `.gitea/`, the Makefile) | nothing; status "nothing to deploy" | n/a |
 | Sunday 04:00 UTC | image rebuild from main and release | no |
 
@@ -181,6 +200,14 @@ make approve BUILD=<id>      # gcloud beta builds approve (there is no GA comman
     commit on main also changes the image.
   - An approved build is never skipped this way, because it may carry the
     version bump the newer one can't release.
+  - **Until the release gate's `superseded` fix lands (its own PR), don't
+    merge an older branch while an earlier image merge's build hasn't
+    reached its release step.** `superseded` asks Gitea's compare API, whose
+    commits include the newer branch's "Merge branch 'main'" commits, and
+    those list the earlier merge's image change. So the earlier build skips
+    its release as superseded, while the newer merge, now classified by its
+    own first-parent diff, may not run the image pipeline at all. The image
+    change then waits for the next image change or the Sunday rebuild.
 
 ## Safety net
 
@@ -306,7 +333,9 @@ secret `inputs.kubeconfig`.
    cd cicd && pulumi config set --secret gitea-cicd:operatorEmail <you>
    ```
 3. Put a token into the status-token secret, straight from the password
-   manager. The functions won't deploy without a version.
+   manager. The functions won't deploy without a version. Both post commit
+   statuses with it, and `gitea-webhook` also reads the pushed commit with it
+   (What deploys, and when); `write:repository` covers both.
    - **Make it a bot user's token, not yours.** A Gitea 28 token's
      `write:repository` scope covers every repo its user can write, and never
      expires.
@@ -410,6 +439,11 @@ Until the old in-project CI is removed (PR 3), all of this is additive:
 
 ## Known limits
 
+- **A fast-forward merge of a branch that had main merged into it still
+  over-deploys.** Its head is a branch commit whose first parent isn't the
+  push's `before`, so the relay uses the payload's lists, and the branch's
+  "Merge branch 'main'" commits name what main already shipped (see What
+  deploys, and when). A merge commit or a squash doesn't have this problem.
 - Cloud Build has no Gitea connector, so the triggers carry an inline launcher.
   The source-less Pub/Sub trigger shape is allowed by gcloud's flag rules but
   is proven only at the first `make ci-up`.
