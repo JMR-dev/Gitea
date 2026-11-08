@@ -142,18 +142,22 @@ catch Gitea down behind a healthy Caddy. Its duration must be at least
 on every replacement.
 
 **On watchtower,** the minter's lines ship scrubbed, and a rule must match
-what ships: the key=value rule reads `gitea-caddy-dns-token:` as a key ending
-in "token" and takes the word after it, and the email rule takes the account.
-The Caddy DNS-token change pins its success line (match `Caddy is told it
-lasts`, never `minted`) and its hourly check's line. `scripts/testdata/scrub.expect`
-pins two more: a failed mint's (`keep:t02`), which loses `kept`,
+what ships. The key=value rule leaves the minter's tag,
+`gitea-caddy-dns-token:`, out of its reach (it would read it as a key ending
+in "token" and take the word after it), but a key=value after the tag is
+still redacted, and the email rule takes the account. The Caddy DNS-token
+change pins its success line (match `Caddy is told it lasts`) and its hourly
+check's line. `scripts/testdata/scrub.log` and `scrub.expect` pin more: a
+failed mint's (`same:t02`) ships whole,
 
 ```
-gitea-caddy-dns-token: [REDACTED-SECRET] the token minted 12 min ago: 48 min of its 60 left
+gitea-caddy-dns-token: kept the token minted 12 min ago: 48 min of its 60 left
 ```
 
-and Caddy's `tls.renew` error (`keep:c16`), which ships whole. A scrub change
-that alters them fails `make check`.
+and so does the line from a VM with no Caddy DNS account (`same:t05`). A
+`token=` after the tag is redacted (`keep:t03`), and so is the word after a
+longer name that ends in the tag (`keep:t04`). Caddy's `tls.renew` error
+(`keep:c16`) ships whole. A scrub change that alters them fails `make check`.
 
 #### Drilling the certificate alert
 

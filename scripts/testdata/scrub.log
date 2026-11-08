@@ -276,7 +276,10 @@ keep:317 systemd[1]: Starting user-runtime-dir@3141592652.service - User Runtime
 keep:318 systemd[1]: user@1000000000.service: Consumed 1.234s CPU time.
 same:190 systemd[1]: Started user-runtime-dir@1000.service - User Runtime Directory /run/user/1000.
 same:191 systemd[1]: user@999999999.service: Consumed 1.234s CPU time.
-keep:t02 gitea-caddy-dns-token: kept the token minted 12 min ago: 48 min of its 60 left
+same:t02 gitea-caddy-dns-token: kept the token minted 12 min ago: 48 min of its 60 left
+keep:t03 gitea-caddy-dns-token: token=fakeLEAK740 after the tag
+keep:t04 x-gitea-caddy-dns-token: fakeLEAK741
+same:t05 gitea-caddy-dns-token: no caddy-dns-account in the instance metadata: this VM doesn't mint for Caddy, nothing to check
 keep:g01 2026/11/06 14:02:11 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for fakeUSER701 from 203.0.113.77:0: user does not exist [uid: 0, name: fakeUSER701]
 keep:g02 2026/11/06 14:02:12 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for fake.user702@leak.example.net from 203.0.113.78:0: Email address does not exist [email: fake.user702@leak.example.net]
 keep:g03 2026/11/06 14:02:13 routers/web/auth/auth.go:317:SignInPost() [W] Failed authentication attempt for correct horse fakeLEAK703 battery from 203.0.113.79:0: user does not exist [uid: 0, name: correct horse fakeLEAK703 battery]

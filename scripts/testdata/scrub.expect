@@ -24,7 +24,8 @@ keep:329 five parts [REDACTED-JWT] now
 keep:330 sshd[99]: key SHA1:[REDACTED-FINGERPRINT]
 keep:331 sshd[99]: key SHA-256:[REDACTED-FINGERPRINT]
 keep:332 tls[99]: cert SHA1:[REDACTED-FINGERPRINT]
-keep:t02 gitea-caddy-dns-token: [REDACTED-SECRET] the token minted 12 min ago: 48 min of its 60 left
+keep:t03 gitea-caddy-dns-token: token=[REDACTED-SECRET] after the tag
+keep:t04 x-gitea-caddy-dns-token: [REDACTED-SECRET]
 {"fixture":"keep:c11","level":"info","ts":1793019000.1,"logger":"http.log.access.log0","msg":"handled request","request":{"remote_ip":"[REDACTED-IP]","remote_port":"51234","client_ip":"[REDACTED-IP]","proto":"HTTP/2.0","method":"GET","host":"gitea.example.test","uri":"/api/v1/repos/example-org/infra/raw/README.md?token=[REDACTED-SECRET]","headers":{"User-Agent":["git/2.47.3"],"Authorization":[REDACTED-CREDENTIAL],"Cookie":[REDACTED-COOKIE]}},"bytes_read":0,"duration":0.02,"size":1024,"status":200,"resp_headers":{"Server":["Caddy"],"Set-Cookie":[REDACTED-COOKIE]}}
 {"fixture":"keep:c15","level":"info","ts":1793019002.3,"logger":"http.log.access.log0","msg":"handled request","request":{"remote_ip":"[REDACTED-IP]","remote_port":"40400","client_ip":"[REDACTED-IP]","proto":"HTTP/1.1","method":"GET","host":"gitea.example.test","uri":"/metrics","headers":{"User-Agent":["curl/8.11.1"]}},"bytes_read":0,"duration":0.0001,"size":0,"status":404,"resp_headers":{"Server":["Caddy"]}}
 {"fixture":"keep:c16","level":"error","ts":1793019003.4,"logger":"tls.renew","msg":"could not get certificate from issuer","identifier":"gitea.example.test","issuer":"acme-v02.api.letsencrypt.org-directory","error":"[gitea.example.test] solving challenges: presenting for challenge: adding temporary record for zone \"example.test.\": googleapi: Error 403: Forbidden, forbidden (order=https://acme-v02.api.letsencrypt.org/acme/order/2112345678/312345678901) (ca=https://acme-v02.api.letsencrypt.org/directory)"}

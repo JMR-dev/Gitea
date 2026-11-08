@@ -294,14 +294,15 @@ loki.process "scrub" {
 	// word after it (Session ID:, Password Hash:). ssn, cvv and cvc only as a
 	// whole name or its last part (card_cvc), never in processname=.
 	//
-	// The first five alternatives have no capture group, so they hide nothing:
+	// The first six alternatives have no capture group, so they hide nothing:
 	// they match first and take these out of the rule's reach. systemd's
 	// `session-3.scope: Deactivated` names a unit, sudo's `TTY=x ; PWD=/y ;` a
 	// directory, `Starting session: shell` is sshd's, `sshd-session[12]: ` a
-	// program and its pid, and an earlier rule's marker is no name. Any other
-	// PWD is a password's short name.
+	// program and its pid, `gitea-caddy-dns-token: ` the Caddy DNS-token
+	// minter's tag, and an earlier rule's marker is no name. A key=value after
+	// the tag is still one. Any other PWD is a password's short name.
 	stage.replace {
-		expression = `(?i)session-\w+\.scope:|(?-i:\bTTY=[^\s;=:]+ ; PWD=/[^\s;=:]* ;)|(?-i:\bStarting session:)|\[REDACTED-[\w-]+\]|[\w.-]+\[\d+\]:|(?:[\w.-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key)(?:[\w.\[\]-]|%5[Dd])*(?:\s+(?:id|hash|key))?|(?:^|[^a-z0-9])(?:ssn|cvv|cvc)\d*)\s*(?:=>|:=|==|%(?:25)*3[Dd]|=|:)\s*("(?:[^"\\]|\\.)*"|".*|'(?:[^'\\]|\\.)*'|'.*|\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|\\".*|[\[{(].*|\w+\(.*|(?:\\.|[^\s&"'\\])(?:\\.|[^\s&"\\])*)`
+		expression = `(?i)session-\w+\.scope:|(?-i:\bTTY=[^\s;=:]+ ; PWD=/[^\s;=:]* ;)|(?-i:\bStarting session:)|\[REDACTED-[\w-]+\]|[\w.-]+\[\d+\]:|(?-i:gitea-caddy-dns-token:)|(?:[\w.-]*(?:pass[_-]?(?:word|phrase|code|key|hash)|passwd|pwd|secret|token|bearer|api[\s._-]?key|private[\s._-]?key|preshared[_-]?key|session|credential|csrf|(?:t?otp|auth|mfa)[_-]?(?:code|key)|(?:access|signing|encryption|ssh)[_-]?key)(?:[\w.\[\]-]|%5[Dd])*(?:\s+(?:id|hash|key))?|(?:^|[^a-z0-9])(?:ssn|cvv|cvc)\d*)\s*(?:=>|:=|==|%(?:25)*3[Dd]|=|:)\s*("(?:[^"\\]|\\.)*"|".*|'(?:[^'\\]|\\.)*'|'.*|\\"(?:\\\\\\"|\\\\|\\[^"\\]|[^"\\])*\\"|\\".*|[\[{(].*|\w+\(.*|(?:\\.|[^\s&"'\\])(?:\\.|[^\s&"\\])*)`
 		replace    = "[REDACTED-SECRET]"
 	}
 
