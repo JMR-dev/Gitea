@@ -111,9 +111,15 @@ carrying both runners:
 | static NAT IP (in use) | $3.65 |
 | Cloud NAT gateway + data processing | $1 + $0.045/GB |
 | boot disk 30 GB + PVCs 10 + 20 + 10 + 10 GB, pd-balanced | $8 |
+| GKE metrics: system only, Managed Prometheus off | $0 |
 
 These are us-east1 list prices from October 2026. For comparison, a spot
 `e2-standard-2` was $29.35/month: spot saves about 40%, not two thirds.
+
+Metrics cost nothing because the cluster sends only GKE's free system metrics
+(*Logs and metrics to Watchtower*, below). GKE's defaults add Managed
+Prometheus, billed per sample: about $14.58/month in November 2026, and
+growing with CI pod churn.
 
 Busy periods add **burst nodes**. Each one costs an on-demand `e2-standard-2`
 plus its boot disk, about $0.07/hour together, only while it exists. A **heavy
@@ -249,6 +255,16 @@ here would be in reach of `docker` jobs. A sink, `watchtower-ci`, feeds the topi
 `watchtower-logs`, and Watchtower reads `watchtower-logs-pull`
 (`infra/pkg/telemetry`). Unset, none of this exists, except the
 `pubsub.googleapis.com` API, which like the others is always on.
+
+The cluster sends only GKE's system metrics, the free `kubernetes.io/*` ones,
+which are all Watchtower's GCP pull reads. Managed Prometheus and GKE's other
+monitoring packages (kube-state-metrics, cAdvisor, Kubelet, DCGM and the rest)
+are off, in `infra/pkg/gke`, and its tests pin both. Deleting those settings
+doesn't turn the packages back on, and neither does a rollback:
+`monitoringConfig` is Optional+Computed, so the provider keeps whatever the
+cluster has. Turning any of them on again means setting the packages and
+`managedPrometheus.enabled` explicitly. Logging stays at GKE's default,
+`SYSTEM_COMPONENTS` and `WORKLOADS`, which the sink needs both of.
 
 | Sent | Why |
 |---|---|
