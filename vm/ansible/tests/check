@@ -20,6 +20,18 @@ checked too (not under --update). Everywhere, as they need nothing downloaded:
   - Caddy's stop budget (caddy_stop_budget): every fixture's Caddyfile sets a
     grace_period, and its shutdown_delay + grace_period + 3 s fits in
     caddy.container's explicit StopTimeout, itself under TimeoutStopSec;
+  - Gitea's and Caddy's fixed MACs (fixed_macs): each one's Network= is
+    gitea.network with exactly one mac= option, in lowercase, locally
+    administered and unicast, not the other's; Caddy on the host network has
+    none;
+  - site.yml's handlers for Gitea's and Caddy's restarts (app_handlers): Caddy
+    stops before Gitea restarts, and Gitea restarts before Caddy;
+  - role app's flush of the gitea bridge's neighbor entries (neighbor_flush):
+    after "Gitea and Caddy running", on every run but --check;
+  - these three checks themselves, on broken inputs (tests/test_check.py,
+    first);
+  - role app's fixed-address check over made-up inspect output
+    (tests/fixed-addresses.yml, as is and under --check);
   - the watchtower peer script over made-up configs (scripts/check-peer-config.sh);
   - role tunnel's state over every case (tests/tunnel-state.yml);
   - that the metadata guard in the ruleset names Alloy's uid and Gitea's
@@ -103,6 +115,21 @@ CADDY_DURATION_PART = r"(\d+(?:\.\d+)?)(ns|us|ms|s|m|h|d)"
 SYSTEMD_TIME_UNITS = {"": 1, "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1, "sec": 1, "m": 60,
                       "min": 60, "h": 3600, "hr": 3600}
 SYSTEMD_TIME_PART = r"\s*(\d+(?:\.\d+)?)\s*([a-z]*)"
+# Gitea's and Caddy's fixed MACs (fixed_macs). The rendered name of
+# vm/quadlets/gitea.container; the network unit both are on; and a MAC as
+# podman prints one, in lowercase.
+GITEA_QUADLET = "gitea.container"
+GITEA_NETWORK = "gitea.network"
+MAC = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}")
+# site.yml's handler topics for Gitea's and Caddy's restarts (app_handlers):
+# role app notifies the first, with the second, when either holds the wrong
+# address or MAC, and the second on any change to their config; and the test
+# of that check (fixed_addresses_test).
+ADDRESSES_CHANGED = "container addresses changed"
+CONFIG_CHANGED = "gitea config changed"
+FIXED_ADDRESSES_TEST = "fixed-addresses.yml"
+# The unit tests of fixed_macs(), app_handlers() and neighbor_flush().
+CHECK_TESTS = "test_check.py"
 SCRUB_FIXTURE = os.path.join(ROOT, "scripts", "testdata", "scrub.log")
 # infra_deploy.py's modes that change, or read, the VM: the deploy, and `make
 # vm-check`/`vm-apply` (also ci-vm-check/ci-vm-apply). Its other, `preview`, is
@@ -381,6 +408,198 @@ def caddy_stop_budget():
     return problems
 
 
+def fixed_macs(golden=None):
+    """Problems with Gitea's and Caddy's MACs in every fixture's goldens, which
+    the caller has just proved are exactly what renders (golden: another
+    directory of fixtures, for testing this: tests/test_check.py).
+
+    Both have fixed addresses on the gitea network, but podman gives every new
+    container a random MAC. After a restart, Caddy's and the host's neighbor
+    (ARP) entries still name the old one, and traffic to the address is lost
+    until they expire: 23-47 s after a Gitea restart (2026-11-07). So each has
+    a fixed MAC there, as an option of its Network= (podman's --network
+    gitea:mac=..., which takes --ip alongside): exactly one, in lowercase as
+    podman prints them and role app compares them, locally administered and
+    unicast, and not the other's. Caddy on the host network has none: podman
+    has no MAC to set there."""
+    golden = golden or os.path.join(HERE, "golden")
+    problems = []
+    for name in sorted(os.listdir(golden)):
+        d = os.path.join(golden, name)
+        fixed = {}
+        for quadlet in (GITEA_QUADLET, CADDY_QUADLET):
+            network = unit_keys(os.path.join(d, quadlet + ".golden")).get("Container", {}).get("Network", "")
+            if quadlet == CADDY_QUADLET and network == "host":
+                continue
+            unit, _, options = network.partition(":")
+            if unit != GITEA_NETWORK:
+                problems.append(f"{name}/{quadlet}: Network={network}, not {GITEA_NETWORK}"
+                                + (" or host" if quadlet == CADDY_QUADLET else ""))
+                continue
+            macs = [o[len("mac="):] for o in options.split(",") if o.startswith("mac=")]
+            if len(macs) != 1:
+                problems.append(f"{name}/{quadlet}: Network={network} has {len(macs)} mac= options, not one: without "
+                                "a fixed MAC, a restart on its fixed IP= leaves its peers' neighbor entries on the old "
+                                "MAC, and traffic to it is lost until they expire")
+                continue
+            mac = macs[0]
+            if not MAC.fullmatch(mac):
+                problems.append(f"{name}/{quadlet}: mac={mac} is not a MAC in lowercase (02:00:00:00:00:fa), "
+                                "as podman prints them and role app compares them")
+            elif int(mac[:2], 16) & 0x03 != 0x02:
+                problems.append(f"{name}/{quadlet}: mac={mac} is not locally administered unicast "
+                                "(the first octet's low two bits must be 10, as in 02:...)")
+            else:
+                fixed[quadlet] = mac
+        if len(fixed) == 2 and fixed[GITEA_QUADLET] == fixed[CADDY_QUADLET]:
+            problems.append(f"{name}: Gitea and Caddy have the same MAC, {fixed[GITEA_QUADLET]}")
+    return problems
+
+
+# What app_handlers() and neighbor_flush() read of a task or handler. Each of
+# listen: and when: may be one string or a list.
+def listens(task):
+    listen = task.get("listen") or []
+    return set([listen] if isinstance(listen, str) else listen)
+
+
+def conditions(task):
+    when = task.get("when") or []
+    return [when] if isinstance(when, str) else list(when)
+
+
+def service(task):
+    s = task.get("ansible.builtin.systemd_service") or {}
+    return s.get("name"), s.get("state")
+
+
+def argv(task):
+    cmd = task.get("ansible.builtin.command")
+    return [str(a) for a in (cmd.get("argv") or [])] if isinstance(cmd, dict) else []
+
+
+def first(tasks, wanted, what, problems):
+    """The index of the first of tasks that wanted() picks, or None, adding
+    "no ... {what}" to problems."""
+    i = next((i for i, t in enumerate(tasks) if wanted(t)), None)
+    if i is None:
+        problems.append(f"no {what}")
+    return i
+
+
+def app_handlers(site=None):
+    """Problems with site.yml's handlers for Gitea's and Caddy's restarts
+    (site: another copy of it, for testing this: tests/test_check.py).
+
+    Ansible runs notified handlers in the order they are defined. Role app
+    notifies CONFIG_CHANGED on any change to their config, which restarts
+    both, and ADDRESSES_CHANGED with it when either holds the wrong address or
+    MAC (roles/app/tasks/fixed-addresses.yml), which stops Caddy first. So
+    Caddy stops (on ADDRESSES_CHANGED) before Gitea restarts, and Gitea
+    restarts before Caddy (both on CONFIG_CHANGED). The neighbor flush that
+    follows is role app's tasks' (neighbor_flush)."""
+    with open(site or os.path.join(ANSIBLE, "site.yml")) as fh:
+        handlers = yaml.safe_load(fh)[0].get("handlers") or []
+    problems = []
+    stop = first(handlers, lambda h: service(h) == ("caddy.service", "stopped"), "handler stops caddy.service",
+                 problems)
+    gitea = first(handlers, lambda h: service(h) == ("gitea.service", "restarted"), "handler restarts gitea.service",
+                  problems)
+    caddy = first(handlers, lambda h: service(h) == ("caddy.service", "restarted"), "handler restarts caddy.service",
+                  problems)
+    if problems:
+        return [f"site.yml: {p}" for p in problems]
+
+    def name(i):
+        return repr(handlers[i].get("name"))
+
+    for i, topic in ((stop, ADDRESSES_CHANGED), (gitea, CONFIG_CHANGED), (caddy, CONFIG_CHANGED)):
+        if topic not in listens(handlers[i]):
+            problems.append(f"site.yml: {name(i)} doesn't listen on {topic}")
+    if not stop < gitea < caddy:
+        problems.append(f"site.yml: the handlers must run in this order (Ansible runs them as defined): {name(stop)}, "
+                        f"{name(gitea)}, then {name(caddy)}")
+    return problems
+
+
+def neighbor_flush(tasks=None):
+    """Problems with role app's flush of the host's neighbor (ARP) entries on
+    the gitea bridge (tasks: another copy of roles/app/tasks/main.yml, for
+    testing this: tests/test_check.py).
+
+    A container that came back on a new MAC (its move to a fixed one, or one
+    started after a run that was cut off mid-restart) leaves those entries
+    naming the old one, and the published ports (and Caddy on the host
+    network) reach the containers through them. So after "Gitea and Caddy
+    running", the task that starts both, a task reads the bridge's name
+    (podman network inspect gitea), and then one flushes it and nothing else
+    (exactly ip neigh flush dev {{ <what the first registers> }}). Both run
+    on every run (a flush costs
+    only a re-ARP) except under --check: `when: not ansible_check_mode` and
+    nothing else."""
+    where = "roles/app/tasks/main.yml"
+    with open(tasks or os.path.join(ANSIBLE, where)) as fh:
+        tasks = yaml.safe_load(fh) or []
+    problems = []
+    running = first(tasks, lambda t: service(t)[1] == "started"
+                    and set(t.get("loop") or []) == {"gitea.service", "caddy.service"},
+                    "task starts gitea.service and caddy.service", problems)
+    bridge = first(tasks, lambda t: argv(t) == ["podman", "network", "inspect", "gitea"],
+                   "task reads the gitea network's bridge (argv podman network inspect gitea)", problems)
+    flush = first(tasks, lambda t: argv(t)[:3] == ["ip", "neigh", "flush"],
+                  "task flushes the host's neighbor entries on it (argv ip neigh flush ...)", problems)
+    if problems:
+        return [f"{where}: {p}" for p in problems]
+
+    def name(i):
+        return repr(tasks[i].get("name"))
+
+    for i in (bridge, flush):
+        if not running < i:
+            problems.append(f"{where}: {name(i)} must come after {name(running)}, which starts both")
+        if conditions(tasks[i]) != ["not ansible_check_mode"]:
+            problems.append(f"{where}: {name(i)} must run on every run but --check: its when: is "
+                            f"{conditions(tasks[i])}, not `not ansible_check_mode` alone")
+    if not bridge < flush:
+        problems.append(f"{where}: {name(bridge)} must come before {name(flush)}, which reads what it registers")
+    # The gitea bridge's entries and nothing else: `ip neigh flush all` or
+    # another dev would clear the VM's uplink's table, or miss the bridge.
+    words = argv(tasks[flush])
+    shaped = len(words) == 5 and words[3] == "dev" and re.fullmatch(r"\{\{[^{}]*\}\}", words[4])
+    if not shaped:
+        problems.append(f"{where}: {name(flush)} must be exactly `ip neigh flush dev {{{{ <the bridge's name> }}}}`, "
+                        f"flushing the gitea bridge's entries alone, not `{' '.join(words)}`")
+    registered = tasks[bridge].get("register")
+    if not registered or not (shaped and re.search(rf"\b{re.escape(registered)}\b", words[4])):
+        problems.append(f"{where}: {name(flush)} doesn't read what {name(bridge)} registers "
+                        f"({registered or 'nothing'})")
+    return problems
+
+
+def run(what, cmd, failures, env=None, quiet=False):
+    """Runs one of the checks' commands. If it fails, prints the tail of its
+    output and adds what to failures; otherwise prints its output, unless
+    quiet. Returns whether it passed."""
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout[-3000:], r.stderr[-3000:], sep="\n")
+        failures.append(what)
+    elif not quiet:
+        print(r.stdout, end="")
+    return r.returncode == 0
+
+
+def fixed_addresses_test():
+    """Runs tests/fixed-addresses.yml as is and under --check (its cases
+    marked check_mode run only there); returns what failed."""
+    failures = []
+    for extra in ([], ["--check"]):
+        run(" ".join([f"tests/{FIXED_ADDRESSES_TEST}", *extra]),
+            ["ansible-playbook", "-i", "localhost,", *extra, os.path.join(HERE, FIXED_ADDRESSES_TEST)], failures,
+            quiet=True)
+    return failures
+
+
 def telemetry_checks(mode):
     """The telemetry checks, run on the goldens, which the caller has just
     proved are exactly what renders; returns what failed. The ones that need
@@ -388,25 +607,16 @@ def telemetry_checks(mode):
     env = dict(os.environ)
     failures = []
 
-    def run(what, cmd, quiet=False):
-        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(r.stdout[-3000:], r.stderr[-3000:], sep="\n")
-            failures.append(what)
-        elif not quiet:
-            print(r.stdout, end="")
-        return r.returncode == 0
-
     # Nothing to download: everywhere.
-    run("peer script", ["bash", os.path.join(ROOT, "scripts", "check-peer-config.sh")])
+    run("peer script", ["bash", os.path.join(ROOT, "scripts", "check-peer-config.sh")], failures, env)
     if run("tunnel state", ["ansible-playbook", "-i", "localhost,", os.path.join(HERE, "tunnel-state.yml")],
-           quiet=True):
+           failures, env, quiet=True):
         print("tunnel state: role tunnel comes to the right state in every case")
     goldens = sorted(os.listdir(os.path.join(HERE, "golden")))
     for name in goldens:
         run(f"{name}: metadata guard", ["bash", os.path.join(ROOT, "scripts", "check-metadata-guard.sh"), "--static"]
             + [os.path.join(HERE, "golden", name, f + ".golden")
-               for f in ("nftables.conf", "alloy.container", "gitea.container", "caddy.container")])
+               for f in ("nftables.conf", "alloy.container", "gitea.container", "caddy.container")], failures, env)
 
     if mode == "deploy":
         print("tests/check: a deploy or vm-check/vm-apply: alloy fmt/validate and the scrub rules are skipped "
@@ -420,15 +630,16 @@ def telemetry_checks(mode):
             # Alloy reads a file by its .alloy name.
             cfg = os.path.join(t, ALLOY_CONFIG)
             shutil.copyfile(golden, cfg)
-            run(f"{name}: alloy fmt", ["alloy", "fmt", "--test", cfg])
-            run(f"{name}: alloy validate", ["alloy", "validate", cfg])
+            run(f"{name}: alloy fmt", ["alloy", "fmt", "--test", cfg], failures, env)
+            run(f"{name}: alloy validate", ["alloy", "validate", cfg], failures, env)
     # The scrub block renders the same from every fixture: it has no ${VAR}.
     # A port of its own, and up to 5 minutes for Alloy to start and get the
     # fixture through, on a slow builder.
     env["ALLOY_TEST_PORT"] = str(free_port())
     env.setdefault("ALLOY_TEST_TIMEOUT", "300")
     run("scrub rules", [os.path.join(ROOT, "scripts", "check-alloy-scrub.sh"),
-                        os.path.join(HERE, "golden", goldens[0], ALLOY_CONFIG + ".golden"), SCRUB_FIXTURE])
+                        os.path.join(HERE, "golden", goldens[0], ALLOY_CONFIG + ".golden"), SCRUB_FIXTURE],
+        failures, env)
     return failures
 
 
@@ -486,6 +697,30 @@ def main():
         return 1
     print(f"tests/check: Caddy's stop budget holds in every fixture: shutdown_delay + grace_period + "
           f"{CADDY_STOP_MARGIN}s <= StopTimeout < TimeoutStopSec")
+    # The checks below, first seen to fail on broken inputs.
+    failures = []
+    if not run(f"tests/{CHECK_TESTS}", [sys.executable, "-m", "unittest", "discover", "-s", HERE, "-p", CHECK_TESTS],
+               failures, quiet=True):
+        print(f"tests/check: its own tests (tests/{CHECK_TESTS}) failed")
+        return 1
+    print(f"tests/check: fixed_macs(), app_handlers() and neighbor_flush() catch what they should (tests/{CHECK_TESTS})")
+    problems = fixed_macs()
+    if problems:
+        print("Fixed MACs:\n  " + "\n  ".join(problems))
+        return 1
+    print("tests/check: Gitea and Caddy (on the bridge) have fixed MACs of their own in every fixture")
+    problems = app_handlers() + neighbor_flush()
+    if problems:
+        print("Gitea's and Caddy's restarts:\n  " + "\n  ".join(problems))
+        return 1
+    print("tests/check: site.yml stops Caddy before Gitea restarts and restarts Gitea before Caddy, and role app "
+          "flushes the gitea bridge's neighbor entries once both run")
+    failures = fixed_addresses_test()
+    if failures:
+        print("fixed-address test failures: " + ", ".join(failures))
+        return 1
+    print(f"tests/check: role app's fixed-address check comes out right in every case (tests/{FIXED_ADDRESSES_TEST}, "
+          "as is and under --check)")
     mode = run_mode()
     failures = telemetry_checks(mode)
     if failures:

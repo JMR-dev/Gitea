@@ -1,0 +1,56 @@
+# One case of tests/fixed-addresses.yml: role app's fixed-address tasks with
+# this case's made-up inspect output, then what they came to.
+- name: Nothing notified, nothing failed, no inspect output yet
+  ansible.builtin.set_fact:
+    notified_stop: false
+    notified_restart: false
+    case_failed: ""
+    app_inspect: {results: []}
+
+- name: The case's inspect output, as register keeps it
+  ansible.builtin.set_fact:
+    app_inspect:
+      results: >-
+        {{ app_inspect.results + [
+             {'item': item.name, 'skipped': true, 'changed': false} if item.skipped | default(false)
+             else {'item': item.name, 'rc': item.rc, 'stdout': '', 'changed': false} if item.rc is defined
+             else {'item': item.name, 'rc': 0, 'changed': false,
+                   'stdout': [{'NetworkSettings': {'Networks': item.networks}}] | to_json}] }}
+  loop: "{{ case.inspect }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Role app's fixed-address tasks
+  block:
+    - name: Role app's fixed-address tasks, {{ case.step }}
+      ansible.builtin.include_tasks: ../roles/app/tasks/fixed-addresses.yml
+      vars:
+        app_fixed_step: "{{ case.step }}"
+        GITEA_MAC: "{{ case.gitea_mac | default(gitea_mac) }}"
+  rescue:
+    - name: What the check said
+      ansible.builtin.set_fact:
+        case_failed: "{{ ansible_failed_result.msg }}"
+
+- name: The handlers it notified
+  ansible.builtin.meta: flush_handlers
+
+- name: What it came to
+  ansible.builtin.assert:
+    that:
+      - notified_stop == case.stop | default(false)
+      - notified_restart == case.restart | default(false)
+      - case_failed == case.fails | default('')
+    fail_msg: >-
+      {{ case.what }}: Caddy stopped first {{ notified_stop }} (want {{ case.stop | default(false) }}), both
+      restarted {{ notified_restart }} (want {{ case.restart | default(false) }}), the check said
+      {{ case_failed | to_json }} (want {{ case.fails | default('') | to_json }})
+    success_msg: "{{ case.what }}: as it should"
+  # Noted, so one run shows every case that comes out wrong.
+  ignore_errors: true
+  register: case_came_to
+
+- name: Noted, if wrong
+  ansible.builtin.set_fact:
+    wrong_cases: "{{ wrong_cases + [case.what] }}"
+  when: case_came_to is failed

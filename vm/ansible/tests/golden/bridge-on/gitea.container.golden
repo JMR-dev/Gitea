@@ -25,7 +25,10 @@ AutoUpdate=registry
 # [Container] group -- that one only exists for .image and .build units.)
 PodmanArgs=--authfile=/etc/containers/ar-auth.json
 Label=io.containers.autoupdate.authfile=/etc/containers/ar-auth.json
-Network=gitea.network
+# A fixed MAC, as the network's mac= option: with a new one at every restart,
+# Caddy's and the host's neighbor entries for Gitea's address kept the old one,
+# and traffic to Gitea was lost for 23-47 s (2026-11-07).
+Network=gitea.network:mac=02:00:00:00:00:fa
 # A fixed address, which vm/nftables/gitea.nft's forward chain keeps off the
 # metadata server: Gitea faces the internet and needs none of the VM's
 # credentials. Caddy reaches it by name (gitea:3000), so the address is
